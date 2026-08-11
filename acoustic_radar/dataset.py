@@ -1,35 +1,70 @@
 #!/usr/bin/env python3
 """
-dataset.py — AudioDataset для навчання моделі акустичного радара.
+dataset.py — PyTorch Dataset для навчання акустичного радара.
 
-Завантажує .wav файли з класифікованих директорій, перетворює їх
-у Mel-спектрограми (дБ) та повертає пари (спектрограма, мітка класу).
+⚠️ ГОЛОВНА ЗМІНА ПРОТИ ПОПЕРЕДНЬОЇ ВЕРСІЇ
+Раніше тут використовувався torchaudio.transforms.MelSpectrogram, а на
+Raspberry Pi (radar.py) — окрема ручна NumPy-реалізація. Вони давали
+РІЗНІ спектрограми:
+    • Mel-фільтри radar.py округлювались до цілих FFT-бінів → форма
+      нижніх фільтрів (саме там гармоніки лопатей!) відрізнялась,
+      cosine similarity падала до 0.73;
+    • np.hanning() — симетричне вікно, torch.hann_window() — періодичне;
+    • у radar.py нижні Mel-канали давали -25 дБ там, де torchaudio давав
+      +4.6 дБ на тому самому сигналі.
+Модель навчалась на одних числах, а на Pi отримувала інші.
 
-Параметри Mel-спектрограми ідентичні в dataset.py та radar.py,
-щоб забезпечити однаковий feature extraction під час навчання та інференсу.
+Тепер ОБИДВА шляхи використовують features.MelFrontend — одну й ту саму
+функцію. Це усуває розбіжність за побудовою, а не «на віру».
 """
 
-import torch
-import torchaudio
-import soundfile as sf
-import numpy as np
-from torch.utils.data import Dataset
+from __future__ import annotations
+
+import random
 from pathlib import Path
 
+import numpy as np
+import soundfile as sf
+import torch
+from torch.utils.data import Dataset
+
+from features import (
+    MelFrontend, N_MELS, SAMPLE_RATE, TARGET_FRAMES, WINDOW_SAMPLES,
+)
+
+__all__ = ["AudioDataset", "N_MELS", "TARGET_FRAMES", "SAMPLE_RATE"]
+
 
 # ═══════════════════════════════════════════════════════════════
-#  Параметри Mel-спектрограми
-#  ⚠️ Ці значення мають ТОЧНО збігатися з radar.py!
+#  SpecAugment (тільки для train)
 # ═══════════════════════════════════════════════════════════════
 
-SAMPLE_RATE   = 16000    # Частота дискретизації (Гц)
-N_MELS        = 32       # Кількість Mel-фільтрів
-N_FFT         = 400      # Розмір FFT вікна (25 мс при 16 кГц)
-HOP_LENGTH    = 160      # Крок FFT вікна (10 мс при 16 кГц)
+def spec_augment(mel: np.ndarray,
+                 freq_masks: int = 2, freq_width: int = 8,
+                 time_masks: int = 2, time_width: int = 16) -> np.ndarray:
+    """
+    Маскує випадкові смуги частот і відрізки часу.
 
-# Фіксована кількість фреймів для 3-секундного аудіо при center=True:
-# n_frames = (48000 + 400 - 400) / 160 + 1 = 301
-TARGET_FRAMES = 301
+    Змушує модель спиратися на всю гармонічну структуру, а не на один
+    зручний Mel-канал. Особливо важливо тут, бо вихідних записів дронів
+    мало (два апарати), і без цього модель легко перенавчається на
+    конкретний тембр.
+    """
+    mel = mel.copy()
+    n_mels, n_frames = mel.shape
+    fill = float(mel.min())
+
+    for _ in range(random.randint(0, freq_masks)):
+        w = random.randint(1, freq_width)
+        f0 = random.randint(0, max(0, n_mels - w))
+        mel[f0:f0 + w, :] = fill
+
+    for _ in range(random.randint(0, time_masks)):
+        w = random.randint(1, time_width)
+        t0 = random.randint(0, max(0, n_frames - w))
+        mel[:, t0:t0 + w] = fill
+
+    return mel
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -38,141 +73,84 @@ TARGET_FRAMES = 301
 
 class AudioDataset(Dataset):
     """
-    PyTorch Dataset для аудіо-класифікації.
+    Очікує структуру:
+        root_dir/
+          0/*.wav   ← клас 0 (Фон)
+          1/*.wav   ← клас 1 (Дрон)
 
-    Очікує структуру директорій:
-      root_dir/
-        0/         ← .wav файли класу 0 (Фон)
-        1/         ← .wav файли класу 1 (Дрон)
-        2/         ← .wav файли класу 2 (Мотор)
-
-    Кожен __getitem__ повертає:
-      mel:   Tensor [1, N_MELS, TARGET_FRAMES]  — Mel-спектрограма в дБ
-      label: int                                 — Мітка класу (0, 1, або 2)
+    __getitem__ повертає:
+        mel:   Tensor [1, N_MELS, TARGET_FRAMES] — нормалізована спектрограма
+        label: int
     """
 
-    def __init__(self, root_dir: str, sample_rate: int = SAMPLE_RATE):
-        """
-        Args:
-            root_dir:    Шлях до кореневої директорії датасету.
-            sample_rate: Цільова частота дискретизації.
-        """
+    def __init__(self, root_dir: str | Path, augment: bool = False,
+                 verbose: bool = True):
         self.root_dir = Path(root_dir)
-        self.sample_rate = sample_rate
-        self.samples = []  # Список кортежів (шлях_до_файлу, мітка_класу)
+        self.augment = augment
+        self.frontend = MelFrontend()
+        self.samples: list[tuple[Path, int]] = []
 
-        # ── Ініціалізація torchaudio трансформацій ──
-        # Mel-спектрограма: конвертує waveform → mel power spectrogram
-        self.mel_transform = torchaudio.transforms.MelSpectrogram(
-            sample_rate=sample_rate,
-            n_fft=N_FFT,
-            hop_length=HOP_LENGTH,
-            n_mels=N_MELS,
-            center=True,           # Padding для збереження довжини
-            pad_mode="reflect",    # Режим padding (як у librosa)
-        )
-
-        # Конвертація амплітуди в децибели (логарифмічна шкала)
-        # top_db=80 обмежує динамічний діапазон
-        self.amplitude_to_db = torchaudio.transforms.AmplitudeToDB(
-            stype="power",
-            top_db=80,
-        )
-
-        # ── Сканування директорій класів ──
         for class_dir in sorted(self.root_dir.iterdir()):
             if class_dir.is_dir() and class_dir.name.isdigit():
                 label = int(class_dir.name)
-                wav_files = sorted(class_dir.glob("*.wav"))
-                for audio_file in wav_files:
-                    self.samples.append((audio_file, label))
+                for wav in sorted(class_dir.glob("*.wav")):
+                    self.samples.append((wav, label))
 
         if not self.samples:
             raise RuntimeError(
-                f"❌ Датасет порожній! Перевірте шлях: '{root_dir}'\n"
-                f"   Очікувана структура: {root_dir}/0/*.wav, "
-                f"{root_dir}/1/*.wav, {root_dir}/2/*.wav"
+                f"❌ Датасет порожній: '{self.root_dir}'\n"
+                f"   Очікується {self.root_dir}/0/*.wav та "
+                f"{self.root_dir}/1/*.wav\n"
+                f"   Спочатку запустіть: python mixer.py"
             )
 
-        # Статистика
-        class_counts = self._count_classes()
-        print(f"📊 AudioDataset завантажено:")
-        print(f"   Шлях:    {self.root_dir}")
-        print(f"   Файлів:  {len(self.samples)}")
-        print(f"   Класи:   {class_counts}")
-        print(f"   Mel:     n_mels={N_MELS}, n_fft={N_FFT}, "
-              f"hop={HOP_LENGTH}, frames={TARGET_FRAMES}")
-
-    def _count_classes(self) -> dict:
-        """Рахує кількість семплів у кожному класі."""
-        counts = {}
-        for _, label in self.samples:
-            counts[label] = counts.get(label, 0) + 1
-        return dict(sorted(counts.items()))
+        if verbose:
+            counts: dict[int, int] = {}
+            for _, lbl in self.samples:
+                counts[lbl] = counts.get(lbl, 0) + 1
+            print(f"📊 AudioDataset  {self.root_dir}")
+            print(f"   Файлів: {len(self.samples)}   Класи: "
+                  f"{dict(sorted(counts.items()))}   "
+                  f"Augment: {'так' if augment else 'ні'}")
 
     def __len__(self) -> int:
-        """Повертає загальну кількість семплів у датасеті."""
         return len(self.samples)
 
-    def __getitem__(self, idx: int):
-        """
-        Завантажує та обробляє один семпл.
+    def class_counts(self) -> dict[int, int]:
+        counts: dict[int, int] = {}
+        for _, lbl in self.samples:
+            counts[lbl] = counts.get(lbl, 0) + 1
+        return dict(sorted(counts.items()))
 
-        Повертає:
-            mel:   Tensor [1, N_MELS, TARGET_FRAMES] — Mel-спектрограма (дБ)
-            label: int — Мітка класу
-        """
+    def __getitem__(self, idx: int):
         filepath, label = self.samples[idx]
 
-        # ── 1. Завантаження аудіо (soundfile замість torchaudio.load) ──
-        audio_np, sr = sf.read(str(filepath), dtype="float32")
-        # audio_np shape: [samples] або [samples, channels]
+        audio, sr = sf.read(str(filepath), dtype="float32", always_2d=True)
+        audio = audio.mean(axis=1)                       # → моно
 
-        # Конвертуємо в torch tensor [channels, samples]
-        if audio_np.ndim == 1:
-            waveform = torch.from_numpy(audio_np).unsqueeze(0)
-        else:
-            waveform = torch.from_numpy(audio_np.T)
+        if sr != SAMPLE_RATE:
+            # mixer.py пише вже 16 кГц; це лише запобіжник для власних записів
+            n_out = int(round(len(audio) * SAMPLE_RATE / sr))
+            audio = np.interp(
+                np.linspace(0, len(audio) - 1, n_out),
+                np.arange(len(audio)), audio,
+            ).astype(np.float32)
 
-        # ── 2. Ресемплінг (якщо SR не збігається) ──
-        if sr != self.sample_rate:
-            resampler = torchaudio.transforms.Resample(
-                orig_freq=sr, new_freq=self.sample_rate
-            )
-            waveform = resampler(waveform)
+        # ── Приводимо ХВИЛЮ до довжини вікна (не спектрограму) ──
+        if len(audio) < WINDOW_SAMPLES:
+            audio = np.pad(audio, (0, WINDOW_SAMPLES - len(audio)))
+        elif len(audio) > WINDOW_SAMPLES:
+            start = (random.randint(0, len(audio) - WINDOW_SAMPLES)
+                     if self.augment else 0)
+            audio = audio[start:start + WINDOW_SAMPLES]
 
-        # ── 3. Конвертація в моно ──
-        if waveform.shape[0] > 1:
-            waveform = waveform.mean(dim=0, keepdim=True)
+        mel = self.frontend(audio)                       # [N_MELS, T]
+        mel = self.frontend.fix_length(mel, TARGET_FRAMES)
 
-        # ── 4. Mel-спектрограма → дБ ──
-        mel = self.mel_transform(waveform)       # [1, N_MELS, T]
-        mel = self.amplitude_to_db(mel)           # Логарифмічна шкала
+        if self.augment:
+            mel = spec_augment(mel)
 
-        # ── 5. Фіксація довжини (padding / truncation) ──
-        mel = self._fix_length(mel, TARGET_FRAMES)
-
-        return mel, label
-
-    @staticmethod
-    def _fix_length(mel: torch.Tensor, target_frames: int) -> torch.Tensor:
-        """
-        Приводить спектрограму до фіксованої кількості фреймів.
-
-        Якщо спектрограма коротша — доповнює нулями справа (zero-padding).
-        Якщо довша — обрізає справа (truncation).
-        """
-        _, _, current_frames = mel.shape
-
-        if current_frames < target_frames:
-            # Доповнення нулями: pad(left, right) по останньому виміру
-            pad_size = target_frames - current_frames
-            mel = torch.nn.functional.pad(mel, (0, pad_size), value=0.0)
-        elif current_frames > target_frames:
-            # Обрізання
-            mel = mel[:, :, :target_frames]
-
-        return mel
+        return torch.from_numpy(mel).unsqueeze(0), label
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -180,8 +158,9 @@ class AudioDataset(Dataset):
 # ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    # Швидкий тест завантаження
-    dataset = AudioDataset("dataset/train")
-    mel, label = dataset[0]
-    print(f"\n🔍 Тест: mel.shape={list(mel.shape)}, label={label}")
-    print(f"   Mel range: [{mel.min():.1f}, {mel.max():.1f}] dB")
+    ds = AudioDataset("dataset/train", augment=True)
+    mel, label = ds[0]
+    print(f"\n🔍 mel.shape={list(mel.shape)}  label={label}")
+    print(f"   mean={mel.mean():+.3f}  std={mel.std():.3f}  "
+          f"range=[{mel.min():.2f}, {mel.max():.2f}]")
+    print(f"   (після нормалізації mean має бути ≈0, std ≈1)")

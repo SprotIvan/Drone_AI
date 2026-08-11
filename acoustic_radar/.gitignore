@@ -1,0 +1,19 @@
+# Аудіо та датасети (важкі, генеруються локально)
+raw_audio/
+dataset/
+*.zip
+*.zip.part
+
+# Моделі та калібрування конкретної установки
+best_model.pth
+acoustic_radar.onnx
+acoustic_radar.onnx.data
+model_config.json
+radar_calibration.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/

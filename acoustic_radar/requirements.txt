@@ -1,21 +1,31 @@
 # ═══════════════════════════════════════════════════════════════
-#  Acoustic Radar — Dependencies
+#  Acoustic Radar — залежності
 # ═══════════════════════════════════════════════════════════════
 
-# ── Етап 1: Генерація датасету (PC) ──
-librosa>=0.10.0
-soundfile>=0.12.0
+# ── Спільне (потрібно всюди) ──
 numpy>=1.24.0
+
+# ── Тільки на ПК: генерація датасету ──
+librosa>=0.10.0          # декодування mp3/flac/ogg + ресемплінг
+soundfile>=0.12.0        # читання/запис wav
+scipy>=1.10.0            # Butterworth low-pass у симуляції відстані
 tqdm>=4.65.0
-scipy>=1.10.0
 
-# ── Етап 2: Навчання моделі (PC) ──
+# ── Тільки на ПК: навчання ──
 torch>=2.0.0
-torchaudio>=2.0.0
+# torchaudio БІЛЬШЕ НЕ ПОТРІБЕН: обчислення Mel-спектрограм перенесено
+# у features.py на чистий NumPy, щоб навчання і Raspberry Pi гарантовано
+# використовували ОДИН І ТОЙ САМИЙ код. Раніше розбіжність між
+# torchaudio (навчання) і ручним NumPy (radar.py) була однією з причин
+# поганої детекції.
 
-# ── Етап 3: Real-time інференс (Raspberry Pi) ──
-sounddevice>=0.4.6
+# ── Raspberry Pi: інференс у реальному часі ──
+# На Pi достатньо: numpy, onnxruntime, sounddevice, pyserial, pygame-ce
 onnxruntime>=1.15.0
+sounddevice>=0.4.6
 pyserial>=3.5
-pygame-ce>=2.3.0
+pygame-ce>=2.3.0         # лише для radar_gui.py
+
+# ── Опційно: апаратний DOA від ReSpeaker XVF3800 ──
+# pyusb потрібен утиліті xvf_host.py від Seeed, а не цьому проєкту.
 pyusb>=1.2.1

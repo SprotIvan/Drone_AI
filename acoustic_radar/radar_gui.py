@@ -1,283 +1,344 @@
 #!/usr/bin/env python3
 """
-radar_gui.py — Графічний інтерфейс для акустичного радара.
-Використовує Pygame для відмальовки радару та імпортує логіку з radar.py.
+radar_gui.py — Графічний інтерфейс акустичного радара (Pygame).
+
+⚠️ ЩО ЗМІНИЛОСЬ
+Раніше цей файл містив ВЛАСНУ копію циклу інференсу: свій розрахунок
+спектрограми, свій виклик моделі, свою формулу відстані
+(`6.0 / peak_volume`). Копія розійшлась з radar.py — наприклад, GUI
+взагалі не вмів надсилати кут по UART і рахував відстань інакше, ніж
+консоль. Тепер уся обробка живе у radar.RadarEngine, а цей файл лише
+малює.
+
+Що показує інтерфейс:
+  • кругова шкала 360° з кільцями дальності;
+  • позначка цілі за напрямком і відстанню;
+  • ДУГА невизначеності кута і КІЛЬЦЕ невизначеності відстані —
+    щоб не створювати ілюзію точності, якої немає;
+  • якщо напрямок невідомий — ціль показується як пульсуюче коло
+    без напрямку, а не в довільній точці;
+  • якщо відстань не відкалібрована — промінь напрямку без дистанції.
+
+Запуск:
+    python radar_gui.py
 """
 
+from __future__ import annotations
+
+import math
 import os
 import sys
-import time
-import math
 import threading
+import time
+
 import numpy as np
-import sounddevice as sd
-import onnxruntime as ort
 
-# Вимикаємо вітальне повідомлення pygame
-os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
-import pygame
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "hide")
+import pygame  # noqa: E402
 
-# Імпортуємо константи та логіку з нашого консольного радару
-from radar import (
-    SAMPLE_RATE, CHANNELS, CHUNK_SAMPLES, N_FFT, HOP_LENGTH, N_MELS,
-    ONNX_MODEL_PATH, NOISE_GATE, MIC_DISTANCE, CONFIRM_THRESHOLD, CLASS_NAMES,
-    create_mel_filterbank, compute_mel_spectrogram, SmartTracker, get_usb_doa
+import calibration  # noqa: E402
+import features  # noqa: E402
+from audio_io import open_stream, resolve_input  # noqa: E402
+from radar import (  # noqa: E402
+    BLOCK_SAMPLES, CONFIRM_THRESHOLD, RadarEngine, RadarStatus, UartSender,
 )
 
+# Максимальна дальність шкали (метри)
+MAX_RANGE_M = 250.0
+RINGS_M = (50, 100, 150, 200, 250)
+
+
 # ═══════════════════════════════════════════════════════════════
-# Спільний стан (Shared State) між потоками
+#  Спільний стан між потоками
 # ═══════════════════════════════════════════════════════════════
-class RadarState:
+
+class SharedState:
     def __init__(self):
         self.lock = threading.Lock()
-        self.state_str = "SLEEP"
-        self.target_class = 0
-        self.conf = 0.0
-        self.doa = 90
-        self.dist_m = 200
-        self.hits = 0
-        self.vol = 0.0
-        self.miss = 0
+        self.status = RadarStatus()
+        self.error: str | None = None
+        self.running = True
 
-shared_state = RadarState()
+    def set(self, status: RadarStatus) -> None:
+        with self.lock:
+            # Копіюємо поля, а не посилання — рушій змінює свій об'єкт на місці
+            self.status = RadarStatus(
+                state=status.state, p_drone=status.p_drone,
+                p_smoothed=status.p_smoothed,
+                confirmations=status.confirmations, misses=status.misses,
+                threshold=status.threshold, level_dbfs=status.level_dbfs,
+                gated=status.gated, angle_deg=status.angle_deg,
+                angle_confidence=status.angle_confidence,
+                angle_source=status.angle_source,
+                angle_ambiguous=status.angle_ambiguous, range=status.range,
+            )
+
+    def get(self) -> RadarStatus:
+        with self.lock:
+            return self.status
+
+
+shared = SharedState()
+
 
 # ═══════════════════════════════════════════════════════════════
-# Аудіо потік (Background)
+#  Фоновий потік обробки
 # ═══════════════════════════════════════════════════════════════
-def audio_inference_thread():
-    print("🔧 Ініціалізація ONNX (Background Thread)...")
-    session = ort.InferenceSession(ONNX_MODEL_PATH, providers=["CPUExecutionProvider"])
-    input_name = session.get_inputs()[0].name
-    mel_fb = create_mel_filterbank(SAMPLE_RATE, N_FFT, N_MELS).astype(np.float32)
-    tracker = SmartTracker()
 
-    print("🎤 Аудіо потік запущено. Інференс працює у фоні.")
+def audio_thread(engine: RadarEngine, inp, use_uart: bool) -> None:
+    uart = UartSender() if use_uart else None
     try:
-        with sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype="float32",
-            blocksize=CHUNK_SAMPLES,
-        ) as stream:
-            while True:
-                audio_chunk, overflowed = stream.read(CHUNK_SAMPLES)
-                current_time = time.time()
-                
-                mono = audio_chunk.mean(axis=1)
-                peak_volume = float(np.max(np.abs(mono)))
-                
-                if peak_volume < NOISE_GATE:
-                    tracker.set_sleep()
-                    with shared_state.lock:
-                        shared_state.state_str = tracker.state
-                        shared_state.vol = peak_volume
-                        shared_state.hits = tracker.confirmations
-                        shared_state.miss = tracker.miss_count
-                    continue
-                    
-                mel = compute_mel_spectrogram(mono, SAMPLE_RATE, N_FFT, HOP_LENGTH, N_MELS, mel_fb)
-                mel_input = mel[np.newaxis, np.newaxis, :, :].astype(np.float32)
-                
-                logits = session.run(None, {input_name: mel_input})[0]
-                exp_logits = np.exp(logits - np.max(logits))
-                probs = exp_logits / exp_logits.sum()
-                
-                pred_class = int(np.argmax(probs))
-                conf = float(probs[0, pred_class])
-                
-                # ── DOA (Прямо з процесора мікрофона через USB) ──
-                angle = get_usb_doa()
-                tracker.update(pred_class, conf, angle, current_time)
-                
-                dist_m = int(min(200, 6.0 / max(peak_volume, 1e-4)))
-                
-                with shared_state.lock:
-                    shared_state.state_str = tracker.state
-                    shared_state.target_class = tracker.target_class
-                    shared_state.conf = tracker.target_conf
-                    shared_state.doa = tracker.current_angle
-                    shared_state.hits = tracker.confirmations
-                    shared_state.vol = peak_volume
-                    shared_state.dist_m = dist_m
-                    shared_state.miss = tracker.miss_count
-
-    except Exception as e:
-        print(f"Помилка в аудіо потоці: {e}")
+        stream = open_stream(inp, BLOCK_SAMPLES)
+        with stream:
+            while shared.running:
+                block, _ = stream.read(BLOCK_SAMPLES)
+                status = engine.process_block(np.asarray(block))
+                if uart is not None:
+                    uart.send(status)
+                shared.set(status)
+    except Exception as exc:
+        with shared.lock:
+            shared.error = str(exc)
+        print(f"❌ Помилка аудіопотоку: {exc}")
+    finally:
+        if uart is not None:
+            uart.close()
 
 
 # ═══════════════════════════════════════════════════════════════
-# Pygame UI (Main Thread)
+#  Малювання
 # ═══════════════════════════════════════════════════════════════
-def main_gui():
+
+BLACK        = (10, 10, 15)
+GREEN_DARK   = (0, 70, 0)
+GREEN_MID    = (0, 140, 0)
+GREEN_BRIGHT = (0, 255, 0)
+RED          = (255, 60, 60)
+RED_DARK     = (110, 30, 30)
+AMBER        = (255, 200, 50)
+WHITE        = (235, 235, 235)
+GRAY         = (110, 110, 110)
+PANEL_BG     = (20, 20, 26)
+
+
+def to_screen(cx: int, cy: int, angle_deg: float, radius_px: float
+              ) -> tuple[int, int]:
+    """
+    Кут установки → екранні координати.
+
+    0° = вгору (північ), далі за годинниковою стрілкою:
+    90° = праворуч, 180° = вниз, 270° = ліворуч.
+    """
+    rad = math.radians(angle_deg - 90.0)
+    return (int(cx + radius_px * math.cos(rad)),
+            int(cy + radius_px * math.sin(rad)))
+
+
+def draw_grid(screen, font, cx, cy, max_radius, px_per_m) -> None:
+    for d in RINGS_M:
+        r = int(d * px_per_m)
+        if r > max_radius:
+            continue
+        pygame.draw.circle(screen, GREEN_DARK, (cx, cy), r, 1)
+        label = font.render(f"{d} м", True, GRAY)
+        screen.blit(label, (cx + 6, cy - r - 16))
+
+    for ang in range(0, 360, 45):
+        x, y = to_screen(cx, cy, ang, max_radius)
+        pygame.draw.line(screen, GREEN_DARK, (cx, cy), (x, y), 1)
+        lx, ly = to_screen(cx, cy, ang, max_radius + 18)
+        label = font.render(f"{ang}°", True, GRAY)
+        screen.blit(label, (lx - label.get_width() // 2,
+                            ly - label.get_height() // 2))
+
+
+def draw_sweep(screen, cx, cy, max_radius, sweep_angle) -> None:
+    for i in range(0, 26, 2):
+        x, y = to_screen(cx, cy, sweep_angle + i, max_radius)
+        shade = max(0, 150 - i * 6)
+        pygame.draw.line(screen, (0, shade, 0), (cx, cy), (x, y), 2)
+    x, y = to_screen(cx, cy, sweep_angle, max_radius)
+    pygame.draw.line(screen, GREEN_MID, (cx, cy), (x, y), 2)
+
+
+def draw_target(screen, font, cx, cy, max_radius, px_per_m,
+                st: RadarStatus) -> None:
+    """Малює ціль з урахуванням того, що саме нам ВІДОМО."""
+    alarm = st.state == "ALARM"
+    colour = RED if alarm else AMBER
+    pulse = 10 + math.sin(time.time() * 12.0) * 4 if alarm else 8
+
+    # ── Напрямок невідомий: коло навколо центру ──
+    if st.angle_deg is None:
+        radius = int(max_radius * 0.55 + math.sin(time.time() * 6) * 6)
+        pygame.draw.circle(screen, colour, (cx, cy), radius, 2)
+        text = font.render("напрямок н/д", True, colour)
+        screen.blit(text, (cx - text.get_width() // 2, cy - radius - 22))
+        return
+
+    angle = st.angle_deg
+    # Ширина сектора невизначеності: чим нижча впевненість, тим ширше
+    half_width = 12.0 + (1.0 - min(st.angle_confidence, 1.0)) * 20.0
+
+    # ── Сектор напрямку ──
+    for offset in (-half_width, half_width):
+        x, y = to_screen(cx, cy, angle + offset, max_radius)
+        pygame.draw.line(screen, RED_DARK, (cx, cy), (x, y), 1)
+
+    if st.range.ok:
+        r_px = min(st.range.distance_m * px_per_m, max_radius - 4)
+        tx, ty = to_screen(cx, cy, angle, r_px)
+
+        # Кільце невизначеності відстані вздовж сектора
+        if st.range.lo_m is not None and st.range.hi_m is not None:
+            lo_px = min(st.range.lo_m * px_per_m, max_radius)
+            hi_px = min(st.range.hi_m * px_per_m, max_radius)
+            for offset in np.linspace(-half_width, half_width, 9):
+                p1 = to_screen(cx, cy, angle + offset, lo_px)
+                p2 = to_screen(cx, cy, angle + offset, hi_px)
+                pygame.draw.line(screen, RED_DARK, p1, p2, 1)
+
+        if alarm:
+            pygame.draw.circle(screen, colour, (tx, ty), int(pulse))
+        pygame.draw.circle(screen, WHITE, (tx, ty), 5)
+        caption = f"ДРОН {angle:.0f}° · {st.range.format()}"
+    else:
+        # Відстань невідома — малюємо промінь, а не точку
+        x, y = to_screen(cx, cy, angle, max_radius - 4)
+        pygame.draw.line(screen, colour, (cx, cy), (x, y), 3)
+        tx, ty = to_screen(cx, cy, angle, max_radius * 0.62)
+        if alarm:
+            pygame.draw.circle(screen, colour, (tx, ty), int(pulse), 2)
+        caption = f"ДРОН {angle:.0f}° · відстань н/д"
+
+    if st.angle_ambiguous:
+        # Дзеркальний напрямок за двома мікрофонами — показуємо обидва
+        mx, my = to_screen(cx, cy, (180.0 - angle) % 360.0,
+                           max_radius * 0.62)
+        pygame.draw.circle(screen, RED_DARK, (mx, my), 5, 1)
+        caption += " (±дзеркально)"
+
+    label = font.render(caption, True, WHITE)
+    screen.blit(label, (min(tx + 14, screen.get_width() - label.get_width() - 8),
+                        ty - 8))
+
+
+def draw_panel(screen, fonts, st: RadarStatus, calib_note: str | None) -> None:
+    font_large, font_med, font_small = fonts
+    rect = pygame.Rect(10, 10, 360, 214)
+    pygame.draw.rect(screen, PANEL_BG, rect, border_radius=10)
+    pygame.draw.rect(screen, GREEN_DARK, rect, 2, border_radius=10)
+
+    if st.state == "ALARM":
+        title, colour = "SOS ДРОН!", RED
+    elif st.state == "TRACK":
+        title, colour = "Підозра...", AMBER
+    elif st.state == "LISTEN":
+        title, colour = "Слухаю...", GREEN_BRIGHT
+    else:
+        title, colour = "Тиша", GRAY
+    screen.blit(font_large.render(title, True, colour), (25, 22))
+
+    rows = [
+        (f"Підтверджень: {st.confirmations}/{CONFIRM_THRESHOLD}", WHITE),
+        (f"Ймовірність: {st.p_smoothed:.0%}  (поріг {st.threshold:.0%})",
+         WHITE),
+    ]
+    y = 86
+    for text, col in rows:
+        screen.blit(font_med.render(text, True, col), (25, y))
+        y += 32
+
+    small = [
+        f"Рівень: {st.level_dbfs:.0f} dBFS   Фон: {st.range.noise_dbfs:.0f} dBFS",
+        f"Напрямок: " + ("н/д" if st.angle_deg is None
+                         else f"{st.angle_deg:.0f}° ({st.angle_source})"),
+        f"Відстань: {st.range.format()}",
+    ]
+    for text in small:
+        screen.blit(font_small.render(text, True, GRAY), (25, y))
+        y += 22
+
+    if calib_note:
+        note = font_small.render(calib_note, True, AMBER)
+        screen.blit(note, (25, y))
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Головна функція
+# ═══════════════════════════════════════════════════════════════
+
+def main() -> None:
+    cfg = calibration.load()
+
+    print("=" * 66)
+    print("🎯 Acoustic Radar — графічний інтерфейс")
+    print("=" * 66)
+
+    engine = RadarEngine(cfg=cfg)
+    inp = resolve_input(cfg, features.SAMPLE_RATE)
+    engine.attach_input(inp)
+    print(f"   Мікрофон: {inp.describe()}")
+    print(f"   {calibration.describe(cfg)}")
+
+    calib_note = None
+    if not engine.ranger.calibrated:
+        calib_note = "⚠ відстань не калібрована: calibrate.py range"
+        print(f"\n   {calib_note}")
+
     pygame.init()
-    
-    # Можна змінити на повноекранний режим для RPi (pygame.FULLSCREEN)
-    WIDTH, HEIGHT = 1024, 600
-    screen = pygame.display.set_mode((WIDTH, HEIGHT))
-    pygame.display.set_caption("Acoustic Radar UI")
+    width, height = 1024, 600
+    fullscreen = "--fullscreen" in sys.argv
+    flags = pygame.FULLSCREEN if fullscreen else 0
+    screen = pygame.display.set_mode((width, height), flags)
+    pygame.display.set_caption("Acoustic Radar")
     clock = pygame.time.Clock()
-    
-    # ── Кольори ──
-    BLACK = (10, 10, 15)
-    GREEN_DARK = (0, 70, 0)
-    GREEN_BRIGHT = (0, 255, 0)
-    RED = (255, 50, 50)
-    BLUE = (50, 150, 255)
-    WHITE = (255, 255, 255)
-    GRAY = (100, 100, 100)
-    
-    # ── Шрифти ──
-    # Використовуємо дефолтний системний шрифт, щоб працювало всюди
-    font_large = pygame.font.Font(None, 64)
-    font_med = pygame.font.Font(None, 36)
-    font_small = pygame.font.Font(None, 24)
-    
-    # ── Геометрія радару ──
-    cx, cy = WIDTH // 2, HEIGHT // 2
-    max_radius = min(WIDTH, HEIGHT) // 2 - 20
-    px_per_m = max_radius / 200.0
-    
-    sweep_angle = 360.0
-    
-    # Запуск фонового потоку інференсу
-    audio_t = threading.Thread(target=audio_inference_thread, daemon=True)
-    audio_t.start()
-    
+
+    fonts = (pygame.font.Font(None, 58),
+             pygame.font.Font(None, 30),
+             pygame.font.Font(None, 22))
+    font_small = fonts[2]
+
+    cx, cy = int(width * 0.66), height // 2
+    max_radius = height // 2 - 34
+    px_per_m = max_radius / MAX_RANGE_M
+
+    thread = threading.Thread(target=audio_thread,
+                              args=(engine, inp, True), daemon=True)
+    thread.start()
+
+    sweep_angle = 0.0
     running = True
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
-            # Вихід по Esc
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+            elif event.type == pygame.KEYDOWN and event.key in (
+                    pygame.K_ESCAPE, pygame.K_q):
                 running = False
-                
-        # Анімація сканування
-        sweep_angle -= 1.5
-        if sweep_angle < 0:
-            sweep_angle = 360.0
-            
-        screen.fill(BLACK)
-        
-        # ── 1. Малюємо сітку радару (повне коло) ──
-        for d in [50, 100, 150, 200]:
-            r = int(d * px_per_m)
-            pygame.draw.circle(screen, GREEN_DARK, (cx, cy), r, 2)
-            
-            # Підписи дистанції (тільки на верхній осі, щоб не забивати екран)
-            lbl = font_small.render(f"{d}m", True, GRAY)
-            screen.blit(lbl, (cx + 5, cy - r - 20))
-            
-        # Радіальні лінії (кожні 45 градусів)
-        for ang in range(0, 360, 45):
-            rad = math.radians(ang - 90)
-            x = cx + max_radius * math.cos(rad)
-            y = cy + max_radius * math.sin(rad)
-            pygame.draw.line(screen, GREEN_DARK, (cx, cy), (x, y), 2)
-            
-            # Підписи кутів
-            ang_lbl = font_small.render(f"{ang}°", True, GRAY)
-            # Невеликий відступ для тексту
-            tx = x + 10 * math.cos(rad)
-            ty = y + 10 * math.sin(rad)
-            screen.blit(ang_lbl, (tx - 10, ty - 10))
-            
-        # ── 2. Малюємо лінію сканування ──
-        rad_sweep = math.radians(sweep_angle - 90)
-        sx = cx + max_radius * math.cos(rad_sweep)
-        sy = cy + max_radius * math.sin(rad_sweep)
-        pygame.draw.line(screen, GREEN_BRIGHT, (cx, cy), (sx, sy), 3)
-        
-        # Заливка сектора (ефект післясвітіння)
-        for i in range(1, 15):
-            lag_rad = math.radians(sweep_angle + i - 90)
-            lx = cx + max_radius * math.cos(lag_rad)
-            ly = cy + max_radius * math.sin(lag_rad)
-            color = (0, max(0, 200 - i*15), 0)
-            pygame.draw.line(screen, color, (cx, cy), (lx, ly), 2)
-        
-        # ── 3. Читаємо стан і малюємо ціль (Blip) ──
-        with shared_state.lock:
-            state = shared_state.state_str
-            t_class = shared_state.target_class
-            conf = shared_state.conf
-            doa = shared_state.doa
-            dist = shared_state.dist_m
-            hits = shared_state.hits
-            vol = shared_state.vol
-            miss = shared_state.miss
-            
-        if state in ("TRACK", "ALARM"):
-            blip_color = RED
-            
-            # Конвертація DOA (0-359) у координати для 360 екрану
-            # 0° (Північ) = Верх, 90° (Схід) = Право, 180° (Південь) = Низ, 270° (Захід) = Ліво
-            target_rad = math.radians(doa - 90)
-            
-            # Відстань
-            r_px = min(dist * px_per_m, max_radius)
-            
-            tx = cx + r_px * math.cos(target_rad)
-            ty = cy + r_px * math.sin(target_rad)
-            
-            # Малюємо 50-градусний сектор захоплення цілі (±25° від основного кута)
-            sec_left_rad = math.radians(doa - 25 - 90)
-            sec_right_rad = math.radians(doa + 25 - 90)
-            x_l = cx + max_radius * math.cos(sec_left_rad)
-            y_l = cy + max_radius * math.sin(sec_left_rad)
-            x_r = cx + max_radius * math.cos(sec_right_rad)
-            y_r = cy + max_radius * math.sin(sec_right_rad)
-            
-            sector_color = (120, 40, 40)
-            pygame.draw.line(screen, sector_color, (cx, cy), (int(x_l), int(y_l)), 1)
-            pygame.draw.line(screen, sector_color, (cx, cy), (int(x_r), int(y_r)), 1)
-            
-            # Пульсація при тривозі
-            if state == "ALARM":
-                pulse = 12 + math.sin(time.time() * 15) * 6
-                pygame.draw.circle(screen, blip_color, (int(tx), int(ty)), int(pulse))
-            
-            pygame.draw.circle(screen, WHITE, (int(tx), int(ty)), 6)
-            
-            # Текст біля цілі
-            lbl = font_small.render(f"DRONE {doa}° | ~{dist}m (±25°)", True, WHITE)
-            screen.blit(lbl, (int(tx) + 15, int(ty) - 10))
 
-        # ── 4. Малюємо інформаційну панель (Лівий верхній кут) ──
-        panel_rect = (10, 10, 340, 200)
-        pygame.draw.rect(screen, (20, 20, 25), panel_rect, border_radius=10)
-        pygame.draw.rect(screen, GREEN_DARK, panel_rect, 2, border_radius=10)
-        
-        if state == "ALARM":
-            status_txt = font_large.render("SOS ДРОН!", True, RED)
-        elif state == "TRACK":
-            status_txt = font_large.render("Підозра...", True, (255, 200, 50))
-        elif state == "LISTEN":
-            status_txt = font_large.render("Слухаю...", True, GREEN_BRIGHT)
-        else:
-            status_txt = font_large.render("Тиша", True, GRAY)
-            
-        screen.blit(status_txt, (25, 20))
-        
-        # Статистика
-        hits_txt = font_med.render(f"Хіти: {hits}/{CONFIRM_THRESHOLD}", True, WHITE)
-        screen.blit(hits_txt, (25, 90))
-        
-        conf_str = f"Впевненість: {conf:.0%}" if state in ("TRACK", "ALARM") else "Впевненість: ---"
-        conf_txt = font_med.render(conf_str, True, WHITE)
-        screen.blit(conf_txt, (25, 125))
-        
-        vol_txt = font_small.render(f"Гучність: {vol:.4f} (Поріг: {NOISE_GATE})", True, GRAY)
-        screen.blit(vol_txt, (25, 160))
-        
-        miss_txt = font_small.render(f"Пропуски: {miss}/5", True, GRAY)
-        screen.blit(miss_txt, (200, 160))
+        sweep_angle = (sweep_angle + 2.0) % 360.0
+        st = shared.get()
+
+        screen.fill(BLACK)
+        draw_grid(screen, font_small, cx, cy, max_radius, px_per_m)
+        draw_sweep(screen, cx, cy, max_radius, sweep_angle)
+        if st.state in ("TRACK", "ALARM"):
+            draw_target(screen, font_small, cx, cy, max_radius, px_per_m, st)
+        draw_panel(screen, fonts, st, calib_note)
+
+        if shared.error:
+            err = font_small.render(f"Аудіо: {shared.error}", True, RED)
+            screen.blit(err, (12, height - 26))
 
         pygame.display.flip()
-        clock.tick(30)  # 30 FPS, плавна анімація
-        
+        clock.tick(30)
+
+    shared.running = False
+    engine.close()
     pygame.quit()
     sys.exit()
 
+
 if __name__ == "__main__":
-    main_gui()
+    main()
