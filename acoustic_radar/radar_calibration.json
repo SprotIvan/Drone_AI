@@ -1,0 +1,8 @@
+{
+  "range_ref_distance_m": 10.0,
+  "range_ref_level_dbfs": -35.0,
+  "noise_floor_dbfs": -60.0,
+  "doa_offset_deg": 0.0,
+  "doa_invert": false,
+  "input_device": "ReSpeaker"
+}

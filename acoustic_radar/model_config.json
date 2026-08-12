@@ -1,0 +1,29 @@
+{
+  "sample_rate": 16000,
+  "n_fft": 1024,
+  "hop_length": 256,
+  "n_mels": 64,
+  "f_min": 50.0,
+  "f_max": 8000.0,
+  "top_db": 80.0,
+  "window_sec": 2.0,
+  "target_frames": 126,
+  "normalize": true,
+  "num_classes": 2,
+  "class_names": {
+    "0": "Фон",
+    "1": "ДРОН"
+  },
+  "decision_threshold": 0.7750000000000004,
+  "val_metrics": {
+    "threshold": 0.7750000000000004,
+    "tp": 671,
+    "fp": 16,
+    "fn": 129,
+    "tn": 784,
+    "precision": 0.9767103347889374,
+    "recall": 0.83875,
+    "f1": 0.902488231338265,
+    "false_alarm_rate": 0.02
+  }
+}
