@@ -41,13 +41,18 @@ download_dads.py — Завантаження сирих аудіо для да�
 
 from __future__ import annotations
 
-import csv
-import io
-import shutil
 import sys
+import io
+import csv
+import shutil
 import urllib.request
 import zipfile
 from pathlib import Path
+
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 
 # ═══════════════════════════════════════════════════════════════

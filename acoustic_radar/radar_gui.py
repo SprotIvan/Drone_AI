@@ -42,6 +42,10 @@ from audio_io import open_stream, resolve_input  # noqa: E402
 from radar import (  # noqa: E402
     BLOCK_SAMPLES, CONFIRM_THRESHOLD, RadarEngine, RadarStatus, UartSender,
 )
+from telegram_alert import TelegramAlerter  # noqa: E402
+from audio_logger import AudioLogger  # noqa: E402
+
+TELEGRAM_TOKEN = "8875007303:AAGb8p-3-_h8qJaUFVAICO4I2sXSCpbTwOE"
 
 # Максимальна дальність шкали (метри)
 MAX_RANGE_M = 250.0
@@ -85,21 +89,39 @@ shared = SharedState()
 #  Фоновий потік обробки
 # ═══════════════════════════════════════════════════════════════
 
-def audio_thread(engine: RadarEngine, inp, use_uart: bool) -> None:
+def audio_thread(engine: RadarEngine, inp, use_uart: bool,
+                 alerter: TelegramAlerter | None = None,
+                 logger: AudioLogger | None = None) -> None:
     uart = UartSender() if use_uart else None
     try:
         stream = open_stream(inp, BLOCK_SAMPLES)
         with stream:
             while shared.running:
                 block, _ = stream.read(BLOCK_SAMPLES)
-                status = engine.process_block(np.asarray(block))
+                block_np = np.asarray(block)
+                status = engine.process_block(block_np)
                 if uart is not None:
                     uart.send(status)
                 shared.set(status)
+
+                # ── Автозапис аудіо ──
+                if logger is not None:
+                    logger.feed(block_np)
+                    logger.on_status(
+                        status.state, status.angle_deg,
+                        status.range.format(),
+                    )
+
+                # ── Telegram тривога ──
+                if alerter is not None and alerter.ready:
+                    alerter.on_status(
+                        status.state, status.angle_deg,
+                        status.range.format(), status.p_smoothed,
+                    )
     except Exception as exc:
         with shared.lock:
             shared.error = str(exc)
-        print(f"❌ Помилка аудіопотоку: {exc}")
+        print(f"Помилка аудіопотоку: {exc}")
     finally:
         if uart is not None:
             uart.close()
@@ -272,19 +294,32 @@ def main() -> None:
     cfg = calibration.load()
 
     print("=" * 66)
-    print("🎯 Acoustic Radar — графічний інтерфейс")
+    print("Acoustic Radar + Telegram + Audio Logger")
     print("=" * 66)
 
     engine = RadarEngine(cfg=cfg)
     inp = resolve_input(cfg, features.SAMPLE_RATE)
     engine.attach_input(inp)
-    print(f"   Мікрофон: {inp.describe()}")
+    print(f"   Mikrofon: {inp.describe()}")
     print(f"   {calibration.describe(cfg)}")
 
     calib_note = None
     if not engine.ranger.calibrated:
-        calib_note = "⚠ відстань не калібрована: calibrate.py range"
+        calib_note = "distance not calibrated: calibrate.py range"
         print(f"\n   {calib_note}")
+
+    # ── Telegram ──
+    alerter = TelegramAlerter(TELEGRAM_TOKEN)
+    alerter.discover_chats()
+    if alerter.ready:
+        print(f"   Telegram: {len(alerter.chat_ids)} chat(s) connected")
+        alerter.send_startup()
+    else:
+        print("   Telegram: no chats yet (send /start to bot)")
+
+    # ── Audio Logger ──
+    logger = AudioLogger()
+    print(f"   Audio Logger: detections/ ({logger.detection_count} saved)")
 
     pygame.init()
     width, height = 1024, 600
@@ -304,7 +339,8 @@ def main() -> None:
     px_per_m = max_radius / MAX_RANGE_M
 
     thread = threading.Thread(target=audio_thread,
-                              args=(engine, inp, True), daemon=True)
+                              args=(engine, inp, True, alerter, logger),
+                              daemon=True)
     thread.start()
 
     sweep_angle = 0.0
