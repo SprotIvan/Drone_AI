@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+"""
+main.py — Unified drone detection station. ONE command, ONE window.
+
+    python main.py
+
+Starts, in order:
+    1. logging
+    2. configuration (fusion_config.json + radar_calibration.json)
+    3. acoustic worker  — microphone, acoustic ML, DOA, ranging
+    4. camera worker    — Picamera2, Hailo/YOLO26n, IMM tracker, switching
+    5. sensor fusion    — priority state machine
+    6. unified UI       — camera view with the acoustic radar overlaid
+
+and shuts all of it down cleanly on 'q', ESC, window close, or Ctrl+C.
+
+═══════════════════════════════════════════════════════════════════
+THREADING
+═══════════════════════════════════════════════════════════════════
+
+    ┌──────────────┐   AcousticObservation   ┌────────────────┐
+    │ audio thread │ ──────────────────────► │                │
+    │   ~2 Hz      │      (LatestValue)      │  SensorFusion  │
+    └──────────────┘                         │   + HUD        │
+    ┌──────────────┐    VisualObservation    │  (main thread) │
+    │ camera thread│ ──────────────────────► │                │
+    │   ~30 Hz     │      (LatestValue)      └────────────────┘
+    └──────────────┘
+
+Neither sensor thread ever waits on the other or on the UI: they publish
+into a one-slot mailbox and move on. The UI never waits on a sensor: it
+renders whatever the newest snapshot is, including "nothing yet" and
+"that subsystem is offline".
+
+The UI runs on the MAIN thread because `cv2.imshow`/`waitKey` require it on
+macOS and are only reliably safe there on Linux/X11 too.
+
+Both workers are daemon threads, so a device call stuck in the kernel
+(a wedged PortAudio read, a hung CSI capture) can never prevent the process
+from exiting.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import signal
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+BASE_DIR = Path(__file__).resolve().parent
+# Allow `python main.py` to work from any working directory: the existing
+# modules use flat imports (`from camera_manager import ...`), which need
+# this directory on the path.
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+import cv2  # noqa: E402
+
+import fusion_config  # noqa: E402
+import station_logging  # noqa: E402
+from acoustic_worker import AcousticWorker  # noqa: E402
+from camera_cue import BearingProjector  # noqa: E402
+from camera_worker import CameraWorker  # noqa: E402
+from hud import HUD  # noqa: E402
+from sensor_fusion import SensorFusion, SystemState  # noqa: E402
+from station_logging import EventLogger  # noqa: E402
+from target_state import SubsystemHealth, SubsystemState, now  # noqa: E402
+
+DEFAULT_HEF = str(BASE_DIR / "bestty_yolo260508.hef")
+
+log = logging.getLogger("station.main")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Startup banner
+# ═══════════════════════════════════════════════════════════════
+
+def print_banner(config: fusion_config.StationConfig, hef_path: str) -> None:
+    log.info("=" * 62)
+    log.info("DRONE DETECTION STATION — acoustic + visual sensor fusion")
+    log.info("=" * 62)
+
+    for line in config.describe_calibration():
+        log.info("  %s", line)
+
+    gate = config.activation_distance_m(0)
+    release = config.release_distance_m(0)
+    if gate is not None:
+        log.info("  camera-range gate: acquire <= %.0f m, release > %.0f m",
+                 gate, release or gate)
+        log.info("  ^ DERIVED from optics, not assumed. A %.2f m drone spans "
+                 "%.0f px at %.0f m on the FAR camera, which is the smallest "
+                 "box this configuration expects the detector to resolve.",
+                 config.geometry.drone_real_width_m or 0.0,
+                 config.fusion.min_detectable_box_px, gate)
+    else:
+        log.warning("  camera-range gate: NOT COMPUTABLE (optics "
+                    "uncalibrated) — visual acquisition will run on acoustic "
+                    "confirmation alone")
+
+    log.info("  camera switch: NEAR below %.2f m, FAR above %.2f m, "
+             "%d-frame confirmation",
+             config.switching.switch_to_near_below_m,
+             config.switching.switch_to_far_above_m,
+             config.switching.confirm_frames)
+    log.info("  HEF: %s", hef_path)
+    log.info("-" * 62)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Application
+# ═══════════════════════════════════════════════════════════════
+
+class Station:
+    """Owns the workers, the fusion layer and the window."""
+
+    def __init__(self, config: fusion_config.StationConfig, hef_path: str,
+                 events: EventLogger, headless: bool = False,
+                 no_audio: bool = False, no_camera: bool = False):
+        self.config = config
+        self.events = events
+        self.headless = headless
+        self.running = True
+
+        self.projector = BearingProjector(config.geometry,
+                                          config.visual.frame_width)
+        self.fusion = SensorFusion(config, self.projector)
+        self.hud = HUD(config, self.projector)
+
+        self.acoustic: Optional[AcousticWorker] = None
+        self.camera: Optional[CameraWorker] = None
+
+        self._disabled = SubsystemHealth(SubsystemState.DISABLED,
+                                         "disabled on the command line")
+
+        if not no_audio:
+            self.acoustic = AcousticWorker(config, events)
+        if not no_camera:
+            self.camera = CameraWorker(config, events, hef_path)
+
+        self._ui_dt = 1.0 / max(config.ui.max_ui_fps, 1.0)
+        self._last_render = 0.0
+        self._ui_fps = 0.0
+        self._frames = 0
+        self._started = now()
+
+    # ── Lifecycle ──────────────────────────────────────────────
+
+    def start(self) -> None:
+        # Workers are started in parallel and each reports its own health.
+        # Neither is allowed to block the other's startup, so a camera that
+        # takes seconds to warm up does not delay the microphone.
+        if self.acoustic is not None:
+            self.acoustic.start()
+        if self.camera is not None:
+            self.camera.start()
+
+    def stop(self) -> None:
+        self.running = False
+
+    def shutdown(self) -> None:
+        log.info("shutting down...")
+        for worker in (self.camera, self.acoustic):
+            if worker is not None:
+                worker.stop()
+        for worker in (self.camera, self.acoustic):
+            if worker is not None:
+                worker.join(timeout=3.0)
+
+        if not self.headless:
+            try:
+                cv2.destroyAllWindows()
+                # On some builds the window only actually closes after a
+                # further waitKey pump.
+                for _ in range(4):
+                    cv2.waitKey(1)
+            except Exception:
+                pass
+
+        uptime = now() - self._started
+        log.info("session: %.0f s, %d UI frames (%.1f fps average)",
+                 uptime, self._frames, self._frames / max(uptime, 1e-6))
+        if self.acoustic is not None and self.acoustic.mean_block_ms:
+            log.info("acoustic block time: mean %.0f ms (budget 500 ms)",
+                     self.acoustic.mean_block_ms)
+        if self.camera is not None:
+            log.info("camera: %.1f fps, inference %.0f ms",
+                     self.camera.fps, self.camera.inference_ms)
+        log.info("stopped.")
+
+    # ── Health helpers ─────────────────────────────────────────
+
+    def _acoustic_health(self) -> SubsystemHealth:
+        if self.acoustic is None:
+            return self._disabled
+        return self.acoustic.health.get() or SubsystemHealth()
+
+    def _visual_health(self) -> SubsystemHealth:
+        if self.camera is None:
+            return self._disabled
+        return self.camera.health.get() or SubsystemHealth()
+
+    # ── Main loop ──────────────────────────────────────────────
+
+    def run(self) -> None:
+        window = self.config.ui.window_name
+        if not self.headless:
+            cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+            if self.config.ui.fullscreen:
+                cv2.setWindowProperty(window, cv2.WND_PROP_FULLSCREEN,
+                                      cv2.WINDOW_FULLSCREEN)
+
+        last_state: Optional[SystemState] = None
+        last_tick = time.monotonic()
+
+        while self.running:
+            tick = time.monotonic()
+            dt = tick - last_tick
+            last_tick = tick
+
+            acoustic_obs = (self.acoustic.latest.get()
+                            if self.acoustic is not None else None)
+            visual_obs = (self.camera.latest.get()
+                          if self.camera is not None else None)
+
+            target = self.fusion.update(
+                acoustic_obs, visual_obs,
+                self._acoustic_health(), self._visual_health())
+
+            if target.state is not last_state:
+                self._announce(target, last_state)
+                last_state = target.state
+
+            if self.headless:
+                # Used by the integration test: run the whole pipeline with
+                # no window, so the logic can be exercised over SSH.
+                time.sleep(self._ui_dt)
+                self._frames += 1
+                continue
+
+            frame = self.hud.render(target, dt, fps=self._ui_fps)
+            cv2.imshow(window, frame)
+            self._frames += 1
+
+            inst = 1.0 / max(dt, 1e-6)
+            self._ui_fps = (0.9 * self._ui_fps + 0.1 * inst
+                            if self._ui_fps else inst)
+
+            if not self._handle_keys(window):
+                break
+
+    def _announce(self, target, previous: Optional[SystemState]) -> None:
+        """One clear line per state change — the operator-facing narrative."""
+        state = target.state
+        acoustic = target.acoustic
+        if state is SystemState.ACOUSTIC_DETECTED:
+            log.info("ACOUSTIC CONTACT: bearing %s, range %s, confidence %.0f%%",
+                     target.bearing_text(),
+                     acoustic.distance_text() if acoustic else "N/A",
+                     (acoustic.p_smoothed * 100.0) if acoustic else 0.0)
+        elif state is SystemState.ACOUSTIC_TRACKING:
+            log.info("ACOUSTIC TRACKING: microphone is the primary sensor")
+        elif state is SystemState.VISUAL_ACQUISITION:
+            log.info("VISUAL ACQUISITION: target should be within camera "
+                     "range — searching visually")
+        elif state is SystemState.VISUAL_TRACKING:
+            log.info("VISUAL TRACKING: camera is now the primary sensor "
+                     "(YOLO confidence %s)", target.visual_confidence_text())
+        elif state is SystemState.VISUAL_LOST_ACOUSTIC_TRACKING:
+            log.warning("VISUAL TRACK LOST — falling back to acoustic "
+                        "tracking for reacquisition")
+        elif state is SystemState.TARGET_LOST:
+            log.warning("TARGET LOST: both sensors have lost contact")
+        elif state is SystemState.SEARCHING and previous is not None:
+            log.info("SEARCHING: no target")
+
+    # ── Keyboard ───────────────────────────────────────────────
+
+    def _handle_keys(self, window: str) -> bool:
+        """Returns False to exit the loop."""
+        key = cv2.waitKey(1) & 0xFF
+
+        # Closing the window with the title-bar X must also stop the app.
+        try:
+            if cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
+                log.info("window closed")
+                return False
+        except cv2.error:
+            return False
+
+        if key in (ord("q"), 27):            # q / ESC
+            log.info("quit requested")
+            return False
+        if key == ord("h"):
+            self.hud.show_help = not self.hud.show_help
+        elif key == ord("f") and self.camera is not None:
+            frozen = not self.camera.switching_frozen
+            self.camera.freeze_switching(frozen)
+            log.info("camera switching %s",
+                     "FROZEN" if frozen else "RESUMED")
+        elif key == ord("c") and self.camera is not None:
+            self.camera.request_focal_calibration()
+        elif key == ord("r"):
+            self.fusion.reset()
+        return True
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Entry point
+# ═══════════════════════════════════════════════════════════════
+
+def main(argv: Optional[list] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Unified acoustic + visual drone detection station")
+    parser.add_argument("--config", default=str(fusion_config.CONFIG_PATH),
+                        help="path to fusion_config.json")
+    parser.add_argument("--hef", default=DEFAULT_HEF,
+                        help="path to the YOLO26n .hef model")
+    parser.add_argument("--fullscreen", action="store_true")
+    parser.add_argument("--headless", action="store_true",
+                        help="run every subsystem but open no window")
+    parser.add_argument("--no-audio", action="store_true",
+                        help="run without the acoustic subsystem")
+    parser.add_argument("--no-camera", action="store_true",
+                        help="run without the camera subsystem")
+    parser.add_argument("--log-level", default=None,
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.add_argument("--duration", type=float, default=None,
+                        help="exit after N seconds (for testing)")
+    args = parser.parse_args(argv)
+
+    config = fusion_config.load(args.config)
+    if args.log_level:
+        config.logging.level = args.log_level
+    if args.fullscreen:
+        config.ui.fullscreen = True
+
+    station_logging.setup(config.logging, BASE_DIR)
+    events = EventLogger(logging.getLogger("station"), config.logging)
+
+    if args.no_audio and args.no_camera:
+        log.error("--no-audio and --no-camera together leave nothing to run")
+        return 2
+
+    print_banner(config, args.hef)
+
+    station = Station(config, args.hef, events, headless=args.headless,
+                      no_audio=args.no_audio, no_camera=args.no_camera)
+
+    # Ctrl+C must run the same orderly shutdown as 'q'.
+    def on_signal(signum, _frame):
+        log.info("signal %s received", signum)
+        station.stop()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, on_signal)
+        except (ValueError, OSError, AttributeError):
+            pass          # not available on this platform / not main thread
+
+    station.start()
+
+    exit_code = 0
+    try:
+        if args.duration is not None:
+            # Test/CI mode: stop the station after a fixed wall-clock time.
+            import threading
+            stopper = threading.Timer(args.duration, station.stop)
+            stopper.daemon = True
+            stopper.start()
+        station.run()
+    except KeyboardInterrupt:
+        log.info("interrupted")
+    except Exception:
+        log.exception("station crashed")
+        exit_code = 1
+    finally:
+        station.shutdown()
+
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -198,6 +198,14 @@ def apply_orientation(angle: float, offset_deg: float,
 #  Апаратний DOA через xvf_host (XVF3800)
 # ═══════════════════════════════════════════════════════════════
 
+#: Каталоги, які ніколи не містять драйвера масиву, але можуть містити
+#: сотні тисяч файлів. Пропускаються під час пошуку xvf_host.py.
+_SKIP_DIRS = frozenset({
+    "node_modules", "__pycache__", "AppData", "Library", "Windows",
+    "Program Files", "Program Files (x86)", "OneDrive", "venv", ".venv",
+    "site-packages", "dist-packages", "snap", "Downloads",
+})
+
 _XVF_CANDIDATES = [
     "/home/pi/mk/reSpeaker_XVF3800_USB_4MIC_ARRAY/python_control/xvf_host.py",
     "~/reSpeaker_XVF3800_USB_4MIC_ARRAY/python_control/xvf_host.py",
@@ -206,12 +214,17 @@ _XVF_CANDIDATES = [
 ]
 
 
-def find_xvf_host() -> Path | None:
+def find_xvf_host(max_depth: int = 4,
+                  max_seconds: float = 2.0) -> Path | None:
     """
     Шукає xvf_host.py. Шлях можна задати змінною середовища XVF_HOST_PATH.
 
     Старий код мав ОДИН зашитий шлях; якщо він не збігався, радар мовчки
     працював з фіктивним кутом 90°.
+
+    Args:
+        max_depth:   максимальна глибина пошуку в домашньому каталозі
+        max_seconds: бюджет часу на пошук (див. коментар нижче)
     """
     env = os.environ.get("XVF_HOST_PATH")
     if env and Path(env).expanduser().exists():
@@ -222,11 +235,57 @@ def find_xvf_host() -> Path | None:
         if p.exists():
             return p
 
-    # Останній шанс — пошук у домашніх каталогах
-    for home in (Path.home(), Path("/home")):
+    # ── Останній шанс: пошук у домашніх каталогах ──
+    #
+    # ⚠️ ВИПРАВЛЕНО (інтеграція): тут було
+    #     for p in home.glob("**/python_control/xvf_host.py")
+    # тобто РЕКУРСИВНИЙ обхід УСЬОГО домашнього каталогу без обмежень.
+    # Виміряно на реальній машині: понад 120 секунд (перервано, не
+    # завершилось). Обхід зачіпає node_modules, .git, кеші, змонтовані
+    # мережеві диски. Це блокувало ЗАПУСК радара — DOAProvider
+    # створюється у setup-фазі аудіо, тобто мікрофон не починав слухати,
+    # доки обхід не завершиться.
+    #
+    # Тепер: обмежена глибина (4 рівні) + бюджет часу. Типова установка
+    # ~/reSpeaker_.../python_control/xvf_host.py знаходиться на 2-3 рівні,
+    # тому реальні випадки як знаходились, так і знаходяться.
+    # Пошук у ширину з перевіркою бюджету на КОЖНОМУ каталозі.
+    # Path.glob() тут не годиться: навіть із обмеженою глибиною один
+    # виклик glob сканує весь рівень, перш ніж повернути керування, тому
+    # перевіряти час між викликами марно (виміряно: 23 с на глибині 4).
+    deadline = time.monotonic() + max_seconds
+    roots = [h for h in (Path.home(), Path("/home"))
+             if h is not None and h.is_dir()]
+    queue: list[tuple[Path, int]] = [(r, 0) for r in roots]
+
+    while queue:
+        if time.monotonic() > deadline:
+            return None
+        directory, depth = queue.pop(0)
+
+        candidate = directory / "python_control" / "xvf_host.py"
         try:
-            for p in home.glob("**/python_control/xvf_host.py"):
-                return p
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            pass
+
+        if depth >= max_depth:
+            continue
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if time.monotonic() > deadline:
+                        return None
+                    # Приховані каталоги й типові «важкі» кеші не містять
+                    # драйвера масиву, але містять сотні тисяч файлів.
+                    if entry.name.startswith(".") or entry.name in _SKIP_DIRS:
+                        continue
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            queue.append((Path(entry.path), depth + 1))
+                    except OSError:
+                        continue
         except (OSError, PermissionError):
             continue
     return None
