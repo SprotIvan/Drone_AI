@@ -193,15 +193,45 @@ class Station:
 
     # ── Health helpers ─────────────────────────────────────────
 
+    # ⚠️ A worker reports its own health, which means a worker that is STUCK
+    # cannot report anything at all. Both sensor threads can block
+    # indefinitely inside a driver call — PortAudio's read() or picamera2's
+    # capture_array() — and a thread blocked in the kernel keeps its last
+    # published health forever. Before this watchdog the lamps stayed green
+    # and the state machine kept trusting a subsystem that had stopped
+    # producing data minutes earlier.
+    #
+    # The Station is the only party that can notice, because it is the one
+    # still running. Silence for longer than the sensor's own lost-timeout
+    # is treated as failure regardless of what the worker last claimed.
+
+    def _watchdog(self, health: SubsystemHealth, last, lost_after: float,
+                  label: str) -> SubsystemHealth:
+        if not health.ok or last is None:
+            return health
+        age = now() - last.timestamp
+        if age <= lost_after:
+            return health
+        return health.with_state(
+            SubsystemState.OFFLINE,
+            f"no data for {age:.1f}s (thread stalled?)",
+            f"{label} watchdog timeout")
+
     def _acoustic_health(self) -> SubsystemHealth:
         if self.acoustic is None:
             return self._disabled
-        return self.acoustic.health.get() or SubsystemHealth()
+        health = self.acoustic.health.get() or SubsystemHealth()
+        return self._watchdog(health, self.acoustic.latest.get(),
+                              self.config.acoustic.lost_after_s * 3.0,
+                              "acoustic")
 
     def _visual_health(self) -> SubsystemHealth:
         if self.camera is None:
             return self._disabled
-        return self.camera.health.get() or SubsystemHealth()
+        health = self.camera.health.get() or SubsystemHealth()
+        return self._watchdog(health, self.camera.latest.get(),
+                              max(self.config.visual.lost_after_s * 3.0, 2.0),
+                              "camera")
 
     # ── Main loop ──────────────────────────────────────────────
 
@@ -214,42 +244,107 @@ class Station:
                                       cv2.WINDOW_FULLSCREEN)
 
         last_state: Optional[SystemState] = None
-        last_tick = time.monotonic()
+        # Start one UI period in the past so the first pass renders
+        # immediately with a sane dt. Initialising to 0.0 made the first
+        # `since_render` the entire monotonic clock (~10^5 s), which fed a
+        # nonsense dt into the radar sweep and pinned the UI-FPS average
+        # near zero for the first seconds.
+        last_render = time.monotonic() - self._ui_dt
+        last_visual_seq = -1
+
+        # ⚠️ PERFORMANCE-CRITICAL LOOP. See the comment block below before
+        # changing anything here.
+        #
+        # The first version of this loop rendered the full HUD on EVERY
+        # iteration, paced only by cv2.waitKey(1). That is not a frame rate,
+        # it is a spin: the HUD was recomposited (resize + radar + every
+        # overlay) over and over on the *same* camera frame, hundreds of
+        # times a second. On a Raspberry Pi 5 that saturates one core
+        # permanently and starves the camera and audio threads through both
+        # CPU contention and the GIL — measured effect on target hardware:
+        # camera 37 fps -> 19 fps, and the audio thread missing blocks badly
+        # enough that acoustic detection stopped working at all.
+        #
+        # `self._ui_dt` was computed and then never used, so the configured
+        # max_ui_fps had no effect whatsoever.
+        #
+        # Now: the HUD is recomposited only when there is something new to
+        # show, and never faster than max_ui_fps. Everything else is spent
+        # inside cv2.waitKey(), which blocks in C with the GIL released and
+        # therefore actively hands the CPU to the sensor threads.
+        idle_interval = 0.25          # refresh at 4 Hz with no new frame,
+                                      # so the radar sweep and acoustic
+                                      # readouts still animate
 
         while self.running:
-            tick = time.monotonic()
-            dt = tick - last_tick
-            last_tick = tick
+            now_t = time.monotonic()
 
-            acoustic_obs = (self.acoustic.latest.get()
-                            if self.acoustic is not None else None)
             visual_obs = (self.camera.latest.get()
                           if self.camera is not None else None)
+            new_frame = (visual_obs is not None
+                         and visual_obs.seq != last_visual_seq)
+            since_render = now_t - last_render
 
-            target = self.fusion.update(
-                acoustic_obs, visual_obs,
-                self._acoustic_health(), self._visual_health())
+            due = since_render >= self._ui_dt and (new_frame
+                                                   or since_render >= idle_interval)
 
-            if target.state is not last_state:
-                self._announce(target, last_state)
-                last_state = target.state
+            if due:
+                acoustic_obs = (self.acoustic.latest.get()
+                                if self.acoustic is not None else None)
+
+                target = self.fusion.update(
+                    acoustic_obs, visual_obs,
+                    self._acoustic_health(), self._visual_health())
+
+                if target.state is not last_state:
+                    self._announce(target, last_state)
+                    last_state = target.state
+
+                if not self.headless:
+                    # The FPS shown is the CAMERA pipeline rate — the number
+                    # the original application displayed and the one that
+                    # actually matters for detection. The UI's own refresh
+                    # rate is reported separately and deliberately smaller.
+                    camera_fps = (visual_obs.loop_fps
+                                  if visual_obs is not None else 0.0)
+                    frame = self.hud.render(target, since_render,
+                                            camera_fps=camera_fps,
+                                            ui_fps=self._ui_fps)
+                    cv2.imshow(window, frame)
+
+                inst = 1.0 / max(since_render, 1e-6)
+                self._ui_fps = (0.9 * self._ui_fps + 0.1 * inst
+                                if self._ui_fps else inst)
+                last_render = now_t
+                if visual_obs is not None:
+                    last_visual_seq = visual_obs.seq
+                self._frames += 1
 
             if self.headless:
-                # Used by the integration test: run the whole pipeline with
-                # no window, so the logic can be exercised over SSH.
-                time.sleep(self._ui_dt)
-                self._frames += 1
+                # No window to pump; just yield.
+                time.sleep(0.005)
                 continue
 
-            frame = self.hud.render(target, dt, fps=self._ui_fps)
-            cv2.imshow(window, frame)
-            self._frames += 1
-
-            inst = 1.0 / max(dt, 1e-6)
-            self._ui_fps = (0.9 * self._ui_fps + 0.1 * inst
-                            if self._ui_fps else inst)
-
-            if not self._handle_keys(window):
+            # Sleep INSIDE waitKey, which releases the GIL — this is what
+            # hands the CPU to the camera and audio threads.
+            #
+            # Two different waits, because there are two reasons to be here:
+            #
+            #   • rate-limited: the UI period has not elapsed. Sleep exactly
+            #     the remainder — the next render is due at a known time.
+            #   • waiting for a frame: the period HAS elapsed and there is
+            #     simply nothing new to draw. The next render time is
+            #     unknown, so poll.
+            #
+            # The second case used to fall through the same expression and
+            # produce a negative remainder, clamped to 1 ms — i.e. a 1000 Hz
+            # poll for as long as the camera was slow or dead, which is
+            # exactly when CPU matters most. Polling at ~5 ms bounds the
+            # added display latency well under one camera frame while
+            # costing 200 wakeups/s instead of 1000.
+            remaining = self._ui_dt - (time.monotonic() - last_render)
+            wait_ms = int(round(remaining * 1000.0)) if remaining > 0.001 else 5
+            if not self._handle_keys(window, max(1, min(20, wait_ms))):
                 break
 
     def _announce(self, target, previous: Optional[SystemState]) -> None:
@@ -279,9 +374,15 @@ class Station:
 
     # ── Keyboard ───────────────────────────────────────────────
 
-    def _handle_keys(self, window: str) -> bool:
-        """Returns False to exit the loop."""
-        key = cv2.waitKey(1) & 0xFF
+    def _handle_keys(self, window: str, wait_ms: int = 1) -> bool:
+        """
+        Pump the GUI event loop and handle a key. Returns False to exit.
+
+        `wait_ms` is where the UI thread spends its idle time. cv2.waitKey
+        blocks in C with the GIL released, so a longer wait here directly
+        buys CPU for the camera and audio threads.
+        """
+        key = cv2.waitKey(max(1, int(wait_ms))) & 0xFF
 
         # Closing the window with the title-bar X must also stop the app.
         try:

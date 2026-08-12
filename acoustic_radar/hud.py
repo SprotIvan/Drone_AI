@@ -122,7 +122,7 @@ class HUD:
         self.projector = projector
         self.radar: Optional[RadarOverlay] = None
         self._radar_size = 0
-        self._last_render = 0.0
+        self._canvas: Optional[np.ndarray] = None
         self.show_help = False
 
     # ── Radar sizing ───────────────────────────────────────────
@@ -140,12 +140,19 @@ class HUD:
     # ── Main entry point ───────────────────────────────────────
 
     def render(self, target: FusedTarget, dt_s: float,
-               fps: float = 0.0) -> np.ndarray:
-        base = self._camera_canvas(target)
-        h, w = base.shape[:2]
-
-        canvas = np.zeros((h + STATUS_H + SENSOR_H, w, 3), dtype=np.uint8)
-        canvas[STATUS_H:STATUS_H + h] = base
+               camera_fps: float = 0.0, ui_fps: float = 0.0) -> np.ndarray:
+        # PERFORMANCE: the camera frame is written ONCE, straight into the
+        # reused output canvas.
+        #
+        # The previous version did `base = self._camera_canvas(...)` (copy or
+        # resize into a fresh buffer) and then `canvas[...] = base` (a second
+        # full-frame copy), plus an np.zeros allocation of the whole canvas,
+        # on every single render. At 640x480x3 that is ~1.8 MB of pointless
+        # memory traffic per frame — on a Pi 5, with its far lower memory
+        # bandwidth, that is not free.
+        w, h = self._display_size(target)
+        canvas = self._get_canvas(w, h)
+        self._blit_camera(canvas, target, w, h)
 
         self._draw_boxes(canvas, target, y_offset=STATUS_H)
         self._draw_bearing_cue(canvas, target, y_offset=STATUS_H,
@@ -157,7 +164,7 @@ class HUD:
         composite(canvas, tile, w - tile.shape[1] - margin,
                   STATUS_H + margin)
 
-        self._draw_status_bar(canvas, target, w, fps)
+        self._draw_status_bar(canvas, target, w, camera_fps, ui_fps)
         self._draw_sensor_bar(canvas, target, w, h + STATUS_H)
 
         if self.show_help:
@@ -166,44 +173,115 @@ class HUD:
 
     # ── Camera area ────────────────────────────────────────────
 
-    def _camera_canvas(self, target: FusedTarget) -> np.ndarray:
-        """
-        The camera image, or an explicit placeholder when there is none.
-
-        A missing camera must not stop the station: the acoustic radar and
-        every readout keep working on this placeholder.
-        """
+    def _display_size(self, target: FusedTarget) -> Tuple[int, int]:
+        """Output size of the camera area, in display pixels."""
+        scale = self.config.ui.display_scale or 1.0
         visual = target.visual
         if visual is not None and visual.frame is not None:
+            fh, fw = visual.frame.shape[:2]
+        else:
+            fw = self.config.visual.frame_width
+            fh = self.config.visual.frame_height
+        return int(round(fw * scale)), int(round(fh * scale))
+
+    def _get_canvas(self, w: int, h: int) -> np.ndarray:
+        """
+        Reused output buffer.
+
+        Allocated once per size instead of once per frame. The camera strip
+        is fully overwritten by _blit_camera every frame; only the two bars
+        need clearing, and they are painted opaque anyway.
+        """
+        need = (h + STATUS_H + SENSOR_H, w, 3)
+        if self._canvas is None or self._canvas.shape != need:
+            self._canvas = np.zeros(need, dtype=np.uint8)
+        return self._canvas
+
+    def _blit_camera(self, canvas: np.ndarray, target: FusedTarget,
+                     w: int, h: int) -> None:
+        """
+        Write the camera image into the canvas — exactly one copy.
+
+        A missing camera must not stop the station: the acoustic radar and
+        every readout keep working on the placeholder drawn here.
+        """
+        dst = canvas[STATUS_H:STATUS_H + h, 0:w]
+        visual = target.visual
+
+        if visual is not None and visual.frame is not None:
             frame = visual.frame
-            scale = self.config.ui.display_scale
-            if scale and abs(scale - 1.0) > 1e-3:
-                frame = cv2.resize(
-                    frame, None, fx=scale, fy=scale,
-                    interpolation=cv2.INTER_LINEAR)
+            if frame.shape[0] == h and frame.shape[1] == w:
+                # No scaling: copy the worker's frame straight in. The UI
+                # draws chrome on top, so it must never draw into the
+                # worker's own buffer — hence a copy rather than a view.
+                np.copyto(dst, frame)
             else:
-                # The UI draws chrome on top, so it must never write into a
-                # buffer the camera worker may still be holding.
-                frame = frame.copy()
-            return frame
+                # cv2.resize writes directly into dst, so the scaled path
+                # also costs exactly one pass.
+                cv2.resize(frame, (w, h), dst=dst,
+                           interpolation=cv2.INTER_LINEAR)
 
-        w = int(self.config.visual.frame_width * self.config.ui.display_scale)
-        h = int(self.config.visual.frame_height * self.config.ui.display_scale)
-        canvas = np.full((h, w, 3), 22, dtype=np.uint8)
+            # ⚠️ CRITICAL: a frame that is no longer arriving must never be
+            # displayed as though it were live.
+            #
+            # This block used to be absent, and it was the single most
+            # dangerous defect in the UI. `visual.frame` is simply the last
+            # observation the camera worker published — it does not expire.
+            # If the camera thread hangs inside capture_array() (a real Pi
+            # failure mode: CSI/USB glitch, driver stall), the worker cannot
+            # even update its own health, so the lamp stays green AND the
+            # last frame stays on screen at full brightness, indefinitely.
+            # Verified: a 30-second-old frame rendered across 87% of the
+            # camera area with no indication at all. An operator would
+            # believe they were watching live video of empty sky.
+            #
+            # The fusion layer already computes the correct answer
+            # (visual_freshness == LOST); the display just has to honour it.
+            if target.visual_freshness is not Freshness.FRESH:
+                self._mark_frame_stale(dst, target, w, h)
+            return
 
+        dst[:] = 22
         detail = target.visual_health.detail or "no frames"
-        msg = "CAMERA OFFLINE"
-        (tw, _), _ = cv2.getTextSize(ascii_safe(msg), FONT, 0.9, 2)
-        cv2.putText(canvas, ascii_safe(msg), ((w - tw) // 2, h // 2 - 10), FONT, 0.9,
-                    C_ALARM, 2, cv2.LINE_AA)
-        (tw2, _), _ = cv2.getTextSize(ascii_safe(detail), FONT, 0.45, 1)
-        cv2.putText(canvas, ascii_safe(detail), ((w - tw2) // 2, h // 2 + 20), FONT, 0.45,
-                    C_DIM, 1, cv2.LINE_AA)
-        note = "acoustic subsystem continues to operate"
-        (tw3, _), _ = cv2.getTextSize(ascii_safe(note), FONT, 0.42, 1)
-        cv2.putText(canvas, ascii_safe(note), ((w - tw3) // 2, h // 2 + 46), FONT, 0.42,
-                    C_DIM, 1, cv2.LINE_AA)
-        return canvas
+        for text, size, colour, dy, thick in (
+                ("CAMERA OFFLINE", 0.9, C_ALARM, -10, 2),
+                (detail, 0.45, C_DIM, 20, 1),
+                ("acoustic subsystem continues to operate", 0.42, C_DIM, 46, 1)):
+            safe = ascii_safe(text)
+            (tw, _), _ = cv2.getTextSize(safe, FONT, size, thick)
+            cv2.putText(dst, safe, ((w - tw) // 2, h // 2 + dy), FONT, size,
+                        colour, thick, cv2.LINE_AA)
+
+    @staticmethod
+    def _mark_frame_stale(dst: np.ndarray, target: FusedTarget,
+                          w: int, h: int) -> None:
+        """
+        Make a frozen frame unmistakably frozen.
+
+        Deliberately heavy-handed: the camera image is the most trusted
+        element on screen, so a stale one has to be obvious at a glance and
+        not merely annotated in a corner. The frame is dimmed hard and the
+        age is stated in seconds.
+        """
+        # Dim in place — one multiply, no allocation.
+        cv2.multiply(dst, np.array([0.28, 0.28, 0.28]), dst=dst)
+
+        age = target.visual_age_s
+        age_txt = "unknown age" if age is None else f"{age:.1f} s ago"
+        lost = target.visual_freshness is Freshness.LOST
+        headline = "CAMERA SIGNAL LOST" if lost else "CAMERA STALLED"
+        colour = C_ALARM if lost else C_WARN
+
+        for text, size, col, dy, thick in (
+                (headline, 0.85, colour, -12, 2),
+                (f"last frame {age_txt} - NOT LIVE", 0.5, C_TEXT, 18, 1)):
+            safe = ascii_safe(text)
+            (tw, _), _ = cv2.getTextSize(safe, FONT, size, thick)
+            org = ((w - tw) // 2, h // 2 + dy)
+            cv2.putText(dst, safe, org, FONT, size, col, thick, cv2.LINE_AA)
+
+        # A border, so the state reads even on a glance at a small window.
+        cv2.rectangle(dst, (1, 1), (w - 2, h - 2), colour, 3)
 
     def _draw_boxes(self, canvas: np.ndarray, target: FusedTarget,
                     y_offset: int) -> None:
@@ -340,43 +418,75 @@ class HUD:
     # ── Status bar ─────────────────────────────────────────────
 
     def _draw_status_bar(self, canvas: np.ndarray, target: FusedTarget,
-                         width: int, fps: float) -> None:
+                         width: int, camera_fps: float,
+                         ui_fps: float = 0.0) -> None:
         cv2.rectangle(canvas, (0, 0), (width, STATUS_H), C_BAR, -1)
         cv2.line(canvas, (0, STATUS_H), (width, STATUS_H), C_EDGE, 1)
 
-        colour = _state_colour(target.state)
-        _dot(canvas, (14, STATUS_H // 2), colour, 5)
-        x = 26
-        x += _text(canvas, target.state.label, (x, 20), 0.5, colour, 1) + 18
-
-        if target.state.has_target:
-            x += _text(canvas, f"TARGET #{target.target_id}", (x, 20), 0.44,
-                       C_TEXT) + 18
-
-        prio = target.priority
-        prio_colour = {Priority.CAMERA: C_VISUAL,
-                       Priority.ACOUSTIC: C_ACOUSTIC,
-                       Priority.NONE: C_DIM}[prio]
-        _text(canvas, f"PRIORITY: {prio.value}", (x, 20), 0.44, prio_colour)
-
+        # ── Right-hand cluster is laid out FIRST ──
+        # It is measured as a whole so the left-hand cluster knows exactly
+        # where it must stop. Previously the lamps were positioned by a
+        # hardcoded `right - tw - 100`, which stopped being correct as soon
+        # as the timing text grew, and "PRIORITY: CAMERA" overprinted the
+        # MIC/CAM lamps into unreadable pixels ("CAMEBRA*CAM").
         right = width - 8
-        # Timing lives here, next to the FPS counter, rather than in the
-        # sensor bar: it is diagnostic information about the pipeline, not
-        # a measurement of the target.
-        fps_txt = f"{fps:.0f} FPS"
+        # ⚠️ The headline number is the CAMERA pipeline rate — capture +
+        # inference + tracking — which is what the original application
+        # displayed and what detection performance actually depends on.
+        #
+        # An earlier version showed the UI's own refresh rate here instead.
+        # That is a different quantity entirely: the display is deliberately
+        # rate-limited so it does not steal CPU from the sensors, so showing
+        # it looked like a large FPS regression when the camera was in fact
+        # running at full speed. UI rate is still reported, but small and
+        # clearly labelled.
+        fps_txt = f"{camera_fps:.0f} FPS"
         if target.visual is not None and target.visual.inference_ms is not None:
             fps_txt = f"YOLO {target.visual.inference_ms:.0f}ms   " + fps_txt
         (tw, _), _ = cv2.getTextSize(ascii_safe(fps_txt), FONT, 0.4, 1)
         _text(canvas, fps_txt, (right - tw, 20), 0.4, C_DIM)
 
-        # Sensor availability lamps
-        lamp_x = right - tw - 100
+        if ui_fps > 0:
+            ui_txt = f"ui {ui_fps:.0f}"
+            (tw_u, _), _ = cv2.getTextSize(ascii_safe(ui_txt), FONT, 0.32, 1)
+            _text(canvas, ui_txt, (right - tw - tw_u - 10, 20), 0.32, C_OFF)
+            tw += tw_u + 10
+
+        # Sensor availability lamps, packed to the left of the timing text.
+        LAMP_W = 44
+        lamp_x = right - tw - 2 * LAMP_W - 12
         for label, health in (("MIC", target.acoustic_health),
                               ("CAM", target.visual_health)):
             c = _health_colour(health.state)
             _dot(canvas, (lamp_x, STATUS_H // 2), c, 4)
             _text(canvas, label, (lamp_x + 8, 19), 0.36, c)
-            lamp_x += 46
+            lamp_x += LAMP_W
+
+        # ── Left-hand cluster, clipped to the free space ──
+        left_limit = right - tw - 2 * LAMP_W - 24
+        colour = _state_colour(target.state)
+        _dot(canvas, (14, STATUS_H // 2), colour, 5)
+        x = 26
+        x += _text(canvas, target.state.label, (x, 20), 0.5, colour, 1) + 18
+
+        def status_field(text: str, x_pos: int, col, scale: float = 0.44) -> int:
+            (tw_f, _), _ = cv2.getTextSize(ascii_safe(text), FONT, scale, 1)
+            if x_pos + tw_f > left_limit:
+                return x_pos
+            return x_pos + _text(canvas, text, (x_pos, 20), scale, col) + 18
+
+        # PRIORITY before TARGET #n: when the bar is too narrow for both,
+        # which sensor currently owns the solution matters more to an
+        # operator than the target's serial number, so the ID is the field
+        # allowed to drop.
+        prio = target.priority
+        prio_colour = {Priority.CAMERA: C_VISUAL,
+                       Priority.ACOUSTIC: C_ACOUSTIC,
+                       Priority.NONE: C_DIM}[prio]
+        x = status_field(f"PRIORITY: {prio.value}", x, prio_colour)
+
+        if target.state.has_target:
+            status_field(f"TARGET #{target.target_id}", x, C_TEXT)
 
     # ── Sensor bar ─────────────────────────────────────────────
 
@@ -389,18 +499,54 @@ class HUD:
         row1 = top + 20
         row2 = top + 40
 
+        # Right-hand annotations are drawn FIRST so the left-flowing sensor
+        # readouts know where they must stop. Previously the acoustic row
+        # ran under the "BEARING->VIEW: NOT CALIBRATED" note and the two
+        # overprinted into unreadable pixels.
+        # ⚠️ The sensor rows are sized to fit at the DEFAULT 640 px width.
+        # At 0.42 scale with the long labels, the acoustic row needed ~650 px
+        # and the range readout — one of the two numbers the whole acoustic
+        # subsystem exists to produce — was silently clipped off the end.
+        # 0.36 scale plus the shortened cue note fits everything at 640 px.
+        FS = 0.36
+        GAP = 11
+
+        row1_limit = width - 8
+        visual_obs = target.visual
+        if visual_obs is not None and not self.projector.is_calibrated(
+                visual_obs.active_camera):
+            note = "CUE: NOT CAL"          # short form; full text is in the log
+            (tw_n, _), _ = cv2.getTextSize(ascii_safe(note), FONT, FS, 1)
+            _text(canvas, note, (width - tw_n - 8, row1), FS, C_OFF)
+            row1_limit = width - tw_n - 16
+
+        def field(text: str, x: int, colour, scale: float = FS) -> int:
+            """Draw a readout only if it fits before the right-hand note."""
+            (tw_f, _), _ = cv2.getTextSize(ascii_safe(text), FONT, scale, 1)
+            if x + tw_f > row1_limit:
+                return x           # no room: drop it rather than overprint
+            return x + _text(canvas, text, (x, row1), scale, colour) + GAP
+
         # ── Acoustic row ──
         a_health = target.acoustic_health
         if not a_health.ok:
             _dot(canvas, (14, row1 - 4), C_ALARM, 4)
-            _text(canvas, "ACOUSTIC", (26, row1), 0.42, C_DIM)
+            _text(canvas, "ACOUSTIC", (26, row1), FS, C_DIM)
             _text(canvas, f"OFFLINE - {a_health.detail or a_health.error or ''}",
-                  (110, row1), 0.42, C_ALARM)
+                  (110, row1), FS, C_ALARM)
         else:
             fresh = target.acoustic_freshness
+            # ⚠️ Staleness is a property of the READING, not of the system
+            # state. This used to be gated on `target.state.has_target`,
+            # which suppressed the stale marker in exactly the states where
+            # it matters most: once the target was declared lost, a
+            # half-minute-old reading was still rendered as "DRONE
+            # CONFIRMED  CONF 90%  BRG 142deg" with nothing to say it was
+            # ancient — the same defect as the frozen camera frame.
+            stale = fresh is not Freshness.FRESH and acoustic is not None
             if acoustic is None:
                 dot_c = C_DIM
-            elif fresh is not Freshness.FRESH and target.state.has_target:
+            elif stale:
                 dot_c = C_OFF
             elif acoustic.confirmed:
                 dot_c = C_ALARM
@@ -411,36 +557,36 @@ class HUD:
             _dot(canvas, (14, row1 - 4), dot_c, 4)
 
             x = 26
-            x += _text(canvas, "ACOUSTIC", (x, row1), 0.42, C_DIM) + 10
+            x += _text(canvas, "ACOUSTIC", (x, row1), FS, C_DIM) + 10
 
             if acoustic is None:
-                _text(canvas, "starting...", (x, row1), 0.42, C_DIM)
+                _text(canvas, "starting...", (x, row1), FS, C_DIM)
             else:
                 label = {"ALARM": "DRONE CONFIRMED", "TRACK": "POSSIBLE DRONE",
                          "LISTEN": "LISTENING", "SLEEP": "SILENT"}.get(
                              acoustic.engine_state, acoustic.engine_state)
-                x += _text(canvas, label, (x, row1), 0.42, dot_c) + 14
-                x += _text(canvas, f"CONF {acoustic.p_smoothed:.0%}",
-                           (x, row1), 0.42, C_TEXT) + 14
-                x += _text(canvas, f"BRG {acoustic.bearing_text()}",
-                           (x, row1), 0.42, C_TEXT) + 14
-                x += _text(canvas, f"RNG {acoustic.distance_text()}",
-                           (x, row1), 0.42, C_TEXT) + 14
+                # The staleness tag is drawn IMMEDIATELY after the label so
+                # it can never be the field that gets dropped for lack of
+                # room — "this is old" outranks every measurement it
+                # qualifies.
+                x = field(label, x, dot_c)
+                if stale:
+                    age = target.acoustic_age_s or 0.0
+                    x = field(f"[{fresh.value} {age:.1f}s]", x, C_OFF)
+
+                readout = C_OFF if stale else C_TEXT
+                x = field(f"CONF {acoustic.p_smoothed:.0%}", x, readout)
+                x = field(f"BRG {acoustic.bearing_text()}", x, readout)
+                x = field(f"RNG {acoustic.distance_text()}", x, readout)
 
                 k = target.kinematics
-                if target.state.has_target:
+                if target.state.has_target and not stale:
                     if k.approach is Approach.UNKNOWN:
-                        x += _text(canvas, "CLOSURE UNKNOWN", (x, row1), 0.42,
-                                   C_DIM) + 14
+                        x = field("CLOSURE UNKNOWN", x, C_DIM)
                     else:
                         kc = (C_ALARM if k.approach is Approach.APPROACHING
                               else C_DIM)
-                        x += _text(canvas, k.text(), (x, row1), 0.42, kc) + 14
-
-                if fresh is not Freshness.FRESH and target.state.has_target:
-                    age = target.acoustic_age_s or 0.0
-                    _text(canvas, f"[{fresh.value} {age:.1f}s]", (x, row1),
-                          0.42, C_OFF)
+                        x = field(k.text(), x, kc)
 
         # ── Visual row ──
         v_health = target.visual_health
@@ -449,9 +595,9 @@ class HUD:
 
         if not v_health.ok:
             _dot(canvas, (14, row2 - 4), C_ALARM, 4)
-            _text(canvas, "VISUAL", (26, row2), 0.42, C_DIM)
+            _text(canvas, "VISUAL", (26, row2), FS, C_DIM)
             _text(canvas, f"OFFLINE - {v_health.detail or v_health.error or ''}",
-                  (110, row2), 0.42, C_ALARM)
+                  (110, row2), FS, C_ALARM)
             return
 
         dot_c = C_VISUAL if track is not None else C_OK
@@ -460,35 +606,31 @@ class HUD:
         _dot(canvas, (14, row2 - 4), dot_c, 4)
 
         x = 26
-        x += _text(canvas, "VISUAL", (x, row2), 0.42, C_DIM) + 10
+        x += _text(canvas, "VISUAL", (x, row2), FS, C_DIM) + 10
 
         if track is None:
-            x += _text(canvas, "NO TARGET", (x, row2), 0.42, C_DIM) + 14
+            x += _text(canvas, "NO TARGET", (x, row2), FS, C_DIM) + 14
         else:
             status = ("LAST KNOWN"
                       if target.state is SystemState.VISUAL_LOST_ACOUSTIC_TRACKING
                       else "TRACKING")
-            x += _text(canvas, status, (x, row2), 0.42, dot_c) + 14
+            x += _text(canvas, status, (x, row2), FS, dot_c) + 14
             x += _text(canvas, f"YOLO {target.visual_confidence_text()}",
-                       (x, row2), 0.42, C_TEXT) + 14
+                       (x, row2), FS, C_TEXT) + 14
             x += _text(canvas, f"BOX {track.bbox[2]:.0f}px", (x, row2), 0.42,
                        C_TEXT) + 14
             dist = (f"{track.distance_m:.1f} m" if track.distance_m is not None
                     else "N/A")
-            x += _text(canvas, f"RNG {dist}", (x, row2), 0.42, C_TEXT) + 14
+            x += _text(canvas, f"RNG {dist}", (x, row2), FS, C_TEXT) + 14
 
         if visual is not None:
             cam_txt = f"CAM: {visual.camera_name}"
-            (tw, _), _ = cv2.getTextSize(ascii_safe(cam_txt), FONT, 0.42, 1)
-            _text(canvas, cam_txt, (width - tw - 8, row2), 0.42, C_WARN)
+            (tw, _), _ = cv2.getTextSize(ascii_safe(cam_txt), FONT, FS, 1)
+            _text(canvas, cam_txt, (width - tw - 8, row2), FS, C_WARN)
 
-            # The bearing→pixel mapping is deliberately disabled until the
-            # mount geometry is measured. That refusal must be visible, or
-            # an operator would assume the system simply never has a cue.
-            if not self.projector.is_calibrated(visual.active_camera):
-                note = "BEARING->VIEW: NOT CALIBRATED"
-                (tw3, _), _ = cv2.getTextSize(ascii_safe(note), FONT, 0.36, 1)
-                _text(canvas, note, (width - tw3 - 8, row1), 0.36, C_OFF)
+            # (The "BEARING->VIEW: NOT CALIBRATED" note is drawn at the top
+            # of this method, before the acoustic row, so that row knows
+            # where it has to stop.)
 
     # ── Help ───────────────────────────────────────────────────
 
@@ -620,14 +762,14 @@ if __name__ == "__main__":
     scenarios.append(("06_mic_offline", s))
 
     for name, snap in scenarios:
-        img = hud.render(snap, 0.033, fps=28.4)
+        img = hud.render(snap, 0.033, camera_fps=37.0, ui_fps=20.0)
         cv2.imwrite(str(out / f"{name}.png"), img)
         print(f"   {name:<24} state={snap.state.value:<26} "
               f"priority={snap.priority.value}")
 
     # Help overlay
     hud.show_help = True
-    img = hud.render(scenarios[3][1], 0.033, fps=28.4)
+    img = hud.render(scenarios[3][1], 0.033, camera_fps=37.0, ui_fps=20.0)
     cv2.imwrite(str(out / "07_help.png"), img)
     print(f"   07_help                  (keyboard overlay)")
     print(f"\n   Preview images in: {out}")

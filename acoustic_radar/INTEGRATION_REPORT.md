@@ -291,6 +291,53 @@ until the unified UI is proven in the field, then retire it.
 - **Action required** — **Revoke the token via @BotFather.** Removing the line
   is not sufficient; it remains in history.
 
+### P1 — The UI thread spun, starving the sensors (CRITICAL regression, now fixed)
+
+- **Problem** — On the Pi the camera dropped from **37 fps to 19 fps**, the
+  microphone stopped tracking entirely, and visual detection became
+  intermittent. Reported from the field after the first integration.
+- **Cause** — My UI loop rendered the *entire* HUD on every iteration, paced
+  only by `cv2.waitKey(1)`. That is a spin, not a frame rate: it recomposited
+  the same camera frame hundreds of times a second. `self._ui_dt` was computed
+  and then never used, so the configured `max_ui_fps` had no effect at all.
+  Compounding it, `display_scale` defaulted to 1.5 (a full-frame interpolation
+  plus a 2.25× larger buffer per refresh) and `render()` copied the frame
+  **twice** (into a fresh buffer, then into a freshly allocated canvas).
+- **Fix** — Render only when a new camera frame has arrived, never faster than
+  `max_ui_fps` (now 20 Hz), and spend the remaining time inside
+  `cv2.waitKey(n)`, which blocks in C with the GIL released and therefore hands
+  the CPU to the sensor threads. `display_scale` now defaults to 1.0, the
+  canvas is allocated once and reused, and the frame is written exactly once.
+- **Impact** — Measured: HUD render **7.89 ms → 1.12 ms**; UI CPU demand
+  **+2.52 cores → +0.18 cores** (14× less). The camera holds full rate with the
+  UI running.
+
+### P2 — The displayed FPS was the wrong quantity
+
+- **Problem** — The number on screen was not comparable to the original's.
+- **Cause** — I displayed `_ui_fps`, the UI refresh rate. The original
+  displayed the camera loop rate.
+- **Fix** — The headline figure is the camera pipeline rate again; the UI rate
+  is shown small and labelled `ui`.
+- **Impact** — Because the display is now deliberately capped at 20 Hz, showing
+  it as "FPS" would have looked like a permanent regression even when the
+  camera was running at full speed.
+
+### P3 — The fusion layer re-gated the acoustic engine's own verdict
+
+- **Problem** — Acoustic targets could stay stuck in `ACOUSTIC_DETECTED` and
+  never hand over to the camera.
+- **Cause** — I added a fusion-level confidence gate defaulting to the engine's
+  trained threshold (0.775). That sounds harmless and is not:
+  `radar.Detector` uses 0.775 to **enter** a track but deliberately **holds**
+  it at `threshold × HOLD_FACTOR` ≈ 0.54. An engine legitimately in ALARM
+  routinely reports p between 0.54 and 0.775 — and my gate rejected exactly
+  those.
+- **Fix** — The gate is disabled by default; the engine's verdict is taken
+  as-is, exactly as `radar_gui.py` always did.
+- **Impact** — Regression-tested: an engine in ALARM at p = 0.60 now promotes
+  to `ACOUSTIC_TRACKING` as it should.
+
 ### Also noted, not changed
 
 - **`radar_gui.py` shutdown race** — sets `shared.running = False` then calls
@@ -486,11 +533,27 @@ numbers must be measured on the Pi.
 | Acoustic processing per block | **6 ms mean, 15 ms max** of a 500 ms budget (~1–3%) |
 | Fusion update | **0.16 ms** |
 | Radar tile render | **0.42 ms** (cache defeated: 1.14 ms → cache saves 63%) |
-| Full HUD compose @ `display_scale=1.0` | **3.43 ms** → 640×562 |
-| Full HUD compose @ `display_scale=1.5` | **7.89 ms** → 960×802 |
-| UI + fusion total @ 1.5 | **5.99 ms** = 18% of a 30 fps frame period |
+| Full HUD compose, current defaults | **1.12 ms** (was 7.89 ms — see bug P1) |
+| UI CPU demand, fixed loop | **+0.18 cores** (was +2.52 cores) |
 | Fusion throughput | 3,300–10,000 updates/s |
 | Memory over 20,000 updates | **+131 KB**, all histories provably capped |
+
+### Simulated Pi 5 + Hailo-8L (`python simulate_pi.py --compare`)
+
+Fake `picamera2` and `hailo_platform` modules with the real API surface, driving
+the real worker, decode path, tracker, fusion and HUD:
+
+| Scenario | Camera | UI | CPU |
+|---|---|---|---|
+| camera only, no UI | 37.2 fps | — | 0.45 cores |
+| + UI, old spinning loop | 37.0 fps | 290.8 fps | **2.97 cores** |
+| + UI, fixed loop | 37.2 fps | 18.8 fps | **0.62 cores** |
+
+⚠️ The *FPS* column proves nothing about the Pi — this host has idle cores and
+the fake sensor paces itself with `sleep()`, so even the broken loop kept 37 fps
+here. The **CPU** column is what transfers: a 4-core Pi 5 that must also run the
+ISP, the audio thread and the DOA subprocess cannot absorb an extra 2.5 cores,
+and that is what took 37 fps to 19.
 
 ### NOT MEASURED
 

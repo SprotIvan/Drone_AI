@@ -2,8 +2,9 @@ import time
 import inspect
 import cv2
 import numpy as np
+from collections import deque
 from scipy.optimize import linear_sum_assignment
-from typing import List, Tuple, Optional
+from typing import Deque, List, Tuple, Optional
 from camera_manager import CameraManager
 
 # Boundary requested: closer than 1.5 m -> NEAR, farther -> FAR.
@@ -824,11 +825,30 @@ class AppearanceModel:
 
 
 class TrajectoryHistory:
+    """
+    Rolling record of a track's estimates.
+
+    ⚠️ MEMORY: these were plain lists with no bound, appended once per
+    frame for the whole life of a track, and NEVER READ anywhere in the
+    program (grep "\\.history" — three writes, zero reads). Measured cost:
+    ~361 KB per 600 frames for a single track, i.e. ~1.3 MB per minute per
+    track at 37 fps, or ~39 MB for one drone tracked for half an hour. With
+    several tracks alive it multiplies.
+
+    Bounded to the most recent MAX_RECORDS entries. deque keeps append/len/
+    indexing identical, so the class's interface is unchanged and any future
+    consumer still sees the recent trajectory — just not an unbounded one.
+    """
+
+    #: ~14 s of trajectory at 37 fps. Long enough for any post-hoc debug
+    #: use, short enough that the memory is a fixed few hundred KB.
+    MAX_RECORDS = 512
+
     def __init__(self):
-        self.states:       List[np.ndarray] = []
-        self.covariances:  List[np.ndarray] = []
-        self.measurements: List[np.ndarray] = []
-        self.mus:          List[np.ndarray] = []
+        self.states:       Deque[np.ndarray] = deque(maxlen=self.MAX_RECORDS)
+        self.covariances:  Deque[np.ndarray] = deque(maxlen=self.MAX_RECORDS)
+        self.measurements: Deque[np.ndarray] = deque(maxlen=self.MAX_RECORDS)
+        self.mus:          Deque[np.ndarray] = deque(maxlen=self.MAX_RECORDS)
 
     def record(self, state: np.ndarray, cov: np.ndarray,
                z: Optional[np.ndarray], mu: np.ndarray):

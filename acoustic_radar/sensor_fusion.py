@@ -307,18 +307,26 @@ class SensorFusion:
     def acoustic_confidence_threshold(self,
                                       obs: Optional[AcousticObservation]) -> float:
         """
-        Fusion-level acoustic confidence gate.
+        Optional EXTRA acoustic confidence gate. Disabled by default.
 
-        Defaults to the engine's own trained threshold rather than a number
-        invented here — that threshold was fitted on real validation data
-        for a 2% false-alarm rate.
+        ⚠️ Do not re-enable this without a specific reason. It defaulted to
+        the engine's own trained threshold (0.775), which sounds harmless
+        and is not: radar.Detector applies that threshold to ENTER a track
+        and then deliberately holds the track at threshold x HOLD_FACTOR
+        (0.70), i.e. ~0.54. So an engine legitimately in ALARM routinely
+        reports p_smoothed between 0.54 and 0.775 — and this gate then
+        refused to promote it, leaving the target stuck in
+        ACOUSTIC_DETECTED and never handing it to the camera.
+
+        That is second-guessing a subsystem that already decided, using a
+        threshold fitted on real validation data for a 2% false-alarm rate.
+        The engine's verdict is now taken as-is, exactly as radar_gui.py
+        always did. 0.0 = no additional gate.
         """
         configured = self.config.acoustic.confidence_threshold
         if configured is not None:
             return float(configured)
-        if obs is not None and obs.threshold > 0:
-            return float(obs.threshold)
-        return 0.6
+        return 0.0
 
     # ── Main entry point ───────────────────────────────────────
 

@@ -48,6 +48,10 @@ class AudioLogger:
         self._recording = False
         self._record_start: float = 0.0
         self._record_chunks: list[np.ndarray] = []
+        # Upper bound on a single recording: pre-roll + post-roll, with
+        # generous slack. Blocks are 0.5 s, so this caps one capture at a
+        # bounded number of chunks no matter what the clock does.
+        self._max_chunks = int((buffer_sec + record_after) / 0.5) + 8
         self._alarm_handled = False   # щоб не зберігати двічі на одну тривогу
 
         self.last_saved: str | None = None
@@ -60,8 +64,17 @@ class AudioLogger:
 
             if self._recording:
                 self._record_chunks.append(mono.copy())
-                elapsed = time.time() - self._record_start
-                if elapsed >= self.record_after:
+                # ⚠️ monotonic, not time.time(): a Raspberry Pi has no RTC
+                # and its wall clock jumps by decades at the first NTP sync.
+                # A backward jump made `elapsed` permanently negative, so
+                # this recording never terminated and _record_chunks grew
+                # without bound in the audio thread (~64 KB/s forever).
+                elapsed = time.monotonic() - self._record_start
+                # Hard cap as a second line of defence, so the buffer is
+                # bounded even if the time source misbehaves in some way not
+                # anticipated here.
+                if (elapsed >= self.record_after
+                        or len(self._record_chunks) >= self._max_chunks):
                     self._save_recording()
 
     def on_status(self, state: str, angle_deg: float | None,
@@ -77,7 +90,7 @@ class AudioLogger:
     def _start_recording(self, angle: float | None, dist: str) -> None:
         """Починає запис: копіює буфер + продовжує записувати."""
         self._recording = True
-        self._record_start = time.time()
+        self._record_start = time.monotonic()
         # Копіюємо кільцевий буфер (аудіо ДО тривоги)
         self._record_chunks = list(self._ring)
         self._angle = angle

@@ -58,16 +58,13 @@ class AcousticConfig:
     correspond to an exact number of missed updates.
     """
 
-    # [POLICY] Minimum smoothed P(drone) for the FUSION layer to treat an
-    # acoustic contact as trustworthy enough to drive the camera.
-    #
-    # This is deliberately SEPARATE from the engine's own detection
-    # threshold (model_config.json -> decision_threshold, currently 0.775,
-    # chosen during training for a 2% false-alarm rate). The engine decides
-    # "is this a drone"; this decides "am I confident enough to act on it".
-    # None = inherit the engine's threshold, which is the sane default
-    # because that threshold was fitted to real validation data whereas any
-    # number typed here would not be.
+    # [POLICY] OPTIONAL extra gate on smoothed P(drone). None = disabled,
+    # which is the correct default: radar.Detector has already applied its
+    # trained threshold AND its hysteresis, and re-applying a threshold on
+    # top of a held track breaks it (see
+    # SensorFusion.acoustic_confidence_threshold for the full explanation).
+    # Set a number here only to make the station DELIBERATELY more
+    # conservative than the detector it is built on.
     confidence_threshold: Optional[float] = None
 
     # [DERIVED] 3 missed updates (3 x 0.5 s). Beyond this the acoustic
@@ -346,11 +343,19 @@ class UIConfig:
     window_name: str = "DRONE DETECTION STATION"
     fullscreen: bool = False
 
-    # [POLICY] Upscale factor for the displayed frame. The camera produces
-    # 640x480; 1.5 gives a 960x720 window that is readable on a monitor
-    # without changing what the detector sees (the detector always runs on
-    # the native frame).
-    display_scale: float = 1.5
+    # [POLICY] Upscale factor for the displayed frame.
+    #
+    # ⚠️ 1.0 (native 640x480), NOT 1.5. Upscaling costs a full-frame
+    # interpolation pass plus a 2.25x larger buffer to composite and blit
+    # every refresh — measured at more than double the HUD cost, and on a
+    # Raspberry Pi 5 that is CPU taken directly from the camera and audio
+    # threads. Detection is unaffected either way (the detector always runs
+    # on the native frame), so this is pure display cost.
+    #
+    # Raise it only on a machine with CPU to spare, or drag the window
+    # larger instead — the window is resizable and the compositor scales it
+    # for free.
+    display_scale: float = 1.0
 
     # [POLICY] Radar widget size in pixels, and its inset from the frame
     # corner. Sized as a fraction of the DISPLAYED frame so it scales with
@@ -372,9 +377,21 @@ class UIConfig:
     # contains the current target and shows the ring labels for it.
     radar_scales_m: tuple = (25.0, 50.0, 100.0, 250.0, 500.0)
 
-    # [POLICY] Redraw the whole HUD at most this often, in Hz. The camera
-    # loop is independent of this; a slow UI never slows the sensors.
-    max_ui_fps: float = 30.0
+    # [POLICY] Redraw the whole HUD at most this often, in Hz.
+    #
+    # ⚠️ This is a HARD CPU BUDGET, not a target. The display is the only
+    # part of the station that can be made cheaper without hurting
+    # detection, so it is capped well below the camera rate on purpose: the
+    # camera keeps capturing and running YOLO at full speed, and only the
+    # picture on screen refreshes at 20 Hz — which is visually smooth and
+    # leaves the sensor threads the CPU they need.
+    #
+    # The station also skips the redraw entirely when no new camera frame
+    # has arrived, so this is a ceiling, not a floor.
+    #
+    # Raising this trades camera FPS for display smoothness. On a Pi 5,
+    # don't.
+    max_ui_fps: float = 20.0
 
 
 # ═══════════════════════════════════════════════════════════════

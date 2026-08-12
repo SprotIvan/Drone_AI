@@ -361,7 +361,12 @@ class RadarOverlay:
 
         if not target.acoustic_online:
             status, col = "OFFLINE", COL_ALARM
-        elif stale and target.state.has_target:
+        elif stale and target.acoustic is not None:
+            # ⚠️ Not gated on target.state.has_target. That gate meant a
+            # 30-second-old reading was still headed "CONTACT" once the
+            # target had been declared lost — the state having moved on is
+            # precisely when the operator needs to be told the reading is
+            # old, not a reason to stop telling them.
             status, col = "STALE", COL_STALE
         elif target.acoustic is not None and target.acoustic.detected:
             status, col = "CONTACT", COL_ACOUSTIC

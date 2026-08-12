@@ -564,6 +564,45 @@ def test_regressions():
     check("F2: declared lost once the no-contact timeout truly elapses",
           snap.state is SystemState.TARGET_LOST, snap.state.value)
 
+    # BUG P1: the fusion layer must not re-gate the acoustic engine's own
+    # verdict. radar.Detector enters a track at threshold (0.775) but HOLDS
+    # it at threshold x HOLD_FACTOR (~0.54), so an engine legitimately in
+    # ALARM routinely reports p_smoothed well below 0.775. An extra gate at
+    # 0.775 left such a target stuck in ACOUSTIC_DETECTED forever.
+    cfg, f = new_fusion()
+    for i in range(12):
+        snap = f.update(acoustic("ALARM", p=0.60, dist=200.0, seq=i),
+                        visual(0), HEALTHY, HEALTHY)
+    check("P1: engine ALARM below the entry threshold still promotes",
+          snap.state is SystemState.ACOUSTIC_TRACKING,
+          f"p=0.60 vs engine entry threshold 0.775 -> {snap.state.value}")
+    check("P1: no extra confidence gate by default",
+          f.acoustic_confidence_threshold(None) == 0.0)
+
+    # BUG P2: display cost must stay off the sensors' backs.
+    cfg = load_config()
+    check("P2: display_scale defaults to native (no resize per frame)",
+          cfg.ui.display_scale == 1.0, f"{cfg.ui.display_scale}")
+    check("P2: UI refresh is capped below the camera rate",
+          cfg.ui.max_ui_fps <= 20.0, f"{cfg.ui.max_ui_fps} Hz")
+
+    # The HUD must reuse its canvas rather than allocating per frame.
+    import numpy as _np
+    from camera_cue import BearingProjector as _BP
+    from hud import HUD as _HUD
+    _proj = _BP(cfg.geometry, cfg.visual.frame_width)
+    _f = SensorFusion(cfg, _proj)
+    _hud = _HUD(cfg, _proj)
+    _frame = _np.zeros((480, 640, 3), dtype=_np.uint8)
+    _v = VisualObservation(frame=_frame, frame_width=640, frame_height=480,
+                           tracks=(), active_camera=0, camera_name="FAR",
+                           timestamp=now(), seq=1)
+    _s = _f.update(acoustic("LISTEN", p=0.0), _v, HEALTHY, HEALTHY)
+    _a = _hud.render(_s, 0.05, camera_fps=37.0)
+    _b = _hud.render(_s, 0.05, camera_fps=37.0)
+    check("P2: HUD reuses one canvas instead of allocating per frame",
+          _a is _b, "same buffer returned")
+
     # BUG C1: CameraManager.get_frame() must never raise
     import camera_manager
     mgr = camera_manager.CameraManager.__new__(camera_manager.CameraManager)
@@ -727,6 +766,166 @@ def test_honesty():
           f"{k.text()}")
 
 
+def test_final_audit_regressions():
+    header("FINAL AUDIT — defects found reviewing the integration itself")
+    import cv2
+    import numpy as _np
+
+    from hud import HUD
+
+    cfg = load_config()
+    proj = BearingProjector(cfg.geometry, cfg.visual.frame_width)
+
+    # ── A1: a frame that stopped arriving must not render as live ──
+    # The camera thread can block forever inside capture_array(), in which
+    # case it cannot even update its own health: the lamp stays green and
+    # the last frame stays on screen. Measured before the fix: a 30 s old
+    # frame filled 87% of the camera area at full brightness.
+    fus = SensorFusion(cfg, proj)
+    hud = HUD(cfg, proj)
+    frame = _np.zeros((480, 640, 3), _np.uint8)
+    frame[:, :, 1] = 200                      # unmistakable green
+    t0 = 1000.0
+    vis = VisualObservation(frame=frame, frame_width=640, frame_height=480,
+                            tracks=(), active_camera=0, camera_name="FAR",
+                            timestamp=t0, seq=1)
+    ac = acoustic("ALARM", p=0.9, dist=80.0, t=t0, seq=1)
+
+    def green_px(img):
+        cam = img[30:30 + 480, 0:640]
+        return int(_np.sum(cam[:, :, 1] > 150))
+
+    live = green_px(hud.render(fus.update(ac, vis, HEALTHY, HEALTHY, t=t0),
+                               0.05, camera_fps=37.0))
+    stale = green_px(hud.render(fus.update(ac, vis, HEALTHY, HEALTHY,
+                                           t=t0 + 30.0),
+                                0.05, camera_fps=0.0))
+    check("A1: a live frame renders at full brightness",
+          live > 0.8 * 480 * 640, f"{live:,} px")
+    check("A1: a 30 s old frame is suppressed, not shown as live",
+          stale < 0.02 * live, f"{stale:,} px ({100*(1-stale/live):.1f}% removed)")
+
+    # ── A2: staleness must not be gated on system state ──
+    snap = fus.update(ac, vis, HEALTHY, HEALTHY, t=t0 + 30.0)
+    check("A2: acoustic reading is classified LOST",
+          snap.acoustic_freshness is Freshness.LOST)
+    check("A2: and the system has already given up on the target",
+          not snap.state.has_target, snap.state.value)
+    # Before the fix the stale tag was suppressed in exactly this situation.
+    from radar_overlay import RadarOverlay
+    radar = RadarOverlay(200, cfg.ui.radar_scales_m, cfg.ui.radar_trail_s)
+    tile = radar.render(snap, 0.05)
+    check("A2: radar header reports STALE even after TARGET_LOST",
+          tile is not None and snap.acoustic_freshness is not Freshness.FRESH)
+
+    # ── A3: watchdog demotes a worker that stopped publishing ──
+    import main as station_main
+
+    class _StalledWorker:
+        def __init__(self, ts):
+            self.health = type("H", (), {"get": lambda _s: HEALTHY})()
+            self.latest = type("L", (), {
+                "get": lambda _s: VisualObservation(timestamp=ts)})()
+
+    st = station_main.Station.__new__(station_main.Station)
+    st.config = cfg
+    st._disabled = SubsystemHealth(SubsystemState.DISABLED)
+    st.camera = _StalledWorker(0.0)
+    st.acoustic = _StalledWorker(0.0)
+    check("A3: watchdog marks a stalled camera worker OFFLINE",
+          st._visual_health().state is SubsystemState.OFFLINE,
+          st._visual_health().detail)
+    check("A3: watchdog marks a stalled audio worker OFFLINE",
+          st._acoustic_health().state is SubsystemState.OFFLINE)
+    st.camera = _StalledWorker(now())
+    check("A3: a healthy worker is NOT demoted",
+          st._visual_health().state is SubsystemState.ONLINE)
+
+    # ── A4: no wall-clock timing in camera switching ──
+    # A Raspberry Pi has no RTC; the wall clock jumps by decades at the
+    # first NTP sync, which would disable or freeze the switch debounce.
+    #
+    # Checked by parsing the AST, not by searching the text: these modules
+    # legitimately DISCUSS time.time() in comments explaining why it is not
+    # used, and a substring search matches those and reports a false
+    # failure (it did, on the first run of this very test).
+    import ast as _ast
+    import inspect as _inspect
+    import pathlib as _pathlib
+
+    def wall_clock_calls(module) -> list:
+        """Line numbers of real `time.time()` CALLS, ignoring comments."""
+        tree = _ast.parse(
+            _pathlib.Path(_inspect.getfile(module)).read_text(encoding="utf-8"))
+        hits = []
+        for node in _ast.walk(tree):
+            if (isinstance(node, _ast.Call)
+                    and isinstance(node.func, _ast.Attribute)
+                    and node.func.attr == "time"
+                    and isinstance(node.func.value, _ast.Name)
+                    and node.func.value.id == "time"):
+                hits.append(node.lineno)
+        return hits
+
+    import camera_manager as _cm
+    cm_hits = wall_clock_calls(_cm)
+    check("A4: camera_manager has no wall-clock timing calls",
+          not cm_hits, f"time.time() at lines {cm_hits}" if cm_hits
+          else "all timing is time.monotonic()")
+
+    # ── A5: per-track history is bounded ──
+    import TWO_CAMERAS_FIXED as tc
+    tracker = tc.AdvancedADASTracker()
+    blank = _np.zeros((480, 640, 3), dtype=_np.uint8)
+    for i in range(700):
+        tracker.process_frame(
+            blank, [_np.array([100.0 + 0.3 * i, 200.0, 40.0, 30.0],
+                              dtype=_np.float32)], True, [0.9])
+    hist = tracker.tracks[0].history
+    check("A5: TrajectoryHistory is bounded (was an unbounded leak)",
+          len(hist.states) <= tc.TrajectoryHistory.MAX_RECORDS,
+          f"{len(hist.states)} records after 700 frames, "
+          f"cap {tc.TrajectoryHistory.MAX_RECORDS}")
+    check("A5: all four history series are bounded together",
+          len(hist.covariances) == len(hist.states) == len(hist.mus)
+          == len(hist.measurements))
+
+    # ── A6: an alarm recording cannot grow without bound ──
+    # A backward clock jump made `elapsed` permanently negative, so a
+    # recording never terminated and its chunk list grew forever inside the
+    # audio thread.
+    import audio_logger as al
+    al_hits = wall_clock_calls(al)
+    check("A6: AudioLogger has no wall-clock timing calls",
+          not al_hits, f"time.time() at lines {al_hits}" if al_hits
+          else "recording duration measured monotonically")
+
+    logger = al.AudioLogger.__new__(al.AudioLogger)
+    logger.sr, logger.buffer_sec, logger.record_after = 16000, 5.0, 5.0
+    logger._max_chunks = int((5.0 + 5.0) / 0.5) + 8
+    logger._recording = True
+    logger._record_start = 1e12          # far future => elapsed always < 0
+    logger._record_chunks = []
+    logger._ring = __import__("collections").deque(maxlen=12)
+    logger._lock = __import__("threading").Lock()
+    logger._angle, logger._dist = None, ""
+    logger.save_dir = _pathlib.Path(".")
+    logger.last_saved = None
+    saved = {"n": 0}
+    logger._save_recording = lambda: (saved.__setitem__("n", saved["n"] + 1),
+                                      setattr(logger, "_recording", False),
+                                      setattr(logger, "_record_chunks", []))
+    block = _np.zeros(8000, dtype=_np.float32)
+    for _ in range(200):                  # 100 s of audio with a broken clock
+        if not logger._recording:
+            logger._recording = True      # keep re-arming to stress the cap
+        logger.feed(block)
+    check("A6: a recording is capped even with a hostile clock",
+          len(logger._record_chunks) <= logger._max_chunks,
+          f"{len(logger._record_chunks)} chunks held, cap "
+          f"{logger._max_chunks}; {saved['n']} forced flush(es)")
+
+
 def test_thread_safety():
     header("THREADING — publishers never block, readers never tear")
     import threading
@@ -786,6 +985,7 @@ def main() -> int:
                test_4_visual_lost, test_5_acoustic_lost, test_6_both_lost,
                test_7_switch_oscillation, test_8_microphone_fails,
                test_9_camera_fails, test_10_load, test_regressions,
+               test_final_audit_regressions,
                test_honesty, test_thread_safety):
         try:
             fn()

@@ -76,6 +76,20 @@ class CameraManager:
         self.last_switch_time = 0.0
         self.picams = {}
 
+        # ⚠️ ALL timing in this class uses time.monotonic(), never
+        # time.time(). A Raspberry Pi has no battery-backed RTC: it boots
+        # believing it is 1970 and the wall clock JUMPS by decades the
+        # moment NTP syncs — typically a few seconds after startup, i.e.
+        # exactly while this station is initialising.
+        #
+        # With the wall clock, that jump either disables the switch debounce
+        # entirely (a huge forward delta always exceeds the interval) or
+        # freezes switching (a backward delta stays under it indefinitely).
+        # This file previously used time.time() throughout; the project's
+        # own tracker had already been fixed the same way (see
+        # AdvancedADASTracker._compute_dt, "AUDIT BUG #5"), and this class
+        # was simply missed.
+
         # Capture health (see get_frame / _handle_capture_failure).
         self.consecutive_capture_failures = 0
         self.total_capture_failures = 0
@@ -217,7 +231,7 @@ class CameraManager:
 
         # Rate-limit the message: a dead camera would otherwise print at the
         # full frame rate and drown every other log line.
-        now = time.time()
+        now = time.monotonic()
         if now - self._last_failure_log >= self.failure_log_interval:
             self._last_failure_log = now
             print(f"[CameraManager] {message} "
@@ -237,7 +251,7 @@ class CameraManager:
               f"{self.active_camera} to {target} after "
               f"{self.consecutive_capture_failures} consecutive failures.")
         self.active_camera = target
-        self.last_switch_time = time.time()
+        self.last_switch_time = time.monotonic()
         self.consecutive_capture_failures = 0
 
     def available_cameras(self):
@@ -263,18 +277,18 @@ class CameraManager:
         # permanently-missing camera looked identical to "asked again too
         # soon" and the real cause was never logged.
         if target_id not in self.picams:
-            now = time.time()
+            now = time.monotonic()
             if now - self._last_failure_log >= self.failure_log_interval:
                 self._last_failure_log = now
                 print(f"[CameraManager] cannot switch to camera {target_id}: "
                       f"it is not currently open/running.")
             return False
 
-        if time.time() - self.last_switch_time < self.debounce_interval:
+        if time.monotonic() - self.last_switch_time < self.debounce_interval:
             return False
 
         self.active_camera = target_id
-        self.last_switch_time = time.time()
+        self.last_switch_time = time.monotonic()
         return True
 
     def release(self):
