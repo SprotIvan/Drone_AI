@@ -212,17 +212,28 @@ def source_convention(source: str, cfg: dict) -> SourceConvention:
         return SourceConvention(float(zero), SRP_HANDEDNESS, "SRP-PHAT")
 
     if source == "usb":
-        if cfg.get("doa_handedness") is None and "doa_invert" not in cfg:
-            return SourceConvention(0.0, Handedness.UNKNOWN, "XVF3800 USB")
+        # ⚠️ HANDEDNESS IS KNOWN ONLY IF `doa_handedness` WAS WRITTEN.
+        #
+        # `doa_invert` cannot be used as evidence of calibration, and an
+        # earlier version of this function tried to. calibration.load()
+        # merges DEFAULTS into every config it returns, and DEFAULTS
+        # contains doa_invert=False — so "the key is present" is true even
+        # on an array nobody has ever calibrated, the UNKNOWN branch was
+        # dead code, and a never-measured handedness was reported as
+        # CLOCKWISE on what is effectively a coin flip.
+        #
+        # That is the same trap acoustic_worker documents for the range
+        # calibration: a default that fills in for a measurement makes the
+        # absence of the measurement invisible. Only `doa_handedness` —
+        # which nothing but `calibrate.py doa` ever writes — counts.
         explicit = cfg.get("doa_handedness")
-        if explicit is not None:
-            hand = (Handedness.COUNTER_CLOCKWISE
-                    if str(explicit).upper() in ("CCW", "COUNTER_CLOCKWISE")
-                    else Handedness.CLOCKWISE)
-        else:
-            # `doa_invert` is the legacy spelling of the same bit.
-            hand = (Handedness.COUNTER_CLOCKWISE if cfg.get("doa_invert")
-                    else Handedness.CLOCKWISE)
+        if explicit is None:
+            return SourceConvention(
+                float(cfg.get("doa_offset_deg", 0.0)),
+                Handedness.UNKNOWN, "XVF3800 USB")
+        hand = (Handedness.COUNTER_CLOCKWISE
+                if str(explicit).upper() in ("CCW", "COUNTER_CLOCKWISE")
+                else Handedness.CLOCKWISE)
         return SourceConvention(float(cfg.get("doa_offset_deg", 0.0)), hand,
                                 "XVF3800 USB")
 

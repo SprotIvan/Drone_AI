@@ -534,10 +534,29 @@ class SensorFusion:
             return CueRole.NONE
         if not acoustic.detected or freshness is Freshness.LOST:
             return CueRole.NONE
-        if not acoustic.bearing_calibrated:
-            return CueRole.NONE
         if not cue.available:
             return CueRole.NONE
+
+        # ⚠️ AN UNVERIFIED CONVENTION IS MARKED, NOT SUPPRESSED.
+        #
+        # An earlier version returned NONE here when `bearing_calibrated`
+        # was False, and that was wrong in two ways.
+        #
+        # It was INCONSISTENT: the radar plots this very bearing, the LED
+        # ring lights on it and the off-screen arrow points with it. Only
+        # the camera region refused. One number cannot be trustworthy
+        # enough for three consumers and too dangerous for the fourth.
+        #
+        # And it OVERRODE THE OPERATOR. `doa_handedness` records a
+        # calibration; its absence means nobody wrote the file, not that
+        # the direction is wrong. An operator who has watched the radar
+        # track a source across the field has verified the direction more
+        # convincingly than any config key — and refusing to draw for them
+        # removes a working feature to enforce paperwork.
+        #
+        # So the region is drawn, and hud.py labels it BEARING UNVERIFIED.
+        # That is this project's standing rule everywhere else: show the
+        # measurement, state exactly what is not known about it.
 
         if visual_track is not None:
             tolerance = self.config.fusion.cue_agreement_deg

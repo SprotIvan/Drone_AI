@@ -487,6 +487,12 @@ class HUD:
             lines.append(f"BEARING {acoustic.bearing_text()}")
             if acoustic.has_distance:
                 lines.append(f"DIST {acoustic.distance_text()}")
+        if acoustic is not None and not acoustic.bearing_calibrated:
+            # The direction is shown because the radar and the LED ring show
+            # it too — but nobody has recorded which way this array counts
+            # its angles, so it could be mirrored. Say so on the picture
+            # rather than withhold the picture.
+            lines.append("BEARING UNVERIFIED - run calibrate.py doa")
         if cue.uncertainty_exceeds_fov:
             # Honest caveat: a +/-15-45 deg DOA cannot localise inside a
             # 28 deg lens, so the "region" is most of the picture.

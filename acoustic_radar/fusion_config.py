@@ -353,6 +353,18 @@ class GeometryConfig:
     # arrow pointing at the wrong horizon. None = never recorded, no check.
     boresight_calibrated_at_doa_offset_deg: Optional[float] = None
 
+    # [CALIBRATE] The array's handedness ("CW"/"CCW") when the boresight
+    # above was measured.
+    #
+    # ⚠️ Recorded SEPARATELY from the offset because the two break the
+    # boresight in different ways. A changed offset ROTATES the frame and
+    # every boresight can be corrected by adding the same delta. A changed
+    # handedness MIRRORS it, and no delta can undo a mirror — the boresight
+    # has to be measured again. Without this field the station would
+    # cheerfully compute a delta after a mirror and hand out a number that
+    # is wrong by twice the bearing.
+    boresight_calibrated_handedness: Optional[str] = None
+
     # [MEASURED] Horizontal focal length in pixels per camera, copied from
     # TWO_CAMERAS_FIXED.CAMERA_FOCAL_PX so that one file drives both.
     # Camera 0 (IMX477 FAR): two independent calibrations at 5.0 m and 1.5 m
@@ -777,7 +789,36 @@ class StationConfig:
         recorded = self.geometry.boresight_calibrated_at_doa_offset_deg
         if recorded is None:
             return []
+
         current = float(calibration_cfg.get("doa_offset_deg", 0.0))
+        # ⚠️ HANDEDNESS FIRST. The frame can change in two ways and only one
+        # of them can be repaired arithmetically.
+        #
+        # A rotation shifts every boresight by the same delta, so the
+        # corrected value can simply be computed. A HANDEDNESS change
+        # mirrors the frame, and a mirror is not a shift: telling an
+        # operator to add a delta after the array's handedness was
+        # re-measured would hand them a confidently wrong number, which is
+        # the exact failure this whole check exists to prevent.
+        recorded_hand = self.geometry.boresight_calibrated_handedness
+        current_hand = calibration_cfg.get("doa_handedness")
+        if (recorded_hand is not None and current_hand is not None
+                and str(recorded_hand).upper() != str(current_hand).upper()):
+            out = [f"the array's angle convention changed from "
+                   f"{recorded_hand} to {current_hand} since the camera "
+                   f"boresight was measured — the frame is now MIRRORED, "
+                   f"not merely rotated"]
+            for cam_id, bore in sorted(
+                    self.geometry.camera_boresight_deg.items()):
+                if bore is not None:
+                    out.append(f"  camera {cam_id}: boresight {bore:.0f}deg is "
+                               f"INVALID and CANNOT be corrected by adding an "
+                               f"offset — it must be RE-MEASURED")
+            out.append("  point the camera at a sound source, read the "
+                       "bearing the HUD shows, and put that number in "
+                       "geometry.camera_boresight_deg")
+            return out
+
         delta = (current - float(recorded) + 180.0) % 360.0 - 180.0
         if abs(delta) < 0.5:
             return []

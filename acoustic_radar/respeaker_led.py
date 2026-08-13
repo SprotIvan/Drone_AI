@@ -173,12 +173,12 @@ def frame_for_target(target) -> LedFrame:
             not target.acoustic_health.ok:
         return LedFrame(LedMode.SEARCHING, None)
 
-    # Only a bearing whose source convention was actually measured may aim
-    # the ring. An uncalibrated one still raises the alarm colour — a drone
-    # IS confirmed — but it lights the whole ring instead of a sector,
-    # which says "confirmed, direction not trustworthy" rather than
-    # pointing an operator at a possibly opposite horizon.
-    calibrated = bool(getattr(acoustic, "bearing_calibrated", True))
+    # The ring aims with the same bearing the radar plots and the camera
+    # region draws — one number, four consumers, no consumer second-
+    # guessing it. Whether the convention was ever WRITTEN DOWN is
+    # reported once at startup (see RespeakerLed._warn_unverified), not
+    # enforced by silently refusing to point.
+    calibrated = True
     if acoustic.coasting:
         return LedFrame(LedMode.COASTING, acoustic.bearing_deg, calibrated)
     if acoustic.confirmed:
@@ -501,6 +501,7 @@ class RespeakerLed:
         self._retry_after = 0.0
         self._arity_just_learned = False
         self._submit_stamp = 0.0
+        self._warned_unverified = False
 
     # ── Introspection ──────────────────────────────────────────
 
@@ -731,8 +732,26 @@ class RespeakerLed:
             return
 
         frame = self._effective_frame()
+        self._warn_unverified(frame)
         target = self._render(frame)
         self._apply(target)
+
+    def _warn_unverified(self, frame: LedFrame) -> None:
+        """
+        Say ONCE that the ring is aiming with an unrecorded convention.
+
+        An LED cannot carry a caption, so the caveat the HUD prints on the
+        picture has to live in the log. Once per session: an indicator that
+        nags every frame is an indicator nobody reads.
+        """
+        if self._warned_unverified or frame.calibrated or not frame.mode.is_alarm:
+            return
+        self._warned_unverified = True
+        log.warning("LED ring is aiming with an UNRECORDED angle convention "
+                    "— it may be mirrored. If the ring already points the "
+                    "right way, record it: add \"doa_handedness\" to "
+                    "radar_calibration.json (CW or CCW), or run "
+                    "`python calibrate.py doa` with two points.")
 
     def _effective_frame(self) -> LedFrame:
         """

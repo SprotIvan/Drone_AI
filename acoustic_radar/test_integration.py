@@ -1163,6 +1163,25 @@ def test_12_led_ring():
           any("should be 0deg" in ln for ln in warned),
           " | ".join(ln.strip() for ln in warned[1:3]))
 
+    # ⚠️ A MIRROR IS NOT A ROTATION, and the advice must not pretend it is.
+    # This is the case the real calibration produced: the XVF3800 measured
+    # as COUNTER-clockwise, having been configured as clockwise. Offering
+    # "add this delta" there would hand over a number wrong by twice the
+    # bearing — the precise failure this check exists to prevent.
+    framed.geometry.boresight_calibrated_handedness = "CW"
+    mirrored = framed.check_bearing_frames(
+        {"doa_offset_deg": 0.0, "doa_handedness": "CCW"})
+    check("a MIRRORED frame is detected even at the same offset",
+          bool(mirrored), mirrored[0] if mirrored else "no warning")
+    check("and it demands a RE-MEASUREMENT instead of offering a delta",
+          any("RE-MEASURED" in ln for ln in mirrored)
+          and not any("should be" in ln for ln in mirrored),
+          " | ".join(ln.strip() for ln in mirrored[1:3]))
+    same = framed.check_bearing_frames(
+        {"doa_offset_deg": 0.0, "doa_handedness": "CW"})
+    check("an unchanged handedness at an unchanged offset stays quiet",
+          same == [], str(same))
+
     # ── The ring's aim must NOT depend on the microphone's calibration ──
     # This is the double-transform regression. The old implementation
     # un-applied radar_calibration.json's doa_offset_deg inside the LED
@@ -1345,11 +1364,30 @@ def test_13_coordinate_chain():
           f"circle — exact at one bearing, 180deg out a quarter turn away")
 
     # ── Each source keeps its OWN convention ──
-    cfg = {"doa_offset_deg": -180.0, "doa_invert": False}
+    # ⚠️ A DEFAULT MUST NOT PASS FOR A MEASUREMENT. calibration.load()
+    # merges DEFAULTS into every config, and DEFAULTS carries
+    # doa_invert=False — so presence of that key proves nothing. Only
+    # doa_handedness, which nothing but `calibrate.py doa` writes, counts.
+    import calibration as _calib
+
+    merged = _calib.load()
+    check("a hand-written config with no doa_handedness reads as "
+          "UNCALIBRATED", not bf.source_convention("usb", merged).calibrated,
+          bf.source_convention("usb", merged).describe())
+    check("doa_invert alone is NOT accepted as evidence of calibration",
+          not bf.source_convention(
+              "usb", {"doa_offset_deg": -180.0, "doa_invert": False}
+          ).calibrated)
+
+    cfg = {"doa_offset_deg": -180.0, "doa_handedness": "CW"}
     usb = bf.source_convention("usb", cfg)
     srp = bf.source_convention("srp", cfg)
-    check("USB convention comes from doa_offset_deg/doa_invert",
+    check("USB convention comes from doa_offset_deg + doa_handedness",
           usb.calibrated and usb.zero_deg == -180.0, usb.describe())
+    check("a CCW handedness is honoured, not silently flattened to CW",
+          bf.source_convention(
+              "usb", {"doa_offset_deg": 0.0, "doa_handedness": "CCW"}
+          ).handedness is bf.Handedness.COUNTER_CLOCKWISE)
     check("SRP-PHAT does NOT silently inherit the USB calibration",
           not srp.calibrated, srp.describe())
     srp_cal = bf.source_convention("srp", dict(cfg, srp_zero_deg=30.0))
@@ -1521,13 +1559,21 @@ def test_15_camera_search_region():
           f"role={snap.cue_role.value}, disagreement="
           f"{disagreement:.0f}deg" if disagreement is not None else "n/a")
 
-    # ── An UNCALIBRATED bearing must not draw a confident region ──
+    # ── An UNVERIFIED convention is MARKED, not suppressed ──
+    # The radar plots this bearing, the LED ring aims with it and the
+    # off-screen arrow points with it. One number cannot be good enough for
+    # three consumers and forbidden to the fourth — the region is drawn and
+    # hud.py labels it BEARING UNVERIFIED.
     _, f3 = new_fusion(cfg)
     for i in range(4):
         snap = f3.update(ac(seq=i, calibrated=False), visual(0),
                          HEALTHY, HEALTHY)
-    check("an uncalibrated bearing draws NO region (it may be mirrored)",
-          snap.cue_role is CueRole.NONE, snap.cue_role.value)
+    check("an unverified convention still draws the region, consistently "
+          "with the radar and the ring",
+          snap.cue_role is CueRole.SEARCH, snap.cue_role.value)
+    check("...and the observation still carries the fact that it is "
+          "unverified, so the HUD can label it",
+          snap.acoustic is not None and not snap.acoustic.bearing_calibrated)
 
     # ── A LOST reading must not leave a region on screen ──
     clock = Clock()
