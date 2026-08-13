@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import sys
 import time
+from dataclasses import replace
 from typing import List
 
 import numpy as np
@@ -70,7 +71,7 @@ def acoustic(state="ALARM", p=0.95, dist=None, lo=None, hi=None,
 
 
 def visual(n=1, score=0.9, bbox=(300.0, 200.0, 60.0, 40.0), state="Confirmed",
-           t=None, dist=5.0) -> VisualObservation:
+           t=None, dist=5.0, cam=0) -> VisualObservation:
     tracks = tuple(
         VisualTrack(track_id=i + 1, bbox=bbox, state=state,
                     quality_score=0.5, detection_score=score,
@@ -78,7 +79,8 @@ def visual(n=1, score=0.9, bbox=(300.0, 200.0, 60.0, 40.0), state="Confirmed",
         for i in range(n))
     return VisualObservation(
         frame=None, frame_width=640, frame_height=480, tracks=tracks,
-        active_camera=0, camera_name="FAR/IMX477",
+        active_camera=cam,
+        camera_name="FAR/IMX477" if cam == 0 else "NEAR/IMX708",
         timestamp=t if t is not None else now(), seq=0)
 
 
@@ -1161,16 +1163,34 @@ def test_12_led_ring():
           any("should be 0deg" in ln for ln in warned),
           " | ".join(ln.strip() for ln in warned[1:3]))
 
-    # ── The mount offset must be undone before choosing an LED ──
-    without = rl.bearing_to_led_index(142.0, N, doa_offset_deg=0.0)
-    with_off = rl.bearing_to_led_index(142.0, N, doa_offset_deg=40.0)
-    check("LED index undoes doa_offset_deg (the ring is bolted to the "
-          "array, not to the compass)", without != with_off,
-          f"offset 0 -> LED {without}, offset +40deg -> LED {with_off}")
+    # ── The ring's aim must NOT depend on the microphone's calibration ──
+    # This is the double-transform regression. The old implementation
+    # un-applied radar_calibration.json's doa_offset_deg inside the LED
+    # mapping, so re-calibrating the DOA silently rotated the ring even
+    # though neither the ring nor the drone had moved. The ring now takes
+    # the canonical bearing and applies only its own two parameters.
+    import inspect
+
+    sig = inspect.signature(rl.bearing_to_led_index)
+    check("LED mapping takes no microphone calibration at all",
+          not any("doa" in p for p in sig.parameters),
+          f"parameters: {', '.join(sig.parameters)}")
+    check("LED mapping exposes exactly the ring's own two parameters",
+          {"led_zero_deg", "clockwise"} <= set(sig.parameters),
+          f"parameters: {', '.join(sig.parameters)}")
+
+    # led_zero_deg rotates; clockwise mirrors. Both must actually act.
+    base = rl.bearing_to_led_index(90.0, N)
+    rotated = rl.bearing_to_led_index(90.0, N, led_zero_deg=90.0)
+    mirrored = rl.bearing_to_led_index(90.0, N, clockwise=False)
+    check("led_zero_deg rotates the ring", base != rotated,
+          f"zero 0 -> LED {base}, zero +90deg -> LED {rotated}")
+    check("led_index_clockwise mirrors the ring", base != mirrored,
+          f"CW -> LED {base}, CCW -> LED {mirrored}")
 
     # ── J: hardware absent or broken must not affect detection ──
     led = rl.RespeakerLed(LedConfig(enabled=True, led_count=N),
-                          {"doa_offset_deg": 0.0}, script_path=None)
+                          script_path=None)
     led.start()
     # find_xvf_host() searches the home directory under a 2 s budget, so
     # poll rather than sleeping a guessed amount.
@@ -1187,7 +1207,7 @@ def test_12_led_ring():
     led = rl.RespeakerLed(
         LedConfig(enabled=True, led_count=N, min_write_interval_s=0.0,
                   max_consecutive_failures=2, command_timeout_s=5.0),
-        {"doa_offset_deg": 0.0}, script_path=broken)
+        script_path=broken)
     led.start()
     deadline = time.monotonic() + 12.0
     while (led.status is not rl.LedStatus.UNAVAILABLE
@@ -1214,7 +1234,7 @@ def test_12_led_ring():
     led = rl.RespeakerLed(
         LedConfig(enabled=True, led_count=N, sector_leds=3,
                   min_write_interval_s=0.0, command_timeout_s=10.0),
-        {"doa_offset_deg": 0.0}, script_path=strict)
+        script_path=strict)
     led.start()
     deadline = time.monotonic() + 20.0
     while led.status is rl.LedStatus.STARTING and time.monotonic() < deadline:
@@ -1242,7 +1262,7 @@ def test_12_led_ring():
     led = rl.RespeakerLed(
         LedConfig(enabled=True, led_count=N, sector_leds=3,
                   min_write_interval_s=0.0, command_timeout_s=10.0),
-        {"doa_offset_deg": 0.0}, script_path=xvf)
+        script_path=xvf)
     led.start()
     deadline = time.monotonic() + 30.0
     while led.status is rl.LedStatus.STARTING and time.monotonic() < deadline:
@@ -1290,12 +1310,261 @@ def test_12_led_ring():
 
     # ── A watchdog must not leave the ring stuck red ──
     led = rl.RespeakerLed(LedConfig(enabled=True, led_count=N, watchdog_s=0.1),
-                          {}, script_path=None)
+                          script_path=None)
     led.submit(rl.LedFrame(rl.LedMode.ALARM, 142.0))
     time.sleep(0.2)
     effective = led._effective_frame()
     check("a stalled station falls back to SEARCHING instead of holding red",
           effective.mode is rl.LedMode.SEARCHING, effective.mode.value)
+
+
+def test_13_coordinate_chain():
+    header("TEST 13 — one canonical bearing, three layers, one direction")
+    import bearing_frame as bf
+
+    # ── SCENARIOS A/B/C: left, right, front all the way through ──
+    for bearing, expected, radar, led, camera, agree in bf.verify_chain():
+        check(f"bearing {bearing:.0f}deg -> {expected} everywhere", agree,
+              f"radar={radar} led={led} camera={camera}")
+
+    # The check must be capable of FAILING, or it proves nothing. A ring
+    # that is physically mirrored relative to its configuration has to be
+    # caught on the axes perpendicular to the mirror.
+    mirrored = bf.verify_chain(physical_clockwise=False)
+    caught = [b for b, _e, _r, _l, _c, ok in mirrored if not ok]
+    check("a physically mirrored ring is detected", len(caught) == 2,
+          f"disagreement at {[f'{b:.0f}deg' for b in caught]}")
+
+    # ── ROOT CAUSE: a reflection is not an offset ──
+    mirror = bf.SourceConvention(0.0, bf.Handedness.COUNTER_CLOCKWISE, "m")
+    errors = [bf.angular_distance(mirror.to_canonical(raw),
+                                  bf.wrap360(raw - 180.0))
+              for raw in range(0, 360, 45)]
+    check("an offset cannot correct a mirrored source", max(errors) >= 179.0,
+          f"error ranges {min(errors):.0f}..{max(errors):.0f}deg across the "
+          f"circle — exact at one bearing, 180deg out a quarter turn away")
+
+    # ── Each source keeps its OWN convention ──
+    cfg = {"doa_offset_deg": -180.0, "doa_invert": False}
+    usb = bf.source_convention("usb", cfg)
+    srp = bf.source_convention("srp", cfg)
+    check("USB convention comes from doa_offset_deg/doa_invert",
+          usb.calibrated and usb.zero_deg == -180.0, usb.describe())
+    check("SRP-PHAT does NOT silently inherit the USB calibration",
+          not srp.calibrated, srp.describe())
+    srp_cal = bf.source_convention("srp", dict(cfg, srp_zero_deg=30.0))
+    check("SRP-PHAT handedness is PROVEN from the code, not guessed",
+          srp_cal.handedness is bf.Handedness.COUNTER_CLOCKWISE,
+          srp_cal.describe())
+
+    # ── Angle wrap ──
+    check("359 -> 1 is a 2deg move", bf.angular_distance(359.0, 1.0) == 2.0)
+    check("circular mean of 350 and 10 is 0, not 180",
+          bf.circular_mean_deg([350.0, 10.0]) == 0.0)
+    check("wrap180(179) and wrap180(-179) are 2deg apart, not 358",
+          abs(bf.wrap180(179.0 - (-179.0))) == 2.0,
+          f"{bf.wrap180(179.0 - (-179.0)):.0f}deg")
+
+    # ── ROOT CAUSE: the beam tie ──
+    from doa import DOAReading, DOATracker, select_azimuth
+
+    answers = {select_azimuth(order)[0] for order in
+               ([280., 280., 100., 100.], [100., 100., 280., 280.],
+                [280., 100., 280., 100.], [100., 280., 100., 280.])}
+    check("a 2-2 beam split resolves the same way regardless of beam order",
+          len(answers) == 1, f"answers: {sorted(answers)}")
+    check("and the tie is reported as ambiguous rather than hidden",
+          select_azimuth([280., 280., 100., 100.])[2])
+    check("an unambiguous reading is not flagged",
+          not select_azimuth([280., 281., 279., 280.])[2])
+
+    # ── ROOT CAUSE: the tracker flipping a stable target ──
+    tr = DOATracker()
+    for i in range(5):
+        tr.update(DOAReading(280.0, confidence=0.9, source="usb"), now=i * 0.5)
+    for i in range(5, 9):
+        tr.update(DOAReading(100.0, confidence=0.25, source="usb",
+                             ambiguous=True), now=i * 0.5)
+    check("a run of AMBIGUOUS readings never flips a stable track",
+          abs(tr.angle - 280.0) < 1.0, f"track is {tr.angle:.0f}deg")
+
+    tr2 = DOATracker()
+    for i in range(5):
+        tr2.update(DOAReading(280.0, confidence=0.9, source="usb"), now=i * 0.5)
+    for i in range(5, 9):
+        tr2.update(DOAReading(100.0, confidence=0.9, source="usb"), now=i * 0.5)
+    check("but an unambiguous manoeuvre IS still followed",
+          abs(tr2.angle - 100.0) < 1.0, f"track is {tr2.angle:.0f}deg")
+
+
+def test_14_srp_geometry():
+    header("TEST 14 — SRP-PHAT geometry, blind band and channel handling")
+    import math
+
+    from doa import ArrayDOA, SPEED_OF_SOUND
+
+    sr = 16000
+    mics = [[-0.0215, 0.0215], [0.0215, 0.0215],
+            [0.0215, -0.0215], [-0.0215, -0.0215]]
+    srp = ArrayDOA(mics, sr)
+    rng = np.random.default_rng(0)
+
+    def synth(true_deg, n_ch=4):
+        n = sr
+        src = rng.standard_normal(n + 200)
+        u = np.array([math.cos(math.radians(true_deg)),
+                      math.sin(math.radians(true_deg))])
+        chans = [np.interp(np.arange(n) + 100
+                           + np.dot(p, u) / SPEED_OF_SOUND * sr,
+                           np.arange(len(src)), src) for p in mics[:n_ch]]
+        return np.stack(chans, axis=1) + 0.01 * rng.standard_normal((n, n_ch))
+
+    # ── ROOT CAUSE: the blind band perpendicular to the 0-1 baseline ──
+    # Mics 0 and 1 share a y coordinate, so a source on the +y axis reaches
+    # both at once. The old distinctness test compared ONLY those two and
+    # refused the whole estimate — and then latched that refusal for the
+    # rest of the session.
+    refused = []
+    for deg in (89.0, 90.0, 91.0, 269.0, 270.0, 271.0):
+        if not srp.estimate(synth(deg)).ok:
+            refused.append(deg)
+    check("no blind band perpendicular to the mic 0-1 baseline",
+          not refused, f"refused at {refused}" if refused
+          else "89-91 and 269-271 deg all produce an estimate")
+
+    audio = synth(90.0)
+    check("degenerate PAIRS are excluded, not the whole estimate",
+          0 < len(srp.usable_pairs(audio)) < 6,
+          f"{len(srp.usable_pairs(audio))}/6 pairs usable at 90deg")
+
+    # Processed stereo (identical channels) must still be refused honestly.
+    mono = rng.standard_normal(sr)
+    fake = np.stack([mono, mono], axis=1)
+    r = ArrayDOA(mics[:2], sr).estimate(fake)
+    check("processed stereo is still refused rather than guessed",
+          not r.ok, r.error or "")
+
+    # ── ROOT CAUSE: a transient degeneracy disabled SRP for the session ──
+    from doa import DOAProvider
+    prov = DOAProvider.__new__(DOAProvider)
+    check("a single degenerate block does not disable SRP-PHAT for good",
+          DOAProvider.ARRAY_DISABLE_AFTER > 1,
+          f"needs {DOAProvider.ARRAY_DISABLE_AFTER} consecutive blocks")
+    del prov
+
+    # ── Channel selection reaches the classifier ──
+    from audio_io import to_mono
+    block = np.zeros((100, 6), dtype=np.float32)
+    block[:, :4] = 1.0            # microphones
+    block[:, 4:] = 9.0            # reference / loopback channels
+    check("to_mono averages ONLY the microphone channels",
+          abs(float(to_mono(block, (0, 1, 2, 3)).mean()) - 1.0) < 1e-6,
+          f"mic-only mean {float(to_mono(block, (0, 1, 2, 3)).mean()):.2f}, "
+          f"all-channel mean {float(to_mono(block).mean()):.2f}")
+    check("with no selection it still averages everything (1-2 ch inputs)",
+          abs(float(to_mono(block).mean()) - 22.0 / 6.0) < 1e-6,
+          f"{float(to_mono(block).mean()):.3f} = (4x1 + 2x9)/6")
+
+
+def test_15_camera_search_region():
+    header("TEST 15 — the acoustic search region and the YOLO handover")
+    from sensor_fusion import CueRole
+
+    cfg = load_config()
+    cfg.geometry.camera_boresight_deg = {0: 150.0, 1: 150.0}
+    cfg.geometry.boresight_calibrated_at_doa_offset_deg = 0.0
+    _, f = new_fusion(cfg)
+
+    def ac(bearing=150.0, seq=0, calibrated=True, state="ALARM"):
+        return AcousticObservation(
+            engine_state=state, p_smoothed=0.92, threshold=0.775,
+            hold_threshold=0.5, confirm_needed=2, miss_tolerance=6,
+            bearing_deg=bearing, bearing_confidence=0.8,
+            bearing_calibrated=calibrated, distance_m=120.0,
+            timestamp=now(), seq=seq)
+
+    # ── SCENARIO D: drone behind a tree, YOLO sees nothing ──
+    for i in range(4):
+        snap = f.update(ac(seq=i), visual(0), HEALTHY, HEALTHY)
+    check("D: acoustic target, no YOLO box -> ACOUSTIC ONLY region",
+          snap.cue_role is CueRole.SEARCH, snap.cue_role.value)
+
+    # ── SCENARIO E: the drone comes out and YOLO confirms it ──
+    for i in range(4):
+        snap = f.update(ac(seq=10 + i), visual(1, bbox=(300., 200., 60., 40.)),
+                        HEALTHY, HEALTHY)
+    check("E: YOLO confirms -> the region is withdrawn",
+          snap.cue_role is CueRole.CONFIRMED, snap.cue_role.value)
+
+    # ── SCENARIO F: YOLO loses it, acoustic still has it ──
+    snap = f.update(ac(seq=20), visual(0), HEALTHY, HEALTHY)
+    check("F: YOLO lost, acoustic holds -> the region returns",
+          snap.cue_role is CueRole.SEARCH, snap.cue_role.value)
+
+    # ── A box that DISAGREES with the bearing is a different object ──
+    _, f2 = new_fusion(cfg)
+    for i in range(4):
+        # Boresight 150 deg, bearing 150 deg => the drone is dead centre.
+        # A box at the far edge is something else entirely.
+        #
+        # This uses the NEAR camera deliberately: the FAR lens is only
+        # 28 deg wide, so NOTHING inside its frame can disagree with the
+        # boresight by the 20 deg tolerance. On a narrow lens every visible
+        # box is "in agreement" by construction — worth knowing, because it
+        # means the disagreement test only has force on the wide camera.
+        snap = f2.update(ac(seq=i),
+                         visual(1, bbox=(10., 200., 40., 30.), cam=1),
+                         HEALTHY, HEALTHY)
+    disagreement = snap.sensor_agreement_deg
+    check("a YOLO box that disagrees with the bearing does not cancel "
+          "the region", snap.cue_role is CueRole.SEARCH,
+          f"role={snap.cue_role.value}, disagreement="
+          f"{disagreement:.0f}deg" if disagreement is not None else "n/a")
+
+    # ── An UNCALIBRATED bearing must not draw a confident region ──
+    _, f3 = new_fusion(cfg)
+    for i in range(4):
+        snap = f3.update(ac(seq=i, calibrated=False), visual(0),
+                         HEALTHY, HEALTHY)
+    check("an uncalibrated bearing draws NO region (it may be mirrored)",
+          snap.cue_role is CueRole.NONE, snap.cue_role.value)
+
+    # ── A LOST reading must not leave a region on screen ──
+    clock = Clock()
+    _, f4 = new_fusion(cfg)
+    old = None
+    for i in range(4):
+        old = replace(ac(seq=i), timestamp=clock.t)
+        snap = f4.update(old, visual(0), HEALTHY, HEALTHY, t=clock.t)
+        clock.advance(0.5)
+    # The SAME observation, 30 s later: the reading itself has aged out.
+    stale = f4.update(old, visual(0), HEALTHY, HEALTHY,
+                      t=clock.advance(30.0))
+    check("a LOST acoustic reading withdraws the region",
+          stale.cue_role is CueRole.NONE, stale.cue_role.value)
+
+    # ── SCENARIO G: a camera switch must use the NEW camera's optics ──
+    proj = BearingProjector(cfg.geometry, cfg.visual.frame_width)
+    far = proj.project(0, 160.0, 0.8)
+    near = proj.project(1, 160.0, 0.8)
+    check("G: the two cameras project the same bearing differently",
+          far.x_px != near.x_px,
+          f"FAR x={far.x_px:.0f} (hfov {far.hfov_deg:.0f}deg), "
+          f"NEAR x={near.x_px:.0f} (hfov {near.hfov_deg:.0f}deg)")
+
+    _, f5 = new_fusion(cfg)
+    snap_far = f5.update(ac(bearing=160.0, seq=1),
+                         visual(0, cam=0), HEALTHY, HEALTHY)
+    snap_near = f5.update(ac(bearing=160.0, seq=2),
+                          visual(0, cam=1), HEALTHY, HEALTHY)
+    check("G: the cue follows the ACTIVE camera on the very next frame",
+          snap_far.bearing_cue.x_px != snap_near.bearing_cue.x_px,
+          f"cam0 x={snap_far.bearing_cue.x_px:.0f} -> "
+          f"cam1 x={snap_near.bearing_cue.x_px:.0f}")
+    check("G: and the cue is computed from the SAME observation that "
+          "carries the frame",
+          snap_near.visual is not None
+          and snap_near.bearing_cue.frame_width_px > 0)
 
 
 def _rl_pack(colour) -> int:
@@ -1482,6 +1751,8 @@ def main() -> int:
                test_7_switch_oscillation, test_8_microphone_fails,
                test_9_camera_fails, test_10_load,
                test_11_acoustic_latency_and_coasting, test_12_led_ring,
+               test_13_coordinate_chain, test_14_srp_geometry,
+               test_15_camera_search_region,
                test_regressions, test_final_audit_regressions,
                test_honesty, test_thread_safety):
         try:

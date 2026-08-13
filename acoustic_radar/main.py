@@ -72,6 +72,7 @@ import cv2  # noqa: E402
 
 import fusion_config  # noqa: E402
 import station_logging  # noqa: E402
+from latency import BUDGET  # noqa: E402
 from acoustic_worker import AcousticWorker  # noqa: E402
 from camera_cue import BearingProjector  # noqa: E402
 from camera_worker import CameraWorker  # noqa: E402
@@ -149,6 +150,12 @@ def print_banner(config: fusion_config.StationConfig, hef_path: str) -> None:
 class Station:
     """Owns the workers, the fusion layer and the window."""
 
+    #: Deterministic test mode — see --inject-bearing. Declared on the
+    #: CLASS, not only in __init__, because the health helpers must work on
+    #: a partially-constructed Station: test_integration builds one with
+    #: __new__ to exercise the watchdog without starting any hardware.
+    inject_bearing: Optional[float] = None
+
     def __init__(self, config: fusion_config.StationConfig, hef_path: str,
                  events: EventLogger, headless: bool = False,
                  no_audio: bool = False, no_camera: bool = False,
@@ -166,15 +173,12 @@ class Station:
         self.acoustic: Optional[AcousticWorker] = None
         self.camera: Optional[CameraWorker] = None
 
-        # The LED ring needs the DOA mount offset to convert a displayed
-        # bearing back into the array's own frame — the ring is bolted to
-        # the array, not to the compass. calibration.load() is the same
-        # source the acoustic worker uses, so the two can never disagree.
-        import calibration
+        # The ring takes no microphone calibration: it consumes the
+        # canonical bearing, which DOAProvider has already normalised.
         led_cfg = config.led
         if no_led:
             led_cfg = fusion_config.LedConfig(enabled=False)
-        self.led = RespeakerLed(led_cfg, calibration.load())
+        self.led = RespeakerLed(led_cfg)
 
         self._disabled = SubsystemHealth(SubsystemState.DISABLED,
                                          "disabled on the command line")
@@ -183,6 +187,10 @@ class Station:
             self.acoustic = AcousticWorker(config, events)
         if not no_camera:
             self.camera = CameraWorker(config, events, hef_path)
+
+        #: Deterministic test mode — see --inject-bearing. None = normal.
+        self.inject_bearing: Optional[float] = None
+        self._inject_seq = 0
 
         self._ui_dt = 1.0 / max(config.ui.max_ui_fps, 1.0)
         self._last_render = 0.0
@@ -241,6 +249,8 @@ class Station:
                      self.camera.fps, self.camera.inference_ms)
         log.info("LED ring: %s, %d hardware writes",
                  self.led.status.value, self.led.writes)
+        for line in BUDGET.report():
+            log.info("%s", line)
         log.info("stopped.")
 
     # ── Health helpers ─────────────────────────────────────────
@@ -270,12 +280,40 @@ class Station:
             f"{label} watchdog timeout")
 
     def _acoustic_health(self) -> SubsystemHealth:
+        if self.inject_bearing is not None:
+            return SubsystemHealth(SubsystemState.ONLINE, "INJECTED BEARING")
         if self.acoustic is None:
             return self._disabled
         health = self.acoustic.health.get() or SubsystemHealth()
         return self._watchdog(health, self.acoustic.latest.get(),
                               self.config.acoustic.lost_after_s * 3.0,
                               "acoustic")
+
+    def _injected_observation(self):
+        """
+        A synthetic acoustic decision at a KNOWN canonical bearing.
+
+        The whole point of the deterministic test mode: it drives the radar,
+        the LED ring and the camera cue from one number, with no microphone,
+        no drone and no acoustics involved at all. If the three disagree
+        about where 90 degrees is, the fault is in a transform or a
+        calibration value, and it can be found in seconds instead of by
+        walking a drone around a field.
+
+        Marked `bearing_calibrated=True` deliberately: the injected bearing
+        IS canonical by construction, so the layers must point with it.
+        """
+        from target_state import AcousticObservation
+
+        self._inject_seq += 1
+        return AcousticObservation(
+            engine_state="ALARM", p_drone=1.0, p_smoothed=1.0,
+            threshold=0.775, hold_threshold=0.5, confirmations=2,
+            confirm_needed=2, miss_tolerance=6, gated=False,
+            bearing_deg=float(self.inject_bearing) % 360.0,
+            bearing_confidence=1.0, bearing_source="injected",
+            bearing_calibrated=True,
+            timestamp=now(), seq=self._inject_seq)
 
     def _led_lamp_state(self) -> Optional[SubsystemState]:
         """
@@ -344,6 +382,8 @@ class Station:
                                       # so the radar sweep and acoustic
                                       # readouts still animate
 
+        last_acoustic_seq = -1
+
         while self.running:
             now_t = time.monotonic()
 
@@ -353,12 +393,42 @@ class Station:
                          and visual_obs.seq != last_visual_seq)
             since_render = now_t - last_render
 
-            due = since_render >= self._ui_dt and (new_frame
-                                                   or since_render >= idle_interval)
+            # ⚠️ A NEW ACOUSTIC DECISION IS A REASON TO WAKE UP.
+            #
+            # Measured before this line existed: `publish_to_fuse` averaged
+            # 357 ms and its p95 was a full 500 ms. The acoustic thread was
+            # publishing a decision every 500 ms and the fusion layer only
+            # looked at it when the UI happened to tick — on a camera frame,
+            # or on the 250 ms idle timer. So the radar, the LED ring and
+            # the camera cue all lagged the microphone by a quarter to a
+            # half second for no reason at all, and nothing in the system
+            # was measuring it. That is a third of the whole latency budget.
+            #
+            # This is still rate-limited by `_ui_dt` (20 Hz) and the
+            # acoustic thread only decides twice a second, so the cost is at
+            # most two extra composites per second.
+            acoustic_obs = (self._injected_observation()
+                            if self.inject_bearing is not None
+                            else self.acoustic.latest.get()
+                            if self.acoustic is not None else None)
+            new_acoustic = (acoustic_obs is not None
+                            and acoustic_obs.seq != last_acoustic_seq)
+
+            due = since_render >= self._ui_dt and (
+                new_frame or new_acoustic or since_render >= idle_interval)
 
             if due:
-                acoustic_obs = (self.acoustic.latest.get()
-                                if self.acoustic is not None else None)
+                if acoustic_obs is not None:
+                    last_acoustic_seq = acoustic_obs.seq
+
+                # How old an acoustic decision is when the fusion layer
+                # FIRST looks at it. Recorded only on a new sequence number:
+                # measuring it on every tick would mix in idle re-renders of
+                # an observation already consumed and report a latency the
+                # pipeline does not actually have.
+                if new_acoustic and acoustic_obs is not None:
+                    BUDGET.record("publish_to_fuse",
+                                  (now() - acoustic_obs.timestamp) * 1000.0)
 
                 target = self.fusion.update(
                     acoustic_obs, visual_obs,
@@ -385,9 +455,12 @@ class Station:
                     # rate is reported separately and deliberately smaller.
                     camera_fps = (visual_obs.loop_fps
                                   if visual_obs is not None else 0.0)
+                    _t_render = time.monotonic()
                     frame = self.hud.render(
                         target, since_render, camera_fps=camera_fps,
                         ui_fps=self._ui_fps, led_state=self._led_lamp_state())
+                    BUDGET.record("hud_render",
+                                  (time.monotonic() - _t_render) * 1000.0)
                     cv2.imshow(window, frame)
 
                 inst = 1.0 / max(since_render, 1e-6)
@@ -507,6 +580,14 @@ def main(argv: Optional[list] = None) -> int:
                         help="run without the camera subsystem")
     parser.add_argument("--no-led", action="store_true",
                         help="run without the ReSpeaker LED ring indicator")
+    parser.add_argument("--inject-bearing", type=float, default=None,
+                        metavar="DEG",
+                        help="DETERMINISTIC TEST MODE: ignore the microphone "
+                             "and feed a fixed canonical bearing (0=front, "
+                             "90=right, 180=behind, 270=left) into the fusion "
+                             "layer, so the radar, the LED ring and the "
+                             "camera cue can be checked against a KNOWN "
+                             "direction on real hardware")
     parser.add_argument("--log-level", default=None,
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument("--duration", type=float, default=None,
@@ -529,8 +610,16 @@ def main(argv: Optional[list] = None) -> int:
     print_banner(config, args.hef)
 
     station = Station(config, args.hef, events, headless=args.headless,
-                      no_audio=args.no_audio, no_camera=args.no_camera,
-                      no_led=args.no_led)
+                      no_audio=args.no_audio or args.inject_bearing is not None,
+                      no_camera=args.no_camera, no_led=args.no_led)
+    station.inject_bearing = args.inject_bearing
+    if args.inject_bearing is not None:
+        log.warning("TEST MODE: injecting a fixed canonical bearing of "
+                    "%.0f deg. The microphone is NOT running. Radar, LED "
+                    "ring and camera cue must all point the same physical "
+                    "way; if any one disagrees, that layer's calibration is "
+                    "wrong and no other evidence is needed.",
+                    args.inject_bearing)
 
     # Ctrl+C must run the same orderly shutdown as 'q'.
     def on_signal(signum, _frame):

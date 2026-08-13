@@ -114,6 +114,39 @@ class Priority(Enum):
     CAMERA = "CAMERA"
 
 
+class CueRole(Enum):
+    """
+    What the acoustic direction should be doing on the CAMERA image.
+
+    This is the whole of the "drone behind a tree" feature, decided in one
+    place so the overlay can never contradict the state machine.
+
+        NONE       nothing to draw — no acoustic target, the reading is
+                   LOST, or the bearing's source convention was never
+                   measured so it may be mirrored. Drawing a region from an
+                   uncalibrated bearing would send an operator to the wrong
+                   half of the sky with full confidence.
+
+        SEARCH     the microphone has a target the CAMERA HAS NOT
+                   CONFIRMED — either YOLO sees nothing there, or what it
+                   sees is at a different bearing. This is the occluded
+                   case: tree, building, roof, car. The image gets a
+                   translucent red search region labelled ACOUSTIC ONLY.
+
+        CONFIRMED  YOLO has a box that agrees with the acoustic bearing.
+                   The box becomes the primary indication and the search
+                   region is withdrawn, so the display never shows two
+                   competing positions for one drone.
+
+    Losing the visual track moves CONFIRMED back to SEARCH on the very next
+    update, which is the reacquisition behaviour: the region reappears
+    exactly where the microphone still hears the target.
+    """
+    NONE = "NONE"
+    SEARCH = "ACOUSTIC ONLY"
+    CONFIRMED = "VISUAL CONFIRMED"
+
+
 #: Priority implied by each state. Single source of truth — nothing else
 #: is allowed to decide who is primary.
 _PRIORITY_OF_STATE = {
@@ -161,6 +194,8 @@ class FusedTarget:
 
     # ── Cross-sensor ──
     bearing_cue: BearingCue = field(default_factory=BearingCue)
+    #: What the acoustic direction should be doing on the camera image.
+    cue_role: CueRole = CueRole.NONE
     #: |visual bearing − acoustic bearing| in degrees, or None when the
     #: mount geometry is uncalibrated and the comparison is impossible.
     sensor_agreement_deg: Optional[float] = None
@@ -428,6 +463,9 @@ class SensorFusion:
             agreement = self.projector.agreement_deg(
                 active_camera, visual_track.center[0], bearing)
 
+        cue_role = self._cue_role(acoustic, a_fresh, visual_track, cue,
+                                  agreement)
+
         # ── State machine ──
         new_state, reason = self._next_state(
             acoustic_live=acoustic_live,
@@ -458,6 +496,7 @@ class SensorFusion:
             visual_freshness=v_fresh,
             visual_age_s=v_age,
             bearing_cue=cue,
+            cue_role=cue_role,
             sensor_agreement_deg=agreement,
             in_camera_range=in_range,
             camera_range_gate_m=gate_m,
@@ -465,6 +504,50 @@ class SensorFusion:
             acoustic_health=acoustic_health,
             visual_health=visual_health,
             timestamp=t)
+
+    # ── The camera's acoustic search region ────────────────────
+
+    def _cue_role(self, acoustic: Optional[AcousticObservation],
+                  freshness: Freshness, visual_track: Optional[VisualTrack],
+                  cue: BearingCue,
+                  agreement: Optional[float]) -> CueRole:
+        """
+        Decide, once, what the acoustic direction does on the camera image.
+
+        Every condition below is a refusal to draw something misleading:
+
+          • no bearing, or a reading old enough to be LOST -> nothing. A
+            region drawn from a stale bearing tells an operator to search
+            where the drone WAS.
+          • an UNCALIBRATED bearing -> nothing. Its source convention was
+            never measured, so it may be mirrored; a confident red region
+            on the wrong side of the image is worse than no region.
+          • the projection itself unavailable (no boresight, no focal
+            length) -> nothing, and camera_cue already says why.
+          • YOLO has a box that AGREES with the bearing -> the box is the
+            truth and the region withdraws, so the operator is never shown
+            two positions for one drone.
+          • YOLO has a box that DISAGREES beyond the tolerance -> that is a
+            different object, and the acoustic region stays up.
+        """
+        if acoustic is None or not acoustic.has_bearing:
+            return CueRole.NONE
+        if not acoustic.detected or freshness is Freshness.LOST:
+            return CueRole.NONE
+        if not acoustic.bearing_calibrated:
+            return CueRole.NONE
+        if not cue.available:
+            return CueRole.NONE
+
+        if visual_track is not None:
+            tolerance = self.config.fusion.cue_agreement_deg
+            # agreement None = the comparison is impossible (uncalibrated
+            # optics). A box we cannot cross-check is still a visual
+            # confirmation, which is how the system behaved before the
+            # region existed.
+            if agreement is None or agreement <= tolerance:
+                return CueRole.CONFIRMED
+        return CueRole.SEARCH
 
     # ── Range gate with hysteresis ─────────────────────────────
 

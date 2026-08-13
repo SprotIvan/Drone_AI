@@ -46,7 +46,7 @@ import numpy as np
 from camera_cue import BearingProjector
 from fusion_config import StationConfig
 from radar_overlay import RadarOverlay, ascii_safe, composite
-from sensor_fusion import FusedTarget, Priority, SystemState
+from sensor_fusion import CueRole, FusedTarget, Priority, SystemState
 from target_state import Approach, Freshness, SubsystemState
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
@@ -62,6 +62,13 @@ C_ALARM = (60, 60, 255)
 C_OFF = (90, 90, 95)
 C_ACOUSTIC = (70, 200, 255)
 C_VISUAL = (90, 235, 120)
+
+# ── Acoustic search region ──
+# Deliberately RED and deliberately NOT C_VISUAL: an operator must be able
+# to tell at a glance that this area is a place to LOOK, not a thing the
+# camera has SEEN. C_VISUAL green is reserved for real YOLO boxes.
+C_CUE = (80, 80, 255)          # outline and caption
+C_CUE_FILL = (40, 40, 150)     # translucent fill
 
 STATUS_H = 30
 SENSOR_H = 52
@@ -105,6 +112,30 @@ def _text(img, s, org, scale=0.42, colour=C_TEXT, thick=1) -> int:
 
 def _dot(img, centre, colour, r=4) -> None:
     cv2.circle(img, centre, r, colour, -1, cv2.LINE_AA)
+
+
+def _dashed_v(img, x: int, y0: int, y1: int, colour, dash: int = 9) -> None:
+    """
+    A dashed vertical edge.
+
+    Dashed, not solid, on purpose: a solid rectangle edge is what YOLO
+    boxes look like. The search region must read as "uncertain area", and
+    a dashed edge says that without a word of text.
+    """
+    x = int(max(0, min(x, img.shape[1] - 1)))
+    for y in range(int(y0), int(y1), dash * 2):
+        cv2.line(img, (x, y), (x, min(y + dash, int(y1))), colour, 1)
+
+
+def _panel(img, x: int, y: int, w: int, h: int, alpha: float = 0.65) -> None:
+    """A darkened plate behind text, so captions stay readable over video."""
+    x0, y0 = max(0, int(x)), max(0, int(y))
+    x1, y1 = min(img.shape[1], int(x + w)), min(img.shape[0], int(y + h))
+    if x1 <= x0 or y1 <= y0:
+        return
+    roi = img[y0:y1, x0:x1]
+    cv2.addWeighted(np.full_like(roi, C_BAR), alpha, roi, 1.0 - alpha, 0.0,
+                    dst=roi)
 
 
 class HUD:
@@ -381,41 +412,96 @@ class HUD:
         cue = target.bearing_cue
         if not cue.available:
             return
+        # CueRole is decided once, by the fusion layer. The overlay never
+        # re-derives whether the camera has confirmed the target — that is
+        # how two widgets end up disagreeing about one drone.
+        if target.cue_role is CueRole.NONE:
+            return
+        if target.cue_role is CueRole.CONFIRMED:
+            # YOLO owns the position now. Withdrawing the region entirely
+            # is the point: the operator must never see a bounding box and
+            # a separate "search here" area for the same drone.
+            return
         scale = self.config.ui.display_scale
 
+        acoustic = target.acoustic
+        coasting = acoustic is not None and acoustic.coasting
+
         if not cue.in_view:
-            # Off-screen: an arrow at the correct edge, nothing more.
+            # Off-screen: an arrow at the correct edge, and how far to turn.
             side = cue.off_screen_side
             x = 18 if side < 0 else width - 18
             y = y_offset + height // 2
             tip = (x - 14, y) if side < 0 else (x + 14, y)
-            cv2.arrowedLine(canvas, (x, y), tip, C_ACOUSTIC, 2,
+            cv2.arrowedLine(canvas, (x, y), tip, C_CUE, 3,
                             cv2.LINE_AA, tipLength=0.5)
-            txt = f"{abs(cue.rel_bearing_deg or 0):.0f}° off"
-            _text(canvas, txt, (x - 22 if side < 0 else x - 50, y - 18),
-                  0.38, C_ACOUSTIC)
+            txt = f"{abs(cue.rel_bearing_deg or 0):.0f}deg off"
+            _text(canvas, txt, (x - 22 if side < 0 else x - 56, y - 18),
+                  0.4, C_CUE)
+            _text(canvas, "ACOUSTIC ONLY",
+                  (x - 40 if side < 0 else x - 96, y + 26), 0.36, C_CUE)
             return
 
         cx = int(round((cue.x_px or 0.0) * scale))
         half = int(round((cue.half_width_px or 0.0) * scale))
         top, bot = y_offset, y_offset + height
 
-        # Uncertainty band, drawn as a translucent fill.
-        if half > 0:
-            x0 = max(0, cx - half)
-            x1 = min(width, cx + half)
-            if x1 > x0:
+        # ── The search REGION ──
+        #
+        # A vertical band spanning the full image height, never a box. The
+        # array measures azimuth only; it has no elevation, so any vertical
+        # extent would be an invented measurement. The band says "search
+        # somewhere along this column", which is exactly what is known.
+        #
+        # Its width is the bearing uncertainty projected through the same
+        # lens, so a low-confidence bearing is visibly a wider search.
+        x0 = max(0, cx - half)
+        x1 = min(width, cx + half)
+        if x1 > x0:
+            # ⚠️ The fill is SKIPPED once the region covers most of the
+            # picture. On the FAR camera (28 deg lens) a +/-30 deg bearing
+            # uncertainty projects to a band wider than the whole frame, and
+            # tinting everything would hide the very obstacle the operator
+            # is studying — while telling them nothing, since "somewhere in
+            # this image" is not a search region. The edges and the caption
+            # still say where the microphone points and that it is coarse.
+            covers_most = (x1 - x0) >= 0.6 * width
+            if not covers_most:
                 roi = canvas[top:bot, x0:x1]
-                tint = np.full_like(roi, (40, 90, 110))
-                cv2.addWeighted(tint, 0.18, roi, 0.82, 0.0, dst=roi)
+                tint = np.full_like(roi, C_CUE_FILL)
+                # Translucent enough that the tree or roofline hiding the
+                # drone stays readable underneath.
+                cv2.addWeighted(tint, 0.28, roi, 0.72, 0.0, dst=roi)
+            _dashed_v(canvas, x0, top, bot, C_CUE)
+            _dashed_v(canvas, x1 - 1, top, bot, C_CUE)
 
-        cv2.line(canvas, (cx, top), (cx, bot), C_ACOUSTIC, 1, cv2.LINE_AA)
+        cv2.line(canvas, (cx, top), (cx, bot), C_CUE, 1, cv2.LINE_AA)
 
-        label = "ACOUSTIC BEARING"
+        # ── Caption ──
+        # Deliberately worded so it can never be mistaken for a detection:
+        # the camera has NOT seen this, the microphone has.
+        head = "ACOUSTIC ONLY - OCCLUDED" if not coasting \
+            else "ACOUSTIC ONLY - COASTING"
+        lines = [head]
+        if acoustic is not None:
+            lines.append(f"BEARING {acoustic.bearing_text()}")
+            if acoustic.has_distance:
+                lines.append(f"DIST {acoustic.distance_text()}")
         if cue.uncertainty_exceeds_fov:
-            # Honest caveat: a ±15-45° DOA cannot localise inside a 28° lens.
-            label += " (COARSE)"
-        _text(canvas, label, (max(2, cx - 60), top + 16), 0.36, C_ACOUSTIC)
+            # Honest caveat: a +/-15-45 deg DOA cannot localise inside a
+            # 28 deg lens, so the "region" is most of the picture.
+            lines.append("COARSE - DOA WIDER THAN THIS LENS")
+
+        # Anchored to the band, clamped into the frame, drawn low so it
+        # does not sit on top of the horizon where drones actually are.
+        tw = max(cv2.getTextSize(ascii_safe(s), FONT, 0.4, 1)[0][0]
+                 for s in lines)
+        bx = int(min(max(2, cx - tw // 2), max(2, width - tw - 6)))
+        by = bot - 12 - 16 * len(lines)
+        _panel(canvas, bx - 6, by - 14, tw + 12, 16 * len(lines) + 10)
+        for i, line in enumerate(lines):
+            colour = C_CUE if i == 0 else C_TEXT
+            _text(canvas, line, (bx, by + 16 * i), 0.4, colour)
 
     # ── Status bar ─────────────────────────────────────────────
 

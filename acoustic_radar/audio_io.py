@@ -38,6 +38,22 @@ class InputConfig:
     sample_rate: int
     raw_array: bool          # True = ≥4 канали, доступний власний SRP-PHAT
 
+    #: Індекси каналів, які вважаються ФІЗИЧНИМИ мікрофонами, у порядку
+    #: mic_positions_m.
+    #:
+    #: ⚠️ PHYSICAL HARDWARE VERIFICATION REQUIRED. Порядок і призначення
+    #: каналів XVF3800 не документовані ніде в цьому репозиторії. Значення
+    #: за замовчуванням — «перші N каналів» — це ПРИПУЩЕННЯ, а не
+    #: вимірювання. Якщо воно хибне, SRP-PHAT рахуватиме напрямок по
+    #: неправильній геометрії й даватиме стабільно неправильні кути, які
+    #: неможливо виправити ані зсувом, ані дзеркаленням.
+    #:
+    #: Перевіряється так: постукайте по одному мікрофону масиву й
+    #: подивіться, у якому каналі зʼявився сплеск
+    #: (`python calibrate.py check` друкує рівні по каналах).
+    #: Результат вписується у radar_calibration.json як "mic_channels".
+    mic_channels: tuple[int, ...] = ()
+
     def describe(self) -> str:
         kind = ("сирі канали масиву" if self.raw_array
                 else "оброблене стерео" if self.channels == 2
@@ -103,11 +119,25 @@ def resolve_input(cfg: dict, sample_rate: int,
     else:
         channels = min(max_ch, 2)
 
+    channels = max(channels, 1)
+
+    # ⚠️ Скільки каналів віддає пристрій — ВИМІРЯНО (драйвер це повідомляє).
+    # Які з них фізичні мікрофони — НІ. Коментар «6 каналів XVF3800 = 4
+    # мікрофони + 2 опорні» вище є припущенням, і саме на ньому мовчки
+    # тримались і SRP-PHAT, і вхід класифікатора.
+    configured = cfg.get("mic_channels")
+    n_mics = len(cfg.get("mic_positions_m") or []) or 4
+    if configured:
+        mic_channels = tuple(int(c) for c in configured if 0 <= int(c) < channels)
+    else:
+        mic_channels = tuple(range(min(n_mics, channels)))
+
     return InputConfig(device_index=idx,
                        device_name=str(info.get("name", "?")),
-                       channels=max(channels, 1),
+                       channels=channels,
                        sample_rate=sample_rate,
-                       raw_array=channels >= 4)
+                       raw_array=channels >= 4,
+                       mic_channels=mic_channels)
 
 
 def open_stream(inp: InputConfig, blocksize: int) -> sd.InputStream:
@@ -135,10 +165,28 @@ def open_stream(inp: InputConfig, blocksize: int) -> sd.InputStream:
     raise RuntimeError(f"Не вдалось відкрити мікрофон: {last_error}")
 
 
-def to_mono(block: np.ndarray) -> np.ndarray:
-    """[samples, channels] → моно float32."""
+def to_mono(block: np.ndarray,
+            channels: tuple[int, ...] | None = None) -> np.ndarray:
+    """
+    [samples, channels] → моно float32.
+
+    ⚠️ ВИПРАВЛЕНО: усереднювались УСІ канали, включно з немікрофонними.
+
+    На 6-канальному XVF3800 старий `block.mean(axis=1)` домішував у вхід
+    класифікатора ще два канали, які, за власним коментарем audio_io,
+    мікрофонами не є (опорні/AEC). Модель навчалась на мікрофонному звуці,
+    а на Pi отримувала суміш мікрофонів із опорним сигналом — тобто вхід,
+    якого в навчальній вибірці не існувало.
+
+    `channels` порожній або None означає «усі» — так поводиться 1- і
+    2-канальний вхід, де вибирати нічого.
+    """
     if block.ndim == 1:
         return block.astype(np.float32, copy=False)
+    if channels:
+        valid = [c for c in channels if 0 <= c < block.shape[1]]
+        if valid and len(valid) != block.shape[1]:
+            return block[:, valid].mean(axis=1).astype(np.float32, copy=False)
     return block.mean(axis=1).astype(np.float32, copy=False)
 
 

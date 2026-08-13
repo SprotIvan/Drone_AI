@@ -67,6 +67,8 @@ from pathlib import Path
 
 import numpy as np
 
+from bearing_frame import CanonicalBearing, source_convention
+
 SPEED_OF_SOUND = 343.0   # м/с при +20 °C
 
 
@@ -135,32 +137,83 @@ def azimuths_to_degrees(values: list[float]) -> list[float]:
 
 
 def select_azimuth(degrees: list[float], beam_index: int = -1,
-                   cluster_deg: float = 25.0) -> tuple[float | None, float]:
+                   cluster_deg: float = 25.0
+                   ) -> tuple[float | None, float, bool]:
     """
     Обирає напрямок з чотирьох променів.
+
+    Повертає (кут, впевненість, неоднозначно).
 
     beam_index >= 0 → беремо саме цей промінь.
     beam_index < 0  → шукаємо найбільшу узгоджену групу променів:
                       якщо кілька променів дивляться приблизно в один бік,
-                      там і є домінантне джерело. Впевненість = частка
-                      променів у цій групі.
+                      там і є домінантне джерело.
+
+    ═══════════════════════════════════════════════════════════════
+    ⚠️ ВИПРАВЛЕНО: НІЧИЯ МІЖ ГРУПАМИ ВИРІШУВАЛАСЬ ПОРЯДКОМ ПРОМЕНІВ
+    ═══════════════════════════════════════════════════════════════
+
+    Старий код брав першу групу, що досягла максимуму (`len > len`).
+    Якщо DSP віддавав два промені на захід і два на схід, перемагала та,
+    що трапилась раніше у списку — а порядок променів DSP не гарантує.
+    Виміряно: ті самі чотири азимути у чотирьох порядках дають ДВІ
+    ПРОТИЛЕЖНІ відповіді, і в усіх випадках впевненість 0.50, тобто
+    нічия була невидимою для решти системи.
+
+    Далі DOATracker бачив три «підтвердження» нового напрямку поспіль і
+    чесно перескакував на протилежний бік — саме те, що на екрані
+    виглядає як «ціль на заході, а стрілка іноді повертає на схід».
+
+    Тепер нічия позначається прапорцем `ambiguous`, а кут береться як
+    циркулярне середнє ВСІХ променів найбільшого розміру групи, тобто
+    детермінований і не залежить від порядку. Трекер на неоднозначних
+    вимірах не перескакує.
     """
     if not degrees:
-        return None, 0.0
+        return None, 0.0, False
 
     if 0 <= beam_index < len(degrees):
-        return degrees[beam_index], 0.5
+        return degrees[beam_index], 0.5, False
 
-    best_members: list[float] = []
+    groups: list[list[float]] = []
     for centre in degrees:
         members = [d for d in degrees
                    if abs((d - centre + 180.0) % 360.0 - 180.0) <= cluster_deg]
-        if len(members) > len(best_members):
-            best_members = members
+        groups.append(members)
+
+    best_size = max(len(g) for g in groups)
+    winners = [g for g in groups if len(g) == best_size]
+
+    # Групи навколо різних променів того самого джерела — це та сама група.
+    # Різними вважаються лише ті, чиї центри рознесені більше за кластер.
+    distinct: list[list[float]] = []
+    for group in winners:
+        centre = circular_mean(group)
+        if not any(angular_diff(centre, circular_mean(d)) <= cluster_deg
+                   for d in distinct):
+            distinct.append(group)
+
+    ambiguous = len(distinct) > 1
+    if ambiguous:
+        # Детермінований вибір: група з найменшим внутрішнім розкидом.
+        # Порядок променів більше ні на що не впливає.
+        distinct.sort(key=lambda g: (_spread_deg(g), circular_mean(g)))
+    best_members = distinct[0]
 
     angle = circular_mean(best_members)
     confidence = len(best_members) / len(degrees)
-    return angle, confidence
+    if ambiguous:
+        # Нічия — це НЕ така сама впевненість, як одностайність.
+        confidence *= 0.5
+    return angle, confidence, ambiguous
+
+
+def _spread_deg(degrees: list[float]) -> float:
+    """Максимальне відхилення групи кутів від її циркулярного середнього."""
+    if len(degrees) < 2:
+        return 0.0
+    centre = circular_mean(degrees)
+    return max(angular_diff(d, centre) for d in degrees)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -398,9 +451,10 @@ class HardwareDOA:
                 None, error=f"не вдалось розібрати вивід: «{snippet}»")
 
         degrees = azimuths_to_degrees(values)
-        angle, conf = select_azimuth(degrees, self.beam_index)
+        angle, conf, ambiguous = select_azimuth(degrees, self.beam_index)
         self.fail_count = 0
-        return DOAReading(angle, confidence=conf, source="usb", raw=degrees)
+        return DOAReading(angle, confidence=conf, source="usb", raw=degrees,
+                          ambiguous=ambiguous)
 
     # ── Читання кешу ───────────────────────────────────────────
 
@@ -492,23 +546,62 @@ class ArrayDOA:
 
     # ── Основний метод ─────────────────────────────────────────
 
+    def usable_pairs(self, audio: np.ndarray,
+                     threshold: float = 0.999) -> list[tuple[int, int]]:
+        """
+        Пари мікрофонів, які цього блоку несуть корисну інформацію.
+
+        ═══════════════════════════════════════════════════════════════
+        ⚠️ ВИПРАВЛЕНО: СЛІПА СМУГА ±90° І ДОВІЧНЕ ВИМКНЕННЯ SRP-PHAT
+        ═══════════════════════════════════════════════════════════════
+
+        Старий channels_are_distinct() порівнював ЛИШЕ канали 0 і 1.
+        Мікрофони 0 і 1 у квадратному масиві мають однакову координату y,
+        тож джерело на осі +y доходить до них ОДНОЧАСНО — канали стають
+        ідентичними, і метод відмовлявся працювати, хоча мікрофони 2 і 3
+        у цей момент дають бездоганний часовий зсув.
+
+        Виміряно на синтетичній хвилі: напрямки 89°, 90°, 91° і 270°
+        відхилялись повністю, тобто масив мав сліпу смугу шириною кілька
+        градусів рівно перпендикулярно базі 0–1.
+
+        Гірше: DOAProvider бачив у тексті помилки слово «ідентичні» і
+        назавжди виставляв _array_disabled_reason. Тобто дрон, який один
+        раз пройшов через 90°, вимикав SRP-PHAT до кінця сеансу.
+
+        Тепер вироджені пари просто виключаються з суми — саме так це і
+        має працювати: SRP-PHAT підсумовує кореляції ПАР, і пара з нульовою
+        затримкою не несе інформації про напрямок, зате несе шум, який
+        зміщує пік. Оброблене стерео (усі пари вироджені) як і раніше
+        чесно відхиляється.
+        """
+        n_ch = min(audio.shape[1], self.n_mics)
+        if n_ch < 2:
+            return []
+        centred = [audio[:, c] - audio[:, c].mean() for c in range(n_ch)]
+        norms = [float(np.linalg.norm(c)) for c in centred]
+
+        good: list[tuple[int, int]] = []
+        for i, j in self.pairs:
+            if i >= n_ch or j >= n_ch:
+                continue
+            denom = norms[i] * norms[j]
+            if denom < 1e-9:
+                continue
+            if abs(float(centred[i] @ centred[j]) / denom) < threshold:
+                good.append((i, j))
+        return good
+
     def channels_are_distinct(self, audio: np.ndarray,
                               threshold: float = 0.999) -> bool:
         """
-        Перевіряє, що канали справді різні мікрофони, а не копії.
+        Чи можна взагалі рахувати напрямок по цьому блоку.
 
-        Оброблене стерео від XVF3800 має майже ідентичні канали —
-        рахувати по ньому DOA неможливо, і краще про це сказати,
-        ніж видавати випадкові кути.
+        True, якщо хоча б одна пара мікрофонів не вироджена. Оброблене
+        стерео від XVF3800 має майже ідентичні канали — по ньому DOA
+        неможливий, і про це краще сказати, ніж видавати випадкові кути.
         """
-        if audio.shape[1] < 2:
-            return False
-        a = audio[:, 0] - audio[:, 0].mean()
-        b = audio[:, 1] - audio[:, 1].mean()
-        denom = np.linalg.norm(a) * np.linalg.norm(b)
-        if denom < 1e-9:
-            return False
-        return abs(float(a @ b) / denom) < threshold
+        return bool(self.usable_pairs(audio, threshold))
 
     def estimate(self, audio: np.ndarray) -> DOAReading:
         """
@@ -519,7 +612,8 @@ class ArrayDOA:
         if n_ch < 2:
             return DOAReading(None, error="потрібно щонайменше 2 канали")
 
-        if not self.channels_are_distinct(audio):
+        good = set(self.usable_pairs(audio))
+        if not good:
             return DOAReading(
                 None, error="канали ідентичні — масив віддає оброблене "
                             "стерео, SRP-PHAT неможливий")
@@ -531,6 +625,10 @@ class ArrayDOA:
         used = 0
         for k, (i, j) in enumerate(self.pairs):
             if i >= n_ch or j >= n_ch:
+                continue
+            # Вироджена пара (джерело на її перпендикулярі) не несе
+            # інформації про напрямок, зате додає у суму шум і зміщує пік.
+            if (i, j) not in good:
                 continue
             cc = self._gcc_phat(channels[i], channels[j])
             centre = (len(cc) - 1) // 2
@@ -618,6 +716,15 @@ class DOATracker:
             return
 
         # ── Викид: чекаємо підтвердження, перш ніж перескакувати ──
+        #
+        # ⚠️ НЕОДНОЗНАЧНИЙ ВИМІР НЕ Є ПІДТВЕРДЖЕННЯМ. Коли DSP віддає
+        # нічию між двома протилежними групами променів, серія таких
+        # вимірів виглядає точно як «ціль стабільно перелетіла» — і трекер
+        # чесно перескакував на протилежний бік за 1.5 с. Це і був
+        # механізм, через який на екрані ціль із заходу «іноді» опинялась
+        # на сході. Нічия не рухає трек: вона лише не оновлює його.
+        if reading.ambiguous:
+            return
         self._pending.append(angle)
         if len(self._pending) >= self.JUMP_CONFIRMATIONS:
             recent = self._pending[-self.JUMP_CONFIRMATIONS:]
@@ -659,9 +766,22 @@ class DOAProvider:
       3. якщо нічого не працює — чесне «н/д».
     """
 
+    #: Скільки блоків поспіль канали мають бути виродженими, перш ніж
+    #: SRP-PHAT вимикається на весь сеанс. Один блок — це не доказ:
+    #: ціль могла просто пройти через перпендикуляр до бази мікрофонів.
+    ARRAY_DISABLE_AFTER = 20
+
     def __init__(self, cfg: dict, sample_rate: int, n_channels: int):
-        self.offset = float(cfg.get("doa_offset_deg", 0.0))
-        self.invert = bool(cfg.get("doa_invert", False))
+        # ⚠️ КОЖНЕ ДЖЕРЕЛО МАЄ ВЛАСНУ КОНВЕНЦІЮ. Раніше один
+        # doa_offset_deg/doa_invert застосовувався і до USB, і до
+        # SRP-PHAT. Але напрямок обертання SRP-PHAT ВІДОМИЙ з коду
+        # (проти годинникової, це atan2 по mic_positions_m), а в USB DSP
+        # він невідомий. Спільне калібрування гарантує, що правильним
+        # може бути щонайбільше одне з двох джерел. Див. bearing_frame.
+        self.conventions = {
+            "usb": source_convention("usb", cfg),
+            "srp": source_convention("srp", cfg),
+        }
 
         self.hardware = HardwareDOA(beam_index=int(cfg.get("doa_beam_index", -1)))
         self.hardware_ok = self.hardware.start()
@@ -669,16 +789,20 @@ class DOAProvider:
         self.array = ArrayDOA(cfg.get("mic_positions_m"), sample_rate)
         self.array_ok = n_channels >= 2
         self._array_disabled_reason: str | None = None
+        self._degenerate_streak = 0
 
         self.tracker = DOATracker()
+        #: Останній канонічний пеленг — те, що споживають радар, LED і
+        #: камера. Жоден із них не бачить сирого кута джерела.
+        self.canonical = CanonicalBearing()
 
     def describe(self) -> str:
         parts = []
         parts.append(f"USB DOA: {'✅ ' + str(self.hardware.script_path)}"
                      if self.hardware_ok else "USB DOA: ❌ недоступний")
         parts.append(f"SRP-PHAT: {'доступний' if self.array_ok else 'вимкнено'}")
-        parts.append(f"зсув {self.offset:+.0f}°"
-                     + (", дзеркально" if self.invert else ""))
+        for conv in self.conventions.values():
+            parts.append(conv.describe())
         return " | ".join(parts)
 
     def update(self, audio: np.ndarray | None = None) -> DOAReading:
@@ -691,18 +815,49 @@ class DOAProvider:
         if not reading.ok and self.array_ok and audio is not None \
                 and self._array_disabled_reason is None:
             reading = self.array.estimate(audio)
-            if not reading.ok and reading.error:
-                # Немає сенсу рахувати SRP щоразу, якщо канали ідентичні
-                if "ідентичні" in reading.error:
+            if not reading.ok and reading.error and "ідентичні" in reading.error:
+                # ⚠️ Один вироджений блок — НЕ привід вимикати SRP-PHAT
+                # назавжди. Раніше саме так і було: дрон, що один раз
+                # пройшов перпендикулярно базі мікрофонів, гасив власний
+                # DOA до кінця сеансу. Вимикаємо лише після стійкої серії,
+                # яку дає справді оброблене стерео.
+                self._degenerate_streak += 1
+                if self._degenerate_streak >= self.ARRAY_DISABLE_AFTER:
                     self._array_disabled_reason = reading.error
-                    print(f"\n⚠️  DOA (SRP-PHAT): {reading.error}")
-
-        if reading.ok:
-            reading.angle_deg = apply_orientation(
-                reading.angle_deg, self.offset, self.invert)
+                    print(f"\n⚠️  DOA (SRP-PHAT): {reading.error} "
+                          f"({self._degenerate_streak} блоків поспіль)")
+            elif reading.ok:
+                self._degenerate_streak = 0
 
         self.tracker.update(reading)
+        self.canonical = self._to_canonical(reading)
         return reading
+
+    def _to_canonical(self, reading: DOAReading) -> CanonicalBearing:
+        """
+        Згладжений кут трекера → канонічний пеленг.
+
+        ЄДИНЕ місце, де сира конвенція джерела перетворюється на спільну.
+        Перетворення застосовується РІВНО ОДИН РАЗ і саме тут; далі радар,
+        LED і камера виконують лише власні вихідні перетворення.
+        """
+        if self.tracker.angle is None:
+            return CanonicalBearing(reason="напрямок не виміряно")
+
+        source = self.tracker.source or reading.source or "none"
+        conv = self.conventions.get(source)
+        if conv is None:
+            return CanonicalBearing(
+                confidence=self.tracker.confidence, source=source,
+                reason=f"невідоме джерело «{source}»")
+
+        return CanonicalBearing(
+            deg=conv.to_canonical(self.tracker.angle),
+            confidence=self.tracker.confidence,
+            source=source,
+            calibrated=conv.calibrated,
+            ambiguous=self.tracker.ambiguous or reading.ambiguous,
+            reason="" if conv.calibrated else conv.describe())
 
     def stop(self) -> None:
         self.hardware.stop()
@@ -727,8 +882,9 @@ if __name__ == "__main__":
     for s in samples:
         vals = parse_azimuth_values(s)
         deg = azimuths_to_degrees(vals)
-        angle, conf = select_azimuth(deg)
-        print(f"   {s[:46]:<48s} → {angle:6.1f}°  (conf {conf:.2f})")
+        angle, conf, amb = select_azimuth(deg)
+        print(f"   {s[:46]:<48s} → {angle:6.1f}°  (conf {conf:.2f}"
+              f"{', НЕОДНОЗНАЧНО' if amb else ''})")
 
     import ast
     print("\n   Для порівняння — стара логіка ast.literal_eval:")

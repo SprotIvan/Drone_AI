@@ -63,7 +63,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from doa import find_xvf_host, unapply_orientation
+from bearing_frame import led_sector, to_led_index
+from doa import find_xvf_host
+from latency import BUDGET
 from target_state import LatestValue
 
 log = logging.getLogger("station.led")
@@ -91,14 +93,20 @@ class LedFrame:
     """
     One requested ring appearance.
 
-    `bearing_deg` is in the INSTALLATION frame — the same 0-360 degrees the
-    radar and the HUD show, i.e. after radar_calibration.json's
-    doa_offset_deg has been applied. Converting it back into the array's own
-    frame is this module's job (see `bearing_to_led_index`), because the
-    ring is bolted to the array, not to the compass.
+    `bearing_deg` is the CANONICAL bearing (bearing_frame): 0 = the
+    direction the installation faces, increasing clockwise. It is the same
+    number the radar plots and the camera cue projects, already normalised
+    out of whichever sensor produced it. This module applies only the
+    ring's own two physical parameters to it and nothing else.
+
+    `calibrated` False means the source's convention was never measured, so
+    the direction may be mirrored. The ring then shows the target STATE
+    without pointing anywhere, because a hardware indicator that may be
+    180 degrees out is worse than one that admits it does not know.
     """
     mode: LedMode = LedMode.SEARCHING
     bearing_deg: Optional[float] = None
+    calibrated: bool = True
 
 
 class LedStatus(Enum):
@@ -165,53 +173,60 @@ def frame_for_target(target) -> LedFrame:
             not target.acoustic_health.ok:
         return LedFrame(LedMode.SEARCHING, None)
 
+    # Only a bearing whose source convention was actually measured may aim
+    # the ring. An uncalibrated one still raises the alarm colour — a drone
+    # IS confirmed — but it lights the whole ring instead of a sector,
+    # which says "confirmed, direction not trustworthy" rather than
+    # pointing an operator at a possibly opposite horizon.
+    calibrated = bool(getattr(acoustic, "bearing_calibrated", True))
     if acoustic.coasting:
-        return LedFrame(LedMode.COASTING, acoustic.bearing_deg)
+        return LedFrame(LedMode.COASTING, acoustic.bearing_deg, calibrated)
     if acoustic.confirmed:
-        return LedFrame(LedMode.ALARM, acoustic.bearing_deg)
-    return LedFrame(LedMode.SEARCHING, None)
+        return LedFrame(LedMode.ALARM, acoustic.bearing_deg, calibrated)
+    return LedFrame(LedMode.SEARCHING, None, calibrated)
 
 
 # ═══════════════════════════════════════════════════════════════
 #  Ring geometry
 # ═══════════════════════════════════════════════════════════════
 
-def bearing_to_led_index(bearing_deg: float, led_count: int,
-                         doa_offset_deg: float = 0.0,
-                         doa_invert: bool = False,
-                         led_zero_offset_deg: float = 0.0,
+def bearing_to_led_index(canonical_deg: float, led_count: int,
+                         led_zero_deg: float = 0.0,
                          clockwise: bool = True) -> int:
     """
-    Which LED sits closest to an installation-frame bearing.
+    Canonical bearing -> the LED closest to it.
 
-    Two rotations, in this order, and both of them matter:
+    ⚠️ REWRITTEN. The previous version took the DISPLAYED bearing and then
+    un-applied radar_calibration.json's doa_offset_deg to "get back to the
+    array's own frame", on the reasoning that the ring is bolted to the
+    array rather than to the compass.
 
-      1. installation frame -> array frame, undoing radar_calibration.json's
-         doa_offset_deg / doa_invert. Skipping this lights an LED that is
-         wrong by exactly the mount offset — a mistake that looks perfectly
-         plausible on screen and is only visible with the hardware in hand.
+    That was a SECOND transform on an already-transformed angle — exactly
+    the double-transform this system had to be purged of. Two consequences,
+    both real:
 
-      2. array frame -> ring index, using where LED 0 physically sits and
-         which way the indices run.
+      • the ring's aim depended on the MICROPHONE's calibration, so
+        re-measuring the DOA silently rotated the ring even though neither
+        the ring nor the drone had moved;
+      • it assumed the DSP's azimuth zero coincides with the ring's LED 0,
+        which nothing in this project or its documentation establishes.
+
+    The ring needs two numbers of its own, both physical facts about the
+    board, both independent of every other subsystem, and both measured
+    with `python respeaker_led.py --bearing sweep`:
+
+        led_zero_deg   the canonical bearing LED 0 sits at
+        clockwise      whether LED indices run clockwise from above
+
+    The maths lives in bearing_frame so that the radar, the camera cue and
+    this ring cannot drift apart.
     """
-    if led_count <= 0:
-        raise ValueError("led_count must be positive")
-
-    array_deg = unapply_orientation(float(bearing_deg), doa_offset_deg,
-                                    doa_invert)
-    ring_deg = (array_deg - float(led_zero_offset_deg)) % 360.0
-    index = int(round(ring_deg / 360.0 * led_count)) % led_count
-    if not clockwise:
-        index = (led_count - index) % led_count
-    return index
+    return to_led_index(canonical_deg, led_count, led_zero_deg, clockwise)
 
 
 def sector_indices(centre: int, span: int, led_count: int) -> List[int]:
     """LED indices of a sector of `span` LEDs centred on `centre`."""
-    span = max(1, min(int(span), int(led_count)))
-    half = (span - 1) // 2
-    start = centre - half
-    return [(start + i) % led_count for i in range(span)]
+    return list(led_sector(centre, span, led_count))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -451,12 +466,16 @@ class RespeakerLed:
     #: without restarting the station.
     RETRY_INTERVAL_S = 30.0
 
-    def __init__(self, led_cfg, calibration_cfg: Optional[dict] = None,
-                 script_path: Optional[Path] = None):
+    def __init__(self, led_cfg, script_path: Optional[Path] = None):
+        """
+        ⚠️ No microphone calibration is taken here, deliberately.
+
+        The ring consumes the CANONICAL bearing, so radar_calibration.json
+        is none of its business. The previous signature accepted it and
+        un-applied doa_offset_deg internally, which made the ring's aim
+        depend on the microphone's calibration — the double-transform bug.
+        """
         self.cfg = led_cfg
-        calibration_cfg = calibration_cfg or {}
-        self._doa_offset = float(calibration_cfg.get("doa_offset_deg", 0.0))
-        self._doa_invert = bool(calibration_cfg.get("doa_invert", False))
         self._script_path = script_path
 
         self.status = (LedStatus.DISABLED if not led_cfg.enabled
@@ -481,6 +500,7 @@ class RespeakerLed:
         self._last_write_time = 0.0
         self._retry_after = 0.0
         self._arity_just_learned = False
+        self._submit_stamp = 0.0
 
     # ── Introspection ──────────────────────────────────────────
 
@@ -520,6 +540,10 @@ class RespeakerLed:
         """
         self._requested.publish(frame)
         self._last_submit = time.monotonic()
+        # Stamped so the worker can report how long the ring lagged the
+        # decision. A hardware indicator that is right but two seconds late
+        # is a different failure from one that is wrong.
+        self._submit_stamp = self._last_submit
         self._wake.set()
 
     def stop(self, timeout: float = 2.0) -> None:
@@ -745,7 +769,8 @@ class RespeakerLed:
         alarm = _rgb(cfg.colour_alarm if frame.mode is LedMode.ALARM
                      else cfg.colour_coasting)
 
-        if frame.bearing_deg is None or not self._commands.can_drive_sector(n):
+        if (frame.bearing_deg is None or not frame.calibrated
+                or not self._commands.can_drive_sector(n)):
             # An alarm with no bearing must not point anywhere. Lighting the
             # whole ring red says "a drone is confirmed, direction unknown",
             # which is true; lighting one arbitrary LED would not be.
@@ -753,8 +778,7 @@ class RespeakerLed:
 
         centre = bearing_to_led_index(
             frame.bearing_deg, n,
-            doa_offset_deg=self._doa_offset, doa_invert=self._doa_invert,
-            led_zero_offset_deg=cfg.led_zero_offset_deg,
+            led_zero_deg=cfg.led_zero_offset_deg,
             clockwise=cfg.led_index_clockwise)
         sector = set(sector_indices(centre, cfg.sector_leds, n))
         return {i: (alarm if i in sector else base) for i in range(n)}
@@ -910,6 +934,9 @@ class RespeakerLed:
 
         self._writes += 1
         self._failures = 0
+        if self._submit_stamp:
+            BUDGET.record("led_write",
+                          (time.monotonic() - self._submit_stamp) * 1000.0)
         return True
 
     def _note_failure(self, message: str) -> None:
@@ -1063,20 +1090,25 @@ def _bearing_test(argv: List[str]) -> int:
     Light the target sector for a KNOWN bearing, so the ring can be
     checked against reality instead of guessed at.
 
-    ⚠️ WHY THIS EXISTS. `bearing_to_led_index` undoes
-    radar_calibration.json's doa_offset_deg before choosing an LED, because
-    the ring is bolted to the array rather than to the compass. That is
-    correct when the offset corrects a MOUNT ROTATION — the ring turns with
-    the array, so the array-frame angle is the physically right one.
+    ⚠️ WHY THIS EXISTS. The ring's two physical parameters —
+    `led.led_zero_offset_deg` (which canonical bearing LED 0 sits at) and
+    `led.led_index_clockwise` (which way the indices run) — are facts about
+    one particular board. No amount of reading this code will settle them,
+    and guessing them is a 50% chance of pointing an operator at the
+    opposite horizon.
 
-    It is NOT correct when the offset instead compensates a mismatch
-    between the DSP's azimuth convention and the board's own geometry. Then
-    the raw angle is itself rotated relative to the ring, and
-    `led.led_zero_offset_deg` has to absorb the difference.
+    This mode injects a KNOWN canonical bearing straight into the ring,
+    bypassing the microphone entirely, so both parameters are read off the
+    hardware in half a minute:
 
-    Which of the two applies is a fact about one particular array, and no
-    amount of reading this code will settle it. Standing in a known
-    direction and looking at the ring settles it in half a minute.
+      1. `--bearing 0` should light the LEDs facing the installation front.
+         If it lights a different direction, the angle between them is
+         `led_zero_offset_deg`.
+      2. `--bearing sweep` should walk the sector CLOCKWISE seen from
+         above. If it walks the other way, flip `led_index_clockwise`.
+
+    Do step 2 before step 1: handedness is a mirror, and no zero-offset can
+    correct a mirror (see bearing_frame for the proof).
 
         python respeaker_led.py --bearing 90      # hold one direction
         python respeaker_led.py --bearing sweep   # walk the whole ring
@@ -1112,7 +1144,7 @@ def _bearing_test(argv: List[str]) -> int:
     bearings = ([float(value)] if value != "sweep"
                 else [float(d) for d in range(0, 360, 360 // 12)])
 
-    led = RespeakerLed(led_cfg, calib)
+    led = RespeakerLed(led_cfg)
     led.start()
     deadline = time.monotonic() + 20.0
     while led.status is LedStatus.STARTING and time.monotonic() < deadline:
@@ -1122,18 +1154,19 @@ def _bearing_test(argv: List[str]) -> int:
         led.stop()
         return 1
 
-    print(f"{'shown on radar':>14} {'array frame':>12} {'LED':>5}  sector")
-    print("-" * 52)
+    print(f"{'canonical':>10} {'compass':>9} {'LED':>5}  sector")
+    print("-" * 46)
     try:
         for bearing in bearings:
-            array_deg = unapply_orientation(bearing, offset, invert)
             index = bearing_to_led_index(
-                bearing, n, doa_offset_deg=offset, doa_invert=invert,
-                led_zero_offset_deg=led_cfg.led_zero_offset_deg,
+                bearing, n, led_zero_deg=led_cfg.led_zero_offset_deg,
                 clockwise=led_cfg.led_index_clockwise)
             sector = sector_indices(index, led_cfg.sector_leds, n)
-            print(f"{bearing:13.0f}° {array_deg:11.0f}° {index:5d}  {sector}")
-            led.submit(LedFrame(LedMode.ALARM, bearing))
+            name = ("FRONT" if bearing < 45 or bearing >= 315
+                    else "RIGHT" if bearing < 135
+                    else "BEHIND" if bearing < 225 else "LEFT")
+            print(f"{bearing:9.0f}° {name:>9} {index:5d}  {sector}")
+            led.submit(LedFrame(LedMode.ALARM, bearing, calibrated=True))
             time.sleep(2.0 if value == "sweep" else 0.5)
         if value != "sweep":
             input("\nring is lit — press Enter to restore ")
@@ -1155,18 +1188,21 @@ def _selftest() -> int:
     print("respeaker_led.py — self-test (no hardware required)")
     print("=" * 66)
 
-    print("\n1. Bearing -> LED index on a 12-LED ring, no mount offset:")
+    print("\n1. Canonical bearing -> LED index on a 12-LED ring:")
     for bearing in (0.0, 30.0, 90.0, 142.0, 180.0, 270.0, 359.0):
         idx = bearing_to_led_index(bearing, 12)
         print(f"   {bearing:6.1f}° -> LED {idx:2d}  "
               f"sector {sector_indices(idx, 3, 12)}")
 
-    print("\n2. The mount offset is UNDONE, not applied twice:")
-    print("   installation bearing 142°, doa_offset_deg = +40°")
-    print(f"   naive (wrong):    LED {bearing_to_led_index(142.0, 12)}")
-    print(f"   correct:          LED "
-          f"{bearing_to_led_index(142.0, 12, doa_offset_deg=40.0)}")
-    print("   ^ the array itself hears the drone at 102°, not 142°")
+    print("\n2. The ring's own two parameters are the ONLY transform:")
+    print(f"   default:        142° -> LED "
+          f"{bearing_to_led_index(142.0, 12)}")
+    print(f"   zero at +90°:   142° -> LED "
+          f"{bearing_to_led_index(142.0, 12, led_zero_deg=90.0)}")
+    print(f"   anticlockwise:  142° -> LED "
+          f"{bearing_to_led_index(142.0, 12, clockwise=False)}")
+    print("   ^ no microphone calibration is read here at all — that")
+    print("     coupling was the double-transform bug.")
 
     print("\n3. Sector wraps across LED 0:")
     print(f"   centre 0, span 3 -> {sector_indices(0, 3, 12)}")

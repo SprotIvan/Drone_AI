@@ -142,6 +142,30 @@ class AcousticConfig:
     # smoothing at all. radar.py default 0.5.
     detector_prob_ema: Optional[float] = None
 
+    # [POLICY] Audio hop, in seconds. None = radar.BLOCK_SEC (0.5).
+    #
+    # ⚠️ THE LAST REMAINING LATENCY LEVER, AND IT IS NOT FREE.
+    #
+    # Measured budget from audible to indication (see latency.py):
+    #     read wait     = block_seconds / 2   (mean quantisation delay)
+    #     confirmation  = confirm_blocks x block_seconds
+    #     everything else measured at ~30 ms combined
+    #
+    # Shortening the hop cuts the READ WAIT without weakening the decision,
+    # because the 2 s analysis window is unchanged — only how often it is
+    # re-evaluated. Shortening the CONFIRMATION cuts the evidence itself.
+    #
+    #     0.50 s hop, 2 confirmations -> ~1.28 s   (default, measured)
+    #     0.25 s hop, 4 confirmations -> ~1.15 s   same evidence, 2x CPU
+    #     0.25 s hop, 3 confirmations -> ~0.90 s   25% less evidence, 2x CPU
+    #
+    # DEFAULT LEFT UNCHANGED ON PURPOSE. Halving the hop doubles the
+    # inference rate, and on the Raspberry Pi 5 the acoustic thread shares
+    # its cores with the camera pipeline and Hailo. Measure block_total on
+    # the Pi before spending that CPU: if it is not comfortably under the
+    # new hop, the audio buffer overruns and detection gets WORSE.
+    block_seconds: Optional[float] = None
+
     def detector_tuning(self):
         """
         Build a radar.DetectorTuning, leaving unset fields at radar.py's
@@ -402,6 +426,17 @@ class FusionConfig:
     # visible). True = the camera is a fully independent detector, not just
     # a confirmer of acoustic contacts.
     allow_visual_only_targets: bool = True
+
+    # [DERIVED] How closely a YOLO box must agree with the acoustic bearing
+    # before the box is accepted as a visual confirmation OF THAT target
+    # and the acoustic search region is withdrawn.
+    #
+    # 20 deg sits just above the DOA's own stated accuracy (+/-15 deg for
+    # SRP-PHAT on a 43 mm array, doa.py's figure). Tighter and a correct
+    # box gets rejected by DOA noise alone; looser and an unrelated object
+    # elsewhere in the frame silently cancels the region for a drone that
+    # is still hidden behind a tree.
+    cue_agreement_deg: float = 20.0
 
 
 # ═══════════════════════════════════════════════════════════════

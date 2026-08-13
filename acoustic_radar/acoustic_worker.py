@@ -41,6 +41,7 @@ from typing import Optional
 import numpy as np
 
 from fusion_config import StationConfig
+from latency import BUDGET
 from station_logging import EventLogger
 from target_state import (AcousticObservation, LatestValue, SubsystemHealth,
                           SubsystemState, now)
@@ -150,19 +151,20 @@ class AcousticWorker:
         # alarm come up and how long does it survive a dropout". They are
         # logged as MEASURED values derived from the real block period, not
         # as the intent behind them.
+        hop = float(self.config.acoustic.block_seconds or BLOCK_SEC)
         log.info("acoustic timing: block %.0f ms x %d confirmations = "
                  "%.0f ms to alarm; coasting %.1f s (%d blocks)",
-                 BLOCK_SEC * 1000.0, tuning.confirm_blocks,
-                 tuning.confirm_seconds(BLOCK_SEC) * 1000.0,
-                 tuning.coast_seconds(BLOCK_SEC), tuning.miss_tolerance)
-        if tuning.coast_seconds(BLOCK_SEC) > self.config.acoustic.lost_after_s:
+                 hop * 1000.0, tuning.confirm_blocks,
+                 tuning.confirm_seconds(hop) * 1000.0,
+                 tuning.coast_seconds(hop), tuning.miss_tolerance)
+        if tuning.coast_seconds(hop) > self.config.acoustic.lost_after_s:
             # The fusion layer would declare the acoustic sensor lost while
             # the engine is still legitimately holding the target.
             log.warning("acoustic.lost_after_s (%.1f s) is SHORTER than the "
                         "detector's coasting window (%.1f s) — the fusion "
                         "layer will drop the target before the engine does",
                         self.config.acoustic.lost_after_s,
-                        tuning.coast_seconds(BLOCK_SEC))
+                        tuning.coast_seconds(hop))
 
         inp = resolve_input(cfg, features.SAMPLE_RATE)
         self._engine.attach_input(inp)
@@ -176,11 +178,20 @@ class AcousticWorker:
         else:
             self._warn_if_range_calibration_looks_synthetic(cfg)
 
-        self._stream = open_stream(inp, BLOCK_SAMPLES)
-        self._block_samples = BLOCK_SAMPLES
-        # The decision period, taken from radar.py rather than duplicated,
-        # so changing BLOCK_SEC there automatically retunes the budget check.
-        self._block_seconds = float(BLOCK_SEC)
+        # The hop may be overridden to trade CPU for latency; radar.py
+        # remains the source of the default so `python radar.py` standalone
+        # is unaffected. The engine's sliding window handles any hop.
+        self._block_seconds = float(
+            self.config.acoustic.block_seconds or BLOCK_SEC)
+        self._block_samples = (
+            BLOCK_SAMPLES if self._block_seconds == BLOCK_SEC
+            else int(features.SAMPLE_RATE * self._block_seconds))
+        if self._block_seconds != BLOCK_SEC:
+            log.warning("audio hop overridden to %.0f ms (radar.py default "
+                        "%.0f ms) — verify block_total stays well under it, "
+                        "or the device buffer will overrun",
+                        self._block_seconds * 1000.0, BLOCK_SEC * 1000.0)
+        self._stream = open_stream(inp, self._block_samples)
 
         # ── Optional side channels ──
         integ = self.config.integrations
@@ -285,10 +296,21 @@ class AcousticWorker:
     # ── Main loop ──────────────────────────────────────────────
 
     def _loop(self) -> None:
+        import features as _features
+
         log.info("acoustic loop running (%.1f Hz decision rate, %.0f ms "
                  "processing budget per block)",
                  1.0 / self._block_seconds, self._block_seconds * 1000.0)
         consecutive_errors = 0
+        # The audio thread is the only place that can measure how long the
+        # microphone takes to hand over a block. That wait IS latency even
+        # though it is not our code: a drone that becomes audible just after
+        # a read returns is not looked at until the next one completes.
+        BUDGET.describe_config(
+            self._block_seconds,
+            self.config.acoustic.detector_tuning().confirm_blocks,
+            float(_features.WINDOW_SEC))
+        last_return = time.monotonic()
 
         with self._stream:
             while not self._stop.is_set():
@@ -314,6 +336,8 @@ class AcousticWorker:
                 # period — if it does not, the device buffer overruns and
                 # audio is permanently lost.
                 t0 = time.monotonic()
+                BUDGET.record("audio_wait", (t0 - last_return) * 1000.0)
+                last_return = t0
 
                 if overflowed:
                     # Data already read is still processed — the original
@@ -348,6 +372,7 @@ class AcousticWorker:
                 self._log_events(obs)
 
                 elapsed = time.monotonic() - t0
+                BUDGET.record("block_total", elapsed * 1000.0)
                 self._block_times.append(elapsed)
                 if len(self._block_times) > 200:
                     del self._block_times[:100]
@@ -392,6 +417,8 @@ class AcousticWorker:
             bearing_confidence=float(status.angle_confidence),
             bearing_source=str(status.angle_source),
             bearing_ambiguous=bool(status.angle_ambiguous),
+            bearing_calibrated=bool(getattr(status, "angle_calibrated", False)),
+            bearing_reason=str(getattr(status, "angle_reason", "")),
             distance_m=None if r.distance_m is None else float(r.distance_m),
             distance_lo_m=None if r.lo_m is None else float(r.lo_m),
             distance_hi_m=None if r.hi_m is None else float(r.hi_m),

@@ -106,10 +106,19 @@ class AcousticObservation:
     gated: bool = True                 # below the noise gate = digital silence
 
     # ── Bearing (azimuth only) ──
+    #: THE CANONICAL BEARING (see bearing_frame): 0 = the direction the
+    #: installation faces, increasing CLOCKWISE. Already normalised out of
+    #: whichever sensor produced it, exactly once, by DOAProvider. The
+    #: radar, the LED ring and the camera cue all consume THIS and apply
+    #: only their own output transform to it.
     bearing_deg: Optional[float] = None
     bearing_confidence: float = 0.0
     bearing_source: str = "none"       # usb | srp | none
-    bearing_ambiguous: bool = False    # 2-mic mirror ambiguity
+    bearing_ambiguous: bool = False    # tie between opposite directions
+    #: The source's convention was actually measured. False means the
+    #: direction may be mirrored, so nothing may POINT with it.
+    bearing_calibrated: bool = False
+    bearing_reason: str = ""           # why, when not calibrated
 
     # ── Range (estimate, with interval) ──
     distance_m: Optional[float] = None
@@ -180,6 +189,11 @@ class AcousticObservation:
         if self.bearing_deg is None:
             return "N/A"
         text = f"{self.bearing_deg:.0f}°"
+        if not self.bearing_calibrated:
+            # An uncalibrated direction may be mirrored. Showing it as a
+            # bare number would assert a physical direction the system has
+            # no basis for.
+            text += " (UNCAL)"
         if self.bearing_ambiguous:
             text += " (±mirror)"
         return text

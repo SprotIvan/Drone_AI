@@ -62,6 +62,7 @@ import math
 from dataclasses import dataclass
 from typing import Optional
 
+from bearing_frame import to_camera_relative_deg, wrap180
 from fusion_config import GeometryConfig
 
 
@@ -113,9 +114,12 @@ class BearingCue:
 #  Projection
 # ═══════════════════════════════════════════════════════════════
 
-def wrap_signed_deg(angle: float) -> float:
-    """Wrap an angle to (−180, +180]."""
-    return (angle + 180.0) % 360.0 - 180.0
+#: Wrap an angle to [−180, +180).
+#:
+#: ⚠️ Delegated to bearing_frame, not reimplemented. Two copies of the same
+#: angle arithmetic in two modules is exactly how a system ends up with two
+#: conventions; there is now one implementation and every layer shares it.
+wrap_signed_deg = wrap180
 
 
 def horizontal_fov_deg(focal_px: float, width_px: int) -> float:
@@ -183,7 +187,10 @@ class BearingProjector:
 
         focal = float(focal)
         hfov = horizontal_fov_deg(focal, self.width_px)
-        rel = wrap_signed_deg(float(bearing_deg) - float(boresight))
+        # THE camera's own output transform, and its only one. The input
+        # is the canonical bearing; nothing here re-applies a sensor
+        # calibration or a mount offset.
+        rel = to_camera_relative_deg(float(bearing_deg), float(boresight))
 
         # Outside the field of view: report which side, no pixel.
         if abs(rel) >= hfov / 2.0:

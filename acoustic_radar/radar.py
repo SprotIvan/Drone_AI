@@ -77,6 +77,7 @@ import features
 from audio_io import InputConfig, open_stream, resolve_input, to_mono
 from doa import DOAProvider, DOAReading
 from features import MelFrontend
+from latency import BUDGET
 from ranging import RangeEstimate, RangeEstimator
 
 
@@ -210,6 +211,10 @@ class RadarStatus:
     angle_confidence: float = 0.0
     angle_source: str = "none"
     angle_ambiguous: bool = False
+    #: Конвенцію джерела виміряно, напрямок можна показувати на залізі.
+    #: False = напрямок може бути дзеркальним — див. bearing_frame.
+    angle_calibrated: bool = False
+    angle_reason: str = ""
     range: RangeEstimate = field(default_factory=RangeEstimate)
     overflow: bool = False
 
@@ -413,6 +418,7 @@ class RadarEngine:
         self.buffer = np.zeros(WINDOW_SAMPLES, dtype=np.float32)
         self._filled = 0
         self.doa: DOAProvider | None = None     # створюється у attach_input
+        self.input: InputConfig | None = None
 
         self.status = RadarStatus(
             threshold=self.threshold,
@@ -477,7 +483,9 @@ class RadarEngine:
 
     def attach_input(self, inp: InputConfig) -> None:
         """Прив'язує рушій до конкретного входу (потрібно для SRP-PHAT)."""
-        self.doa = DOAProvider(self.cfg, inp.sample_rate, inp.channels)
+        self.input = inp
+        self.doa = DOAProvider(self.cfg, inp.sample_rate,
+                               len(inp.mic_channels) or inp.channels)
         if self.verbose:
             print(f"   {self.doa.describe()}")
 
@@ -490,7 +498,8 @@ class RadarEngine:
         Returns:
             RadarStatus — актуальний стан
         """
-        mono = to_mono(block)
+        # Тільки мікрофонні канали — див. audio_io.to_mono.
+        mono = to_mono(block, getattr(self.input, "mic_channels", None))
 
         # ── Ковзне вікно: зсуваємо буфер і дописуємо новий блок ──
         n = len(mono)
@@ -519,11 +528,17 @@ class RadarEngine:
         if st.gated:
             st.p_drone = 0.0
         else:
+            _t = time.monotonic()
             mel = self.frontend(self.buffer)
+            _t_feat = time.monotonic()
             logits = self.session.run(
                 None, {self.input_name: MelFrontend.as_model_input(mel)})[0]
             exp = np.exp(logits[0] - logits[0].max())
             st.p_drone = float((exp / exp.sum())[1])
+            # Measured, not estimated: these two are the only parts of the
+            # chain that a faster machine would actually speed up.
+            BUDGET.record("features", (_t_feat - _t) * 1000.0)
+            BUDGET.record("inference", (time.monotonic() - _t_feat) * 1000.0)
 
         st.state = self.detector.update(st.p_drone, st.gated)
         st.p_smoothed = self.detector.p_smoothed
@@ -543,13 +558,23 @@ class RadarEngine:
         # кут гарантовано доживає до кінця coasting без жодних припущень.
         if self.doa is not None:
             if st.state in ("TRACK", "ALARM"):
-                self.doa.update(block if block.ndim == 2 else None)
+                # SRP-PHAT отримує САМЕ мікрофонні канали, у порядку
+                # mic_positions_m. Передати сюди сирий блок означало б
+                # рахувати геометрію по опорних каналах.
+                self.doa.update(self._mic_block(block))
             else:
                 self.doa.tracker.update(DOAReading(None))
-            st.angle_deg = self.doa.tracker.angle
-            st.angle_confidence = self.doa.tracker.confidence
-            st.angle_source = self.doa.tracker.source
-            st.angle_ambiguous = self.doa.tracker.ambiguous
+                self.doa.canonical = self.doa._to_canonical(DOAReading(None))
+            # ⚠️ КАНОНІЧНИЙ кут, а не сирий кут трекера. Перетворення
+            # конвенції джерела виконує DOAProvider РІВНО ОДИН РАЗ; радар,
+            # LED і камера далі не мають права нічого «довертати».
+            canon = self.doa.canonical
+            st.angle_deg = canon.deg
+            st.angle_confidence = canon.confidence
+            st.angle_source = canon.source
+            st.angle_ambiguous = canon.ambiguous
+            st.angle_calibrated = canon.calibrated
+            st.angle_reason = canon.reason
 
         # ── Відстань ──
         if st.state in ("TRACK", "ALARM"):
@@ -568,6 +593,18 @@ class RadarEngine:
                                      noise_dbfs=self.ranger.noise.level_dbfs,
                                      reason="цілі немає")
         return st
+
+    def _mic_block(self, block: np.ndarray) -> np.ndarray | None:
+        """Підблок лише з мікрофонних каналів, або None якщо їх немає."""
+        if block.ndim != 2:
+            return None
+        chans = getattr(self.input, "mic_channels", None)
+        if not chans:
+            return block
+        valid = [c for c in chans if 0 <= c < block.shape[1]]
+        if len(valid) < 2:
+            return None
+        return block[:, valid]
 
     def close(self) -> None:
         if self.doa is not None:

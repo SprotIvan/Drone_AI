@@ -356,7 +356,20 @@ def measure_raw_angle(cfg: dict, seconds: float) -> tuple[float | None, str]:
 
 
 def cmd_doa(cfg: dict, seconds: float) -> None:
-    from doa import angular_diff, apply_orientation, circular_mean
+    """
+    ⚠️ Solves the SAME model the runtime applies, and writes the keys of the
+    source it actually measured.
+
+    Two defects lived here. First, the fit used doa.apply_orientation while
+    the station now normalises through bearing_frame.SourceConvention — two
+    models of the same thing, and a calibration that solves one and is
+    applied by the other is wrong by construction. Second, it always wrote
+    doa_offset_deg / doa_invert, which describe the USB DSP, even when the
+    measurement had come from SRP-PHAT. Calibrating with one source and
+    storing the result against the other cannot be right for either.
+    """
+    from bearing_frame import (Handedness, SourceConvention,
+                               angular_distance, circular_mean_deg)
 
     print("=" * 66)
     print("🧭 Калібрування напрямку")
@@ -368,6 +381,7 @@ def cmd_doa(cfg: dict, seconds: float) -> None:
     print("   чи не дзеркальний напрямок обертання — тому краще зробити дві.\n")
 
     points: list[tuple[float, float]] = []
+    sources: set[str] = set()
     while True:
         raw = input(f"   Істинний напрямок у градусах "
                     f"(Enter — завершити, зібрано {len(points)}): ").strip()
@@ -386,37 +400,67 @@ def cmd_doa(cfg: dict, seconds: float) -> None:
             continue
         print(f"      Масив показує {measured:.1f}° (джерело: {source})")
         points.append((true_angle, measured))
+        sources.add(source)
 
     if not points:
         print("\n   Жодної точки — калібрування не змінено.")
         return
 
-    # Перебираємо дві гіпотези напрямку обертання і беремо кращу
-    best = None
-    for invert in (False, True):
-        offsets = [(true - (-meas if invert else meas)) % 360.0
-                   for true, meas in points]
-        offset = circular_mean(offsets)
-        residual = sum(angular_diff(apply_orientation(meas, offset, invert),
-                                    true) for true, meas in points)
-        residual /= len(points)
-        if best is None or residual < best[2]:
-            best = (offset, invert, residual)
+    if len(sources) > 1:
+        print(f"\n   ❌ Точки виміряні РІЗНИМИ джерелами ({sorted(sources)}).")
+        print("      У кожного джерела своя конвенція кута, тому спільне")
+        print("      калібрування було б неправильним для обох.")
+        print("      Повторіть вимір так, щоб працювало одне джерело.")
+        return
+    source = next(iter(sources))
 
-    offset, invert, residual = best
-    print(f"\n   Зсув: {offset:+.1f}°"
-          f"{'   (напрямок обертання дзеркальний)' if invert else ''}")
+    # Дві гіпотези напрямку обертання — і саме тут вирішується головне.
+    # Дзеркальність НЕ можна виправити зсувом (доведення у bearing_frame),
+    # тому обидва параметри підбираються разом, ТІЄЮ САМОЮ моделлю
+    # SourceConvention, яку станція застосовує під час роботи. Раніше тут
+    # розвʼязувалась модель doa.apply_orientation, а застосовувалась інша —
+    # калібрування, розвʼязане не для тієї моделі, хибне за побудовою.
+    best = None
+    for hand in (Handedness.CLOCKWISE, Handedness.COUNTER_CLOCKWISE):
+        zeros = [(true - (-meas if hand is Handedness.COUNTER_CLOCKWISE
+                          else meas)) % 360.0 for true, meas in points]
+        zero = circular_mean_deg(zeros)
+        conv = SourceConvention(zero, hand, source)
+        residual = sum(angular_distance(conv.to_canonical(meas), true)
+                       for true, meas in points) / len(points)
+        if best is None or residual < best[1]:
+            best = (conv, residual)
+
+    conv, residual = best
+    print(f"\n   {conv.describe()}")
     print(f"   Середня похибка після корекції: {residual:.1f}°")
 
     if len(points) == 1:
-        print("   ⚠️  Одна точка не може виявити дзеркальність — "
-              "зробіть другий вимір під іншим кутом.")
+        print("   ⚠️  ОДНА ТОЧКА НЕ ВИЗНАЧАЄ НАПРЯМОК ОБЕРТАННЯ.")
+        print("      Зсув і дзеркальність — два незалежні параметри. Одна")
+        print("      точка задає лише зсув, і результат буде правильним")
+        print("      РІВНО там, де ви міряли, а за чверть оберту — на 180°")
+        print("      хибним. Саме так виглядає «ціль на заході, а стрілка")
+        print("      іноді на сході». Зробіть другий вимір, краще ~90° від")
+        print("      першого.")
     elif residual > 30.0:
         print("   ⚠️  Похибка велика. Ймовірні причини: масив рахує кут")
         print("      нестабільно, або джерело було не в тому напрямку.")
 
-    calibration.save({"doa_offset_deg": float(offset),
-                      "doa_invert": bool(invert)})
+    # Ключі належать ДЖЕРЕЛУ, яке справді вимірювали. Раніше сюди завжди
+    # писались doa_offset_deg/doa_invert, тобто параметри USB DSP, навіть
+    # коли вимір робив SRP-PHAT.
+    if source == "srp":
+        calibration.save({"srp_zero_deg": float(conv.zero_deg)})
+        print("   Записано srp_zero_deg (власний SRP-PHAT). Його напрямок")
+        print("   обертання відомий із коду і не зберігається.")
+    else:
+        calibration.save({
+            "doa_offset_deg": float(conv.zero_deg),
+            "doa_invert": conv.handedness is Handedness.COUNTER_CLOCKWISE,
+            "doa_handedness": conv.handedness.value,
+        })
+        print("   Записано doa_offset_deg / doa_handedness (USB DSP).")
 
 
 # ═══════════════════════════════════════════════════════════════
