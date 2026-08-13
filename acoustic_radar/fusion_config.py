@@ -313,6 +313,22 @@ class GeometryConfig:
     camera_boresight_deg: Dict[int, Optional[float]] = field(
         default_factory=lambda: {0: None, 1: None})
 
+    # [CALIBRATE] The value radar_calibration.json's `doa_offset_deg` had
+    # when the boresight above was measured.
+    #
+    # ⚠️ THIS EXISTS BECAUSE THE BORESIGHT SILENTLY GOES STALE. The
+    # boresight is an azimuth in the INSTALLATION frame, and doa_offset_deg
+    # is what defines that frame. Change the offset — say, by -180 to stop
+    # the radar showing the wrong side — and the frame rotates underneath
+    # every boresight already recorded, by exactly the same amount. The
+    # numbers still look plausible, nothing errors, and the camera cue just
+    # points the wrong way.
+    #
+    # Recording the offset the measurement was taken under lets the station
+    # notice and say so, instead of leaving it to be discovered by a drone
+    # arrow pointing at the wrong horizon. None = never recorded, no check.
+    boresight_calibrated_at_doa_offset_deg: Optional[float] = None
+
     # [MEASURED] Horizontal focal length in pixels per camera, copied from
     # TWO_CAMERAS_FIXED.CAMERA_FOCAL_PX so that one file drives both.
     # Camera 0 (IMX477 FAR): two independent calibrations at 5.0 m and 1.5 m
@@ -712,6 +728,36 @@ class StationConfig:
                 out.append(f"camera {cam_id}: boresight {bore:.1f}°")
         if self.geometry.drone_real_width_m is None:
             out.append("drone_real_width_m NOT SET -> no visual distance")
+        return out
+
+    def check_bearing_frames(self, calibration_cfg: dict) -> list[str]:
+        """
+        Warn when the camera boresight was measured in a frame that has
+        since been rotated by a change to doa_offset_deg.
+
+        Returns human-readable warnings, empty when everything agrees. The
+        corrected value is computed and shown, because "your boresight is
+        stale" without the replacement number is only half a warning.
+        """
+        recorded = self.geometry.boresight_calibrated_at_doa_offset_deg
+        if recorded is None:
+            return []
+        current = float(calibration_cfg.get("doa_offset_deg", 0.0))
+        delta = (current - float(recorded) + 180.0) % 360.0 - 180.0
+        if abs(delta) < 0.5:
+            return []
+
+        out = [f"doa_offset_deg is now {current:+.0f}deg but the camera "
+               f"boresight was measured at {float(recorded):+.0f}deg — the "
+               f"installation frame has rotated {delta:+.0f}deg underneath it"]
+        for cam_id, bore in sorted(self.geometry.camera_boresight_deg.items()):
+            if bore is None:
+                continue
+            out.append(f"  camera {cam_id}: boresight {bore:.0f}deg is STALE, "
+                       f"it should be {(float(bore) + delta) % 360.0:.0f}deg "
+                       f"(or re-measure it)")
+        out.append("  then set geometry.boresight_calibrated_at_doa_offset_deg"
+                   f" to {current:+.0f} to silence this")
         return out
 
 

@@ -1058,6 +1058,97 @@ def _q(value: Optional[str]) -> str:
     return f'"{value}"' if value else "null  /* not found */"
 
 
+def _bearing_test(argv: List[str]) -> int:
+    """
+    Light the target sector for a KNOWN bearing, so the ring can be
+    checked against reality instead of guessed at.
+
+    ⚠️ WHY THIS EXISTS. `bearing_to_led_index` undoes
+    radar_calibration.json's doa_offset_deg before choosing an LED, because
+    the ring is bolted to the array rather than to the compass. That is
+    correct when the offset corrects a MOUNT ROTATION — the ring turns with
+    the array, so the array-frame angle is the physically right one.
+
+    It is NOT correct when the offset instead compensates a mismatch
+    between the DSP's azimuth convention and the board's own geometry. Then
+    the raw angle is itself rotated relative to the ring, and
+    `led.led_zero_offset_deg` has to absorb the difference.
+
+    Which of the two applies is a fact about one particular array, and no
+    amount of reading this code will settle it. Standing in a known
+    direction and looking at the ring settles it in half a minute.
+
+        python respeaker_led.py --bearing 90      # hold one direction
+        python respeaker_led.py --bearing sweep   # walk the whole ring
+    """
+    import calibration
+    from fusion_config import load as load_config
+
+    value = "sweep"
+    for i, arg in enumerate(argv):
+        if arg == "--bearing" and i + 1 < len(argv):
+            value = argv[i + 1]
+
+    cfg = load_config()
+    calib = calibration.load()
+    led_cfg = cfg.led
+    if led_cfg.led_count is None:
+        print("led.led_count is not set in fusion_config.json — run "
+              "`python respeaker_led.py --probe` first.")
+        return 2
+
+    n = int(led_cfg.led_count)
+    offset = float(calib.get("doa_offset_deg", 0.0))
+    invert = bool(calib.get("doa_invert", False))
+
+    print("=" * 66)
+    print("respeaker_led.py — bearing check")
+    print("=" * 66)
+    print(f"\ndoa_offset_deg = {offset:+.0f}   doa_invert = {invert}")
+    print(f"led_zero_offset_deg = {led_cfg.led_zero_offset_deg:+.0f}   "
+          f"led_index_clockwise = {led_cfg.led_index_clockwise}")
+    print(f"ring = {n} LEDs, sector = {led_cfg.sector_leds}\n")
+
+    bearings = ([float(value)] if value != "sweep"
+                else [float(d) for d in range(0, 360, 360 // 12)])
+
+    led = RespeakerLed(led_cfg, calib)
+    led.start()
+    deadline = time.monotonic() + 20.0
+    while led.status is LedStatus.STARTING and time.monotonic() < deadline:
+        time.sleep(0.1)
+    if led.status is not LedStatus.ACTIVE:
+        print(f"LED unavailable: {led.detail}")
+        led.stop()
+        return 1
+
+    print(f"{'shown on radar':>14} {'array frame':>12} {'LED':>5}  sector")
+    print("-" * 52)
+    try:
+        for bearing in bearings:
+            array_deg = unapply_orientation(bearing, offset, invert)
+            index = bearing_to_led_index(
+                bearing, n, doa_offset_deg=offset, doa_invert=invert,
+                led_zero_offset_deg=led_cfg.led_zero_offset_deg,
+                clockwise=led_cfg.led_index_clockwise)
+            sector = sector_indices(index, led_cfg.sector_leds, n)
+            print(f"{bearing:13.0f}° {array_deg:11.0f}° {index:5d}  {sector}")
+            led.submit(LedFrame(LedMode.ALARM, bearing))
+            time.sleep(2.0 if value == "sweep" else 0.5)
+        if value != "sweep":
+            input("\nring is lit — press Enter to restore ")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        led.stop(timeout=3.0)
+
+    print("\nIf the lit sector points the WRONG way by a constant amount,")
+    print("that amount is what led.led_zero_offset_deg must absorb — e.g. a")
+    print("ring lighting the exact opposite side needs 180. Nothing else in")
+    print("the system is affected by this value.")
+    return 0
+
+
 def _selftest() -> int:
     """Geometry and mapping only — runs anywhere, no hardware."""
     print("=" * 66)
@@ -1096,20 +1187,25 @@ if __name__ == "__main__":
     # quietly running the offline self-test looks exactly like a probe that
     # found no hardware, which is the most misleading failure this script
     # could have.
+    USAGE = (
+        "usage: respeaker_led.py [--probe | --bearing DEG|sweep | --self-test]\n"
+        "   --probe          ask the attached array what it supports\n"
+        "   --bearing DEG    light the sector for a known bearing and check\n"
+        "                    it against reality (--bearing sweep walks the\n"
+        "                    whole ring); this is how led_zero_offset_deg is\n"
+        "                    calibrated\n"
+        "   --self-test      geometry checks only, runs anywhere (default)")
     flags = [a for a in sys.argv[1:] if a.startswith("-")]
-    unknown = [a for a in flags if a not in ("--probe", "--self-test", "-h",
-                                             "--help")]
+    unknown = [a for a in flags if a not in ("--probe", "--self-test",
+                                             "--bearing", "-h", "--help")]
     if unknown:
-        print(f"unknown option(s): {' '.join(unknown)}\n"
-              f"usage: respeaker_led.py [--probe | --self-test]\n"
-              f"   --probe      ask the attached array what it supports "
-              f"(needs the hardware)\n"
-              f"   --self-test  geometry checks only, runs anywhere "
-              f"(default)")
+        print(f"unknown option(s): {' '.join(unknown)}\n{USAGE}")
         sys.exit(2)
     if "-h" in flags or "--help" in flags:
-        print("usage: respeaker_led.py [--probe | --self-test]")
+        print(USAGE)
         sys.exit(0)
     if "--probe" in flags:
         sys.exit(_probe())
+    if "--bearing" in flags:
+        sys.exit(_bearing_test(sys.argv[1:]))
     sys.exit(_selftest())

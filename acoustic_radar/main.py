@@ -98,6 +98,14 @@ def print_banner(config: fusion_config.StationConfig, hef_path: str) -> None:
     for line in config.describe_calibration():
         log.info("  %s", line)
 
+    # The acoustic bearing, the camera cue and the LED ring all express the
+    # same direction, but only if they share one frame of reference. A
+    # change to doa_offset_deg rotates that frame under every boresight
+    # already measured, and nothing about the resulting numbers looks wrong.
+    import calibration
+    for line in config.check_bearing_frames(calibration.load()):
+        log.warning("  %s", line)
+
     gate = config.activation_distance_m(0)
     release = config.release_distance_m(0)
     if gate is not None:

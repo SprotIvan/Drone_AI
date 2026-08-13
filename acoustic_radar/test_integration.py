@@ -1144,6 +1144,23 @@ def test_12_led_ring():
         check("I: camera cue reports its own unavailability honestly",
               not cue.available or not cue.in_view, cue.reason)
 
+    # ── A boresight measured in a since-rotated frame must be caught ──
+    # Changing doa_offset_deg (e.g. by -180 to stop the radar showing the
+    # wrong side) rotates the installation frame under every boresight
+    # already recorded. Nothing errors and the numbers stay plausible, so
+    # the station has to say so out loud.
+    framed = load_config()
+    framed.geometry.camera_boresight_deg = {0: 180.0, 1: 180.0}
+    framed.geometry.boresight_calibrated_at_doa_offset_deg = 0.0
+    quiet = framed.check_bearing_frames({"doa_offset_deg": 0.0})
+    check("no warning while the frames agree", quiet == [], str(quiet))
+    warned = framed.check_bearing_frames({"doa_offset_deg": -180.0})
+    check("a rotated frame is detected", bool(warned),
+          warned[0] if warned else "no warning")
+    check("the corrected boresight is computed, not just complained about",
+          any("should be 0deg" in ln for ln in warned),
+          " | ".join(ln.strip() for ln in warned[1:3]))
+
     # ── The mount offset must be undone before choosing an LED ──
     without = rl.bearing_to_led_index(142.0, N, doa_offset_deg=0.0)
     with_off = rl.bearing_to_led_index(142.0, N, doa_offset_deg=40.0)
