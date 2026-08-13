@@ -509,16 +509,40 @@ class LedConfig:
     # the controller simply reports which one is missing.
 
     # Command that takes the ring out of the firmware's own automatic
-    # speech/DOA animation and into host control. This is the
-    # "LED_AUTO_MODE = 0" step: without it the firmware keeps repainting
-    # the ring on claps and speech and fights every frame written here.
-    cmd_auto_mode: Optional[str] = None
+    # speech/DOA animation and into host control — the "LED_AUTO_MODE = 0"
+    # step. Without it the firmware keeps repainting the ring on claps and
+    # speech and fights every frame written here.
+    #
+    # ⚠️ The XVF3800 firmware observed in the field has NO LED_AUTO_MODE.
+    # Its animation selector is LED_EFFECT (alongside LED_SPEED and
+    # LED_DOA_COLOR), so that is what the controller looks for. The value
+    # written is `auto_mode_off_value` and the exact call is logged,
+    # because the effect enumeration is not something this project can
+    # read — if the ring still animates on its own, try other small
+    # integers here.
+    cmd_auto_mode: Optional[str] = None        # e.g. LED_EFFECT
     auto_mode_off_value: str = "0"
 
-    # Command that sets the whole ring, or one LED, to a colour. The
-    # controller adapts to whichever of the two the firmware exposes.
-    cmd_ring_colour: Optional[str] = None      # takes R G B for all LEDs
+    # Command that paints the ring, and (if the firmware has one) a command
+    # that addresses a single LED.
+    #
+    # ⚠️ The ring command's ARITY is measured from the device, not assumed
+    # from its name. On the XVF3800 firmware observed in the field
+    # LED_RING_COLOR takes TWELVE values — one packed colour per LED —
+    # despite reading like a single colour for the whole ring. That is the
+    # good case: the entire sector paints in one call.
+    cmd_ring_colour: Optional[str] = None      # LED_RING_COLOR
     cmd_led_colour: Optional[str] = None       # takes INDEX R G B
+
+    # [CALIBRATE] Byte order inside a packed per-LED colour value.
+    #
+    # This is the ONE thing the controller cannot read off the device: the
+    # firmware reports how many values it wants, but not how each is
+    # encoded, and reading a dark ring back returns zeros. 24-bit 0xRRGGBB
+    # is the near-universal convention and is the default. If the ring
+    # shows blue where red is expected, change this to "bgr" — nothing
+    # else about the indication depends on it.
+    led_value_order: str = "rgb"               # "rgb" | "bgr"
 
     # [MEASURED] Flag the utility expects command values behind. Taken from
     # the usage line the installed xvf_host.py prints on a bad call:

@@ -1216,6 +1216,61 @@ def test_12_led_ring():
           f"{len(logged)} accepted call(s): "
           + (logged[0] if logged else "none"))
 
+    # ── The real XVF3800 firmware, reproduced from its own output ──
+    # LED_RING_COLOR takes 12 values (one per LED) even though the name
+    # says otherwise, and there is no LED_AUTO_MODE. Both facts broke the
+    # ring on hardware while every unit test passed, so both are pinned
+    # here against a stand-in that answers exactly as the device did.
+    xvf, accepted = _make_xvf3800_xvf_host()
+    led = rl.RespeakerLed(
+        LedConfig(enabled=True, led_count=N, sector_leds=3,
+                  min_write_interval_s=0.0, command_timeout_s=10.0),
+        {"doa_offset_deg": 0.0}, script_path=xvf)
+    led.start()
+    deadline = time.monotonic() + 30.0
+    while led.status is rl.LedStatus.STARTING and time.monotonic() < deadline:
+        time.sleep(0.05)
+    check("XVF3800: controller comes up ACTIVE against the real command set",
+          led.status is rl.LedStatus.ACTIVE, led.detail)
+    check("XVF3800: the ring command's arity is measured, not assumed",
+          led._commands.ring_arity == N,
+          f"{led._commands.ring_colour} takes "
+          f"{led._commands.ring_arity} values")
+    check("XVF3800: a per-pixel ring command CAN draw the target sector",
+          led._commands.can_drive_sector(N))
+    check("XVF3800: LED_EFFECT is found as the automatic-mode control",
+          led._commands.auto_mode == "LED_EFFECT",
+          str(led._commands.auto_mode))
+
+    deadline = time.monotonic() + 30.0
+    while led.writes < 2 and time.monotonic() < deadline:
+        led.submit(rl.LedFrame(rl.LedMode.ALARM, 142.0))
+        time.sleep(0.05)
+    led.stop(timeout=3.0)
+
+    logged = accepted.read_text(encoding="utf-8").splitlines() \
+        if accepted.exists() else []
+    ring_writes = [ln for ln in logged if ln.startswith("LED_RING_COLOR")]
+    check("XVF3800: the array accepted real ring writes",
+          bool(ring_writes), f"{len(logged)} accepted call(s)")
+    if ring_writes:
+        red = _rl_pack(rl._rgb((255, 0, 0)))
+        check("XVF3800: one call paints all 12 LEDs",
+              all(len(ln.split()) - 1 == N for ln in ring_writes),
+              f"{[len(ln.split()) - 1 for ln in ring_writes]} values per call")
+        # The LAST ring write is the shutdown restore to searching-blue, so
+        # the alarm frame is looked for among all of them.
+        sectors = [
+            [i for i, v in enumerate(ln.split()[1:]) if int(v) == red]
+            for ln in ring_writes]
+        expected = sorted(rl.sector_indices(
+            rl.bearing_to_led_index(142.0, N), 3, N))
+        check("XVF3800: exactly a 3-LED red sector is lit, at bearing 142deg",
+              any(lit == expected for lit in sectors),
+              f"expected {expected}, saw {sectors}")
+        check("XVF3800: the ring is left blue on shutdown, never red",
+              sectors[-1] == [], f"last write lit red at {sectors[-1]}")
+
     # ── A watchdog must not leave the ring stuck red ──
     led = rl.RespeakerLed(LedConfig(enabled=True, led_count=N, watchdog_s=0.1),
                           {}, script_path=None)
@@ -1224,6 +1279,65 @@ def test_12_led_ring():
     effective = led._effective_frame()
     check("a stalled station falls back to SEARCHING instead of holding red",
           effective.mode is rl.LedMode.SEARCHING, effective.mode.value)
+
+
+def _rl_pack(colour) -> int:
+    """The 0xRRGGBB packing the controller uses, for asserting on writes."""
+    r, g, b = colour
+    return (r << 16) | (g << 8) | b
+
+
+def _make_xvf3800_xvf_host():
+    """
+    A stand-in reproducing the XVF3800 firmware observed in the field.
+
+    Everything here is taken from real device output, not invented:
+
+      • the command list it reports (no LED_AUTO_MODE; LED_EFFECT instead);
+      • LED_RING_COLOR taking TWELVE values, one per LED, despite its name;
+      • the exact rejection it produces for a wrong count, which the
+        controller is expected to learn from:
+            "Error: LED_RING_COLOR value count is 12, but 3 values provided"
+    """
+    import pathlib
+    import tempfile
+
+    directory = pathlib.Path(tempfile.mkdtemp(prefix="xvf3800_"))
+    script = directory / "xvf_host.py"
+    script.write_text(
+        "import argparse, os, sys\n"
+        "LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)),\n"
+        "                   'accepted.log')\n"
+        "LISTED = ['LED_BRIGHTNESS', 'LED_COLOR', 'LED_DOA_COLOR',\n"
+        "          'LED_EFFECT', 'LED_GAMMIFY', 'LED_RING_COLOR',\n"
+        "          'LED_SPEED', 'AEC_AZIMUTH_VALUES', 'GET_VERSION']\n"
+        "ARITY = {'LED_RING_COLOR': 12, 'LED_EFFECT': 1, 'LED_COLOR': 1,\n"
+        "         'LED_BRIGHTNESS': 1, 'LED_SPEED': 1}\n"
+        "CURRENT = {'LED_RING_COLOR': ['0'] * 12, 'LED_EFFECT': ['3']}\n"
+        "p = argparse.ArgumentParser()\n"
+        "p.add_argument('-l', action='store_true')\n"
+        "p.add_argument('--vid'); p.add_argument('--pid')\n"
+        "p.add_argument('--values', nargs='+')\n"
+        "p.add_argument('COMMAND', nargs='?')\n"
+        "a = p.parse_args()\n"
+        "if a.l or not a.COMMAND:\n"
+        "    print('\\n'.join(LISTED)); sys.exit(0)\n"
+        "if a.COMMAND not in LISTED:\n"
+        "    sys.stderr.write('unknown command\\n'); sys.exit(1)\n"
+        "if not a.values:\n"
+        "    print(' '.join(CURRENT.get(a.COMMAND, ['0'])))\n"
+        "    sys.exit(0)\n"
+        "want = ARITY.get(a.COMMAND, len(a.values))\n"
+        "if len(a.values) != want:\n"
+        "    sys.stderr.write(f'Error: {a.COMMAND} value count is {want}, '\n"
+        "                     f'but {len(a.values)} values provided\\n')\n"
+        "    sys.exit(1)\n"
+        "CURRENT[a.COMMAND] = a.values\n"
+        "with open(LOG, 'a', encoding='utf-8') as fh:\n"
+        "    fh.write(f\"{a.COMMAND} {' '.join(a.values)}\\n\")\n"
+        "print('OK')\n",
+        encoding="utf-8")
+    return script, directory / "accepted.log"
 
 
 def _make_strict_xvf_host():

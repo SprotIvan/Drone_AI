@@ -235,11 +235,26 @@ _LIST_FLAGS: Sequence[Sequence[str]] = (
 #: simply not used, and a pattern that matches more than one command is
 #: treated as ambiguous and refused. No command is ever sent because it
 #: appears in this table — only because the device declared it.
-_AUTO_MODE_PATTERNS = ("LED_AUTO_MODE", "AUTO_LED_MODE", "LED_AUTO")
+#
+# LED_EFFECT is the automatic-animation selector on the XVF3800 firmware
+# actually observed in the field (which reports LED_BRIGHTNESS, LED_COLOR,
+# LED_DOA_COLOR, LED_EFFECT, LED_GAMMIFY, LED_RING_COLOR, LED_SPEED and NO
+# LED_AUTO_MODE at all). It is the register that has to be quietened for
+# host control; `led.auto_mode_off_value` decides what is written to it and
+# the exact call is logged, because an effect index is a cosmetic setting
+# whose enumeration this project cannot read.
+_AUTO_MODE_PATTERNS = ("LED_AUTO_MODE", "AUTO_LED_MODE", "LED_AUTO",
+                       "LED_EFFECT")
 _RING_COLOUR_PATTERNS = ("LED_RING_COLOUR", "LED_RING_COLOR", "LED_RING",
-                         "LED_COLOUR_ALL", "LED_COLOR_ALL", "LED_ALL")
+                         "LED_COLOUR_ALL", "LED_COLOR_ALL", "LED_ALL",
+                         "LED_COLOUR", "LED_COLOR")
 _LED_COLOUR_PATTERNS = ("LED_INDIVIDUAL", "LED_SET_ONE", "LED_PIXEL",
                         "LED_SINGLE", "LED_INDEX")
+
+#: The firmware states its own arity when it rejects a call, e.g.
+#: "Error: LED_RING_COLOR value count is 12, but 3 values provided".
+#: Parsing it turns a dead indicator into a self-correcting one.
+_ARITY_ERROR = re.compile(r"value count is\s+(\d+)", re.IGNORECASE)
 
 
 @dataclass
@@ -249,16 +264,33 @@ class XvfCommands:
     auto_mode: Optional[str] = None
     ring_colour: Optional[str] = None
     led_colour: Optional[str] = None
+    #: How many values the ring command wants, MEASURED by reading it back
+    #: from the device (or learned from the device's own error message).
+    #: This is what distinguishes "one colour for the whole ring" (3) from
+    #: "one packed colour per LED" (led_count) — a difference that cannot
+    #: be inferred from the command's NAME, and which the observed
+    #: LED_RING_COLOR gets exactly backwards from what the name suggests.
+    ring_arity: Optional[int] = None
     detail: str = ""
+
+    def ring_is_per_pixel(self, led_count: Optional[int]) -> bool:
+        return (self.ring_colour is not None and led_count is not None
+                and self.ring_arity == int(led_count))
 
     @property
     def can_drive_ring(self) -> bool:
         return self.ring_colour is not None or self.led_colour is not None
 
-    @property
-    def can_drive_sector(self) -> bool:
-        """A sector needs per-LED control; a whole-ring command cannot."""
-        return self.led_colour is not None
+    def can_drive_sector(self, led_count: Optional[int] = None) -> bool:
+        """
+        A sector needs per-LED addressing.
+
+        Two ways to get it: a command that sets one LED at a time, or a ring
+        command that takes one value per LED — which is far better, since it
+        paints the whole ring in ONE subprocess call instead of twelve.
+        """
+        return (self.led_colour is not None
+                or self.ring_is_per_pixel(led_count))
 
     def led_related(self) -> Tuple[str, ...]:
         return tuple(c for c in self.available if "LED" in c.upper())
@@ -290,6 +322,30 @@ def discover_commands(script_path: Path,
         if len(found) >= 5:
             return tuple(found)
     return ()
+
+
+def read_command_values(script_path: Path, command: str,
+                        timeout: float = 5.0) -> List[float]:
+    """
+    Read a control command's CURRENT values back from the device.
+
+    This is how the ring command's arity is established without guessing:
+    `xvf_host.py LED_RING_COLOR` with no values is a read, and counting the
+    numbers it prints says how many the write form expects. The observed
+    firmware wants 12 — one packed colour per LED — even though the name
+    reads like a single colour for the whole ring.
+    """
+    try:
+        out = subprocess.run(
+            [sys.executable, str(script_path), command],
+            capture_output=True, text=True, timeout=timeout,
+            cwd=str(script_path.parent))
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+    text = (out.stdout or "") + "\n" + (out.stderr or "")
+    # Drop the echoed command name so its digits are not read as values.
+    text = re.sub(re.escape(command), " ", text, flags=re.IGNORECASE)
+    return [float(m) for m in re.findall(r"[-+]?\d+(?:\.\d+)?", text)]
 
 
 def _match_unique(patterns: Sequence[str],
@@ -424,6 +480,7 @@ class RespeakerLed:
         self._writes = 0
         self._last_write_time = 0.0
         self._retry_after = 0.0
+        self._arity_just_learned = False
 
     # ── Introspection ──────────────────────────────────────────
 
@@ -541,7 +598,9 @@ class RespeakerLed:
                 "ring is a hardware fact this project will not guess")
             return
 
-        if not self._commands.can_drive_sector:
+        self._measure_ring_arity()
+
+        if not self._commands.can_drive_sector(cfg.led_count):
             log.warning("LED ring supports whole-ring colour only — the red "
                         "TARGET SECTOR cannot be drawn, so the ring will "
                         "show the target STATE without a bearing")
@@ -556,6 +615,65 @@ class RespeakerLed:
             self._set_status(
                 LedStatus.ACTIVE,
                 f"{cfg.led_count} LEDs via {self._script_path.name}")
+
+    def _measure_ring_arity(self) -> None:
+        """
+        Ask the device how many values its ring command wants.
+
+        ⚠️ THIS IS WHY THE RING STAYED DARK ON REAL HARDWARE. The command
+        is called LED_RING_COLOR, which reads like "one colour for the whole
+        ring", so it was sent three values (R, G, B). The firmware answered
+
+            Error: LED_RING_COLOR value count is 12, but 3 values provided
+
+        — it is a PER-PIXEL command taking one packed colour per LED. A
+        command's arity is a property of the firmware and cannot be inferred
+        from its name, so it is measured here rather than assumed: reading
+        the command back returns its current values, and counting them
+        settles the question. `_note_arity_from_error` recovers the same
+        number from a rejection if the read is not available.
+        """
+        cmd = self._commands.ring_colour
+        if cmd is None or self._script_path is None:
+            return
+        values = read_command_values(self._script_path, cmd,
+                                     self.cfg.command_timeout_s)
+        if values:
+            self._commands.ring_arity = len(values)
+            log.info("LED ring command %s takes %d value(s) — %s", cmd,
+                     len(values),
+                     "one per LED, the whole ring paints in a single call"
+                     if self._commands.ring_is_per_pixel(self.cfg.led_count)
+                     else "a single colour for the whole ring")
+            if (self._commands.ring_arity not in (1, 3)
+                    and not self._commands.ring_is_per_pixel(
+                        self.cfg.led_count)):
+                log.warning("...but led.led_count is %s, which does not match "
+                            "the %d values %s expects. Set led_count to %d.",
+                            self.cfg.led_count, len(values), cmd, len(values))
+
+    def _note_arity_from_error(self, message: str) -> bool:
+        """
+        Learn the ring command's arity from the device's own complaint.
+
+        Returns True if something was learned, so the caller can retry
+        instead of counting the call as a hard failure.
+        """
+        match = _ARITY_ERROR.search(message)
+        if not match:
+            return False
+        wanted = int(match.group(1))
+        if self._commands.ring_arity == wanted:
+            return False
+        self._commands.ring_arity = wanted
+        log.info("LED ring command wants %d values (learned from the "
+                 "device's own error) — adapting", wanted)
+        if self.cfg.led_count and wanted != int(self.cfg.led_count) \
+                and wanted not in (1, 3):
+            log.warning("led.led_count is %d but the ring command wants %d "
+                        "values — set led_count to %d",
+                        int(self.cfg.led_count), wanted, wanted)
+        return True
 
     def _disable_auto_mode(self) -> None:
         """
@@ -627,7 +745,7 @@ class RespeakerLed:
         alarm = _rgb(cfg.colour_alarm if frame.mode is LedMode.ALARM
                      else cfg.colour_coasting)
 
-        if frame.bearing_deg is None or not self._commands.can_drive_sector:
+        if frame.bearing_deg is None or not self._commands.can_drive_sector(n):
             # An alarm with no bearing must not point anywhere. Lighting the
             # whole ring red says "a drone is confirmed, direction unknown",
             # which is true; lighting one arbitrary LED would not be.
@@ -647,14 +765,31 @@ class RespeakerLed:
         if now_t - self._last_write_time < self.cfg.min_write_interval_s:
             return
 
-        # Whole-ring shortcut: if every LED wants the same colour and the
-        # firmware has a ring command, one write replaces N.
+        n = int(self.cfg.led_count or 0)
+
+        # ── Best case: the ring command takes one value per LED ──
+        # The whole ring, sector included, goes out in ONE subprocess call.
+        # This is the path the observed XVF3800 firmware uses.
+        if self._commands.ring_is_per_pixel(n):
+            if self._shadow == target:
+                return
+            values = [str(self._pack(target[i])) for i in range(n)]
+            if self._write_ring(values):
+                self._shadow = dict(target)
+                self._ring_shadow = None
+                self._last_write_time = now_t
+            return
+
+        # ── Uniform colour and a whole-ring command: one write replaces N ──
         colours = set(target.values())
         if len(colours) == 1 and self._commands.ring_colour:
             colour = next(iter(colours))
             if self._ring_shadow == colour:
                 return
-            if self._invoke(self._commands.ring_colour, *map(str, colour)):
+            values = ([str(self._pack(colour))]
+                      if self._commands.ring_arity == 1
+                      else [str(v) for v in colour])
+            if self._write_ring(values):
                 self._ring_shadow = colour
                 self._shadow = dict.fromkeys(self._shadow, colour)
                 self._last_write_time = now_t
@@ -682,7 +817,51 @@ class RespeakerLed:
         # wakes every min_write_interval_s, which is exactly when the next
         # batch becomes eligible.
 
+    def _pack(self, colour: Colour) -> int:
+        """
+        One LED colour as the single integer a per-pixel command takes.
+
+        ⚠️ THE ONE THING THIS MODULE COULD NOT READ OFF THE DEVICE. The
+        firmware reports how MANY values it wants (measured, see
+        _measure_ring_arity) but not how each one is encoded, and reading
+        the ring back on a dark array returns zeros, which say nothing.
+        24-bit 0xRRGGBB is the near-universal convention and is therefore
+        the default — but it IS an assumption, and it is the only one left
+        in this file. If red and blue come out swapped on the ring, set
+        `led.led_value_order` to "bgr"; the geometry and the state logic are
+        unaffected either way.
+        """
+        r, g, b = colour
+        if str(self.cfg.led_value_order).lower() == "bgr":
+            r, b = b, r
+        return (r << 16) | (g << 8) | b
+
     # ── Device I/O ─────────────────────────────────────────────
+
+    def _write_ring(self, values: Sequence[str]) -> bool:
+        """
+        Write the ring command, retrying once if the device corrects us.
+
+        The firmware states its own arity when it rejects a call. Learning
+        from that and retrying immediately means a mismatch costs one wasted
+        call at startup instead of leaving the ring dark until somebody
+        reads the log.
+        """
+        assert self._commands.ring_colour is not None
+        if self._invoke(self._commands.ring_colour, *values):
+            return True
+        if not self._arity_just_learned:
+            return False
+        self._arity_just_learned = False
+        n = int(self.cfg.led_count or 0)
+        wanted = self._commands.ring_arity
+        if wanted == n and n:
+            return False        # caller will rebuild per-pixel next cycle
+        if wanted == 1 and len(values) == 3:
+            r, g, b = (int(v) for v in values)
+            return self._invoke(self._commands.ring_colour,
+                                str(self._pack((r, g, b))))
+        return False
 
     def _invoke(self, command: str, *args: str) -> bool:
         """
@@ -734,6 +913,12 @@ class RespeakerLed:
         return True
 
     def _note_failure(self, message: str) -> None:
+        # A rejection that tells us the command's real arity is information,
+        # not a fault: adapt and let the caller retry rather than counting
+        # it toward the give-up limit.
+        if self._note_arity_from_error(message):
+            self._arity_just_learned = True
+            return
         self._failures += 1
         if self._failures == 1 or self._failures == \
                 self.cfg.max_consecutive_failures:
@@ -768,10 +953,15 @@ class RespeakerLed:
             return
         try:
             base = _rgb(self.cfg.colour_searching)
-            if self._commands.ring_colour:
-                self._invoke(self._commands.ring_colour, *map(str, base))
-            elif self._commands.led_colour and self.cfg.led_count:
-                for i in range(int(self.cfg.led_count)):
+            n = int(self.cfg.led_count or 0)
+            if self._commands.ring_is_per_pixel(n):
+                self._write_ring([str(self._pack(base))] * n)
+            elif self._commands.ring_colour:
+                self._write_ring([str(self._pack(base))]
+                                 if self._commands.ring_arity == 1
+                                 else [str(v) for v in base])
+            elif self._commands.led_colour and n:
+                for i in range(n):
                     self._invoke(self._commands.led_colour, str(i),
                                  *map(str, base))
         except Exception as exc:
@@ -825,9 +1015,34 @@ def _probe() -> int:
         print("no LED-related commands were reported by this firmware")
 
     print(f"\nresolution: {commands.detail}")
+
+    # Arity, read back from the device. This is the number that decides
+    # whether the target SECTOR can be drawn at all, and it cannot be
+    # guessed from the command's name — the observed LED_RING_COLOR takes
+    # one value per LED despite sounding like one colour for the ring.
+    suggested_count = cfg.led.led_count
+    if commands.ring_colour:
+        values = read_command_values(path, commands.ring_colour,
+                                     cfg.led.command_timeout_s)
+        if values:
+            print(f"\n{commands.ring_colour} currently returns {len(values)} "
+                  f"value(s): {' '.join(str(int(v)) for v in values[:16])}")
+            if len(values) not in (1, 3):
+                suggested_count = len(values)
+                print(f"   -> one value per LED: this ring has "
+                      f"{len(values)} LEDs, and the whole target sector "
+                      f"paints in a single call.")
+            else:
+                print("   -> a single colour for the whole ring: the target "
+                      "SECTOR cannot be drawn, only the target STATE.")
+        else:
+            print(f"\n{commands.ring_colour}: could not read its current "
+                  f"values — arity will be learned from the device's first "
+                  f"rejection instead.")
+
     print("\nput the confirmed names into fusion_config.json:")
     print('   { "led": {')
-    print('       "led_count": <count them>,')
+    print(f'       "led_count": {suggested_count or "<count them>"},')
     print(f'       "cmd_auto_mode":   {_q(commands.auto_mode)},')
     print(f'       "cmd_ring_colour": {_q(commands.ring_colour)},')
     print(f'       "cmd_led_colour":  {_q(commands.led_colour)}')
@@ -877,6 +1092,24 @@ def _selftest() -> int:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(message)s",
                         stream=sys.stdout)
-    if "--probe" in sys.argv:
+    # A mistyped flag must not silently run the wrong thing. `--prob`
+    # quietly running the offline self-test looks exactly like a probe that
+    # found no hardware, which is the most misleading failure this script
+    # could have.
+    flags = [a for a in sys.argv[1:] if a.startswith("-")]
+    unknown = [a for a in flags if a not in ("--probe", "--self-test", "-h",
+                                             "--help")]
+    if unknown:
+        print(f"unknown option(s): {' '.join(unknown)}\n"
+              f"usage: respeaker_led.py [--probe | --self-test]\n"
+              f"   --probe      ask the attached array what it supports "
+              f"(needs the hardware)\n"
+              f"   --self-test  geometry checks only, runs anywhere "
+              f"(default)")
+        sys.exit(2)
+    if "-h" in flags or "--help" in flags:
+        print("usage: respeaker_led.py [--probe | --self-test]")
+        sys.exit(0)
+    if "--probe" in flags:
         sys.exit(_probe())
     sys.exit(_selftest())
