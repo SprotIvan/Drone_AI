@@ -93,12 +93,16 @@ class AcousticObservation:
     """
 
     # ── Classification ──
-    engine_state: str = "SLEEP"        # SLEEP | LISTEN | TRACK | ALARM
+    #: SLEEP | LISTEN | TRACK | ALARM | ALARM_COASTING
+    engine_state: str = "SLEEP"
     p_drone: float = 0.0               # instantaneous P(drone) this block
     p_smoothed: float = 0.0            # EMA-smoothed, this is what decides
-    threshold: float = 0.0             # engine's own decision threshold
+    threshold: float = 0.0             # P_START — engine's entry threshold
+    hold_threshold: float = 0.0        # P_HOLD — threshold to KEEP an alarm
     confirmations: int = 0
+    confirm_needed: int = 0            # confirmations required for an alarm
     misses: int = 0
+    miss_tolerance: int = 0            # missed blocks before the target drops
     gated: bool = True                 # below the noise gate = digital silence
 
     # ── Bearing (azimuth only) ──
@@ -123,13 +127,33 @@ class AcousticObservation:
 
     @property
     def detected(self) -> bool:
-        """Engine has a target under track (suspected or confirmed)."""
-        return self.engine_state in ("TRACK", "ALARM")
+        """Engine has a target under track (suspected, confirmed or held)."""
+        return self.engine_state in ("TRACK", "ALARM", "ALARM_COASTING")
 
     @property
     def confirmed(self) -> bool:
-        """Engine has raised the alarm — enough consecutive confirmations."""
-        return self.engine_state == "ALARM"
+        """
+        Engine has raised the alarm — enough confirmations.
+
+        ALARM_COASTING counts as confirmed on purpose. It is the SAME
+        target, still held by radar.Detector's miss tolerance; the signal is
+        merely absent for a moment. Excluding it here would make the fusion
+        layer drop and re-acquire the target every time the drone turned or
+        the wind gusted, which is exactly the flicker the coasting state
+        exists to prevent. Use `coasting` to tell the two apart for display.
+        """
+        return self.engine_state in ("ALARM", "ALARM_COASTING")
+
+    @property
+    def coasting(self) -> bool:
+        """
+        Alarm is held, but there is NO current signal.
+
+        Everything positional in this observation (bearing, distance) is the
+        LAST VALID measurement, not a fresh one. Any UI that shows those
+        numbers while this is True must say so.
+        """
+        return self.engine_state == "ALARM_COASTING"
 
     @property
     def has_bearing(self) -> bool:

@@ -118,7 +118,10 @@ class TelegramAlerter:
                   distance_str: str, confidence: float) -> None:
         """Викликається з основного циклу радара."""
         with self._lock:
-            if state == "ALARM":
+            # ALARM_COASTING — це та сама піднята тривога, лише без
+            # поточного сигналу. Якби вона знімала прапорець, повернення
+            # сигналу вважалось би НОВОЮ тривогою і надсилалось повторно.
+            if state in ("ALARM", "ALARM_COASTING"):
                 if not self._alarm_active:
                     self._alarm_active = True
                     self._try_send(angle_deg, distance_str, confidence)

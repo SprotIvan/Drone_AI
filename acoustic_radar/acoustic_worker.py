@@ -142,9 +142,27 @@ class AcousticWorker:
                else calibration.load())
 
         log.info("loading acoustic model...")
-        self._engine = RadarEngine(cfg=cfg, verbose=False)
-        log.info("acoustic model loaded (decision threshold %.3f)",
-                 self._engine.threshold)
+        tuning = self.config.acoustic.detector_tuning()
+        self._engine = RadarEngine(cfg=cfg, verbose=False, tuning=tuning)
+        log.info("acoustic model loaded (P_START %.3f, P_HOLD %.3f)",
+                 self._engine.threshold, self._engine.detector.hold_limit)
+        # These three numbers are the whole answer to "how fast does the
+        # alarm come up and how long does it survive a dropout". They are
+        # logged as MEASURED values derived from the real block period, not
+        # as the intent behind them.
+        log.info("acoustic timing: block %.0f ms x %d confirmations = "
+                 "%.0f ms to alarm; coasting %.1f s (%d blocks)",
+                 BLOCK_SEC * 1000.0, tuning.confirm_blocks,
+                 tuning.confirm_seconds(BLOCK_SEC) * 1000.0,
+                 tuning.coast_seconds(BLOCK_SEC), tuning.miss_tolerance)
+        if tuning.coast_seconds(BLOCK_SEC) > self.config.acoustic.lost_after_s:
+            # The fusion layer would declare the acoustic sensor lost while
+            # the engine is still legitimately holding the target.
+            log.warning("acoustic.lost_after_s (%.1f s) is SHORTER than the "
+                        "detector's coasting window (%.1f s) — the fusion "
+                        "layer will drop the target before the engine does",
+                        self.config.acoustic.lost_after_s,
+                        tuning.coast_seconds(BLOCK_SEC))
 
         inp = resolve_input(cfg, features.SAMPLE_RATE)
         self._engine.attach_input(inp)
@@ -363,8 +381,11 @@ class AcousticWorker:
             p_drone=float(status.p_drone),
             p_smoothed=float(status.p_smoothed),
             threshold=float(status.threshold),
+            hold_threshold=float(status.hold_threshold),
             confirmations=int(status.confirmations),
+            confirm_needed=int(status.confirm_needed),
             misses=int(status.misses),
+            miss_tolerance=int(status.miss_tolerance),
             gated=bool(status.gated),
             bearing_deg=(None if status.angle_deg is None
                          else float(status.angle_deg)),

@@ -363,7 +363,16 @@ class SensorFusion:
         if (acoustic is not None and acoustic.seq != self._last_acoustic_seq
                 and a_fresh is Freshness.FRESH):
             self._last_acoustic_seq = acoustic.seq
-            if acoustic.detected:
+            # ⚠️ A COASTING observation carries the last valid bearing and
+            # distance re-stamped with a new time. Feeding those into the
+            # history would insert a run of identical distances at advancing
+            # timestamps — a perfectly flat least-squares fit — and the UI
+            # would confidently report a manoeuvring drone as STEADY. The
+            # history is left untouched instead: it is a record of
+            # measurements, and during coasting no measurement is made.
+            if acoustic.coasting:
+                pass
+            elif acoustic.detected:
                 self.history.add(acoustic)
             else:
                 self.history.clear()

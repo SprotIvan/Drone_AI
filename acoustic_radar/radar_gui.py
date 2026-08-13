@@ -186,7 +186,9 @@ def draw_sweep(screen, cx, cy, max_radius, sweep_angle) -> None:
 def draw_target(screen, font, cx, cy, max_radius, px_per_m,
                 st: RadarStatus) -> None:
     """Малює ціль з урахуванням того, що саме нам ВІДОМО."""
-    alarm = st.state == "ALARM"
+    # is_alarm охоплює і ALARM_COASTING: під час утримання ціль
+    # лишається червоною, бо вона нікуди не зникла — зник сигнал.
+    alarm = st.is_alarm
     colour = RED if alarm else AMBER
     pulse = 10 + math.sin(time.time() * 12.0) * 4 if alarm else 8
 
@@ -253,6 +255,8 @@ def draw_panel(screen, fonts, st: RadarStatus, calib_note: str | None) -> None:
 
     if st.state == "ALARM":
         title, colour = "SOS ДРОН!", RED
+    elif st.state == "ALARM_COASTING":
+        title, colour = "SOS ДРОН! (сигнал зник)", RED
     elif st.state == "TRACK":
         title, colour = "Підозра...", AMBER
     elif st.state == "LISTEN":
@@ -359,7 +363,7 @@ def main() -> None:
         screen.fill(BLACK)
         draw_grid(screen, font_small, cx, cy, max_radius, px_per_m)
         draw_sweep(screen, cx, cy, max_radius, sweep_angle)
-        if st.state in ("TRACK", "ALARM"):
+        if st.is_tracking:
             draw_target(screen, font_small, cx, cy, max_radius, px_per_m, st)
         draw_panel(screen, fonts, st, calib_note)
 

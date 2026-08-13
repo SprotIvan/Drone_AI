@@ -140,7 +140,8 @@ class HUD:
     # ── Main entry point ───────────────────────────────────────
 
     def render(self, target: FusedTarget, dt_s: float,
-               camera_fps: float = 0.0, ui_fps: float = 0.0) -> np.ndarray:
+               camera_fps: float = 0.0, ui_fps: float = 0.0,
+               led_state: Optional[SubsystemState] = None) -> np.ndarray:
         # PERFORMANCE: the camera frame is written ONCE, straight into the
         # reused output canvas.
         #
@@ -164,7 +165,8 @@ class HUD:
         composite(canvas, tile, w - tile.shape[1] - margin,
                   STATUS_H + margin)
 
-        self._draw_status_bar(canvas, target, w, camera_fps, ui_fps)
+        self._draw_status_bar(canvas, target, w, camera_fps, ui_fps,
+                              led_state)
         self._draw_sensor_bar(canvas, target, w, h + STATUS_H)
 
         if self.show_help:
@@ -419,7 +421,8 @@ class HUD:
 
     def _draw_status_bar(self, canvas: np.ndarray, target: FusedTarget,
                          width: int, camera_fps: float,
-                         ui_fps: float = 0.0) -> None:
+                         ui_fps: float = 0.0,
+                         led_state: Optional[SubsystemState] = None) -> None:
         cv2.rectangle(canvas, (0, 0), (width, STATUS_H), C_BAR, -1)
         cv2.line(canvas, (0, STATUS_H), (width, STATUS_H), C_EDGE, 1)
 
@@ -453,17 +456,26 @@ class HUD:
             tw += tw_u + 10
 
         # Sensor availability lamps, packed to the left of the timing text.
+        #
+        # The LED lamp only appears when the ring subsystem is actually in
+        # play (led_state is not None). With it disabled the bar is laid out
+        # exactly as before, so nothing about the existing display moves.
+        lamps = [("MIC", target.acoustic_health.state),
+                 ("CAM", target.visual_health.state)]
+        if led_state is not None:
+            lamps.append(("LED", led_state))
+
         LAMP_W = 44
-        lamp_x = right - tw - 2 * LAMP_W - 12
-        for label, health in (("MIC", target.acoustic_health),
-                              ("CAM", target.visual_health)):
-            c = _health_colour(health.state)
+        lamp_span = len(lamps) * LAMP_W
+        lamp_x = right - tw - lamp_span - 12
+        for label, state in lamps:
+            c = _health_colour(state)
             _dot(canvas, (lamp_x, STATUS_H // 2), c, 4)
             _text(canvas, label, (lamp_x + 8, 19), 0.36, c)
             lamp_x += LAMP_W
 
         # ── Left-hand cluster, clipped to the free space ──
-        left_limit = right - tw - 2 * LAMP_W - 24
+        left_limit = right - tw - lamp_span - 24
         colour = _state_colour(target.state)
         _dot(canvas, (14, STATUS_H // 2), colour, 5)
         x = 26
@@ -562,7 +574,13 @@ class HUD:
             if acoustic is None:
                 _text(canvas, "starting...", (x, row1), FS, C_DIM)
             else:
+                # "COASTING" is kept short on purpose: at 640 px the row
+                # has ~60 px of slack, and a longer label buys wording at
+                # the cost of the RANGE readout being silently clipped off
+                # the end. The red dot, the LAST prefixes and the HOLD
+                # countdown already say what it means.
                 label = {"ALARM": "DRONE CONFIRMED", "TRACK": "POSSIBLE DRONE",
+                         "ALARM_COASTING": "COASTING",
                          "LISTEN": "LISTENING", "SLEEP": "SILENT"}.get(
                              acoustic.engine_state, acoustic.engine_state)
                 # The staleness tag is drawn IMMEDIATELY after the label so
@@ -574,11 +592,42 @@ class HUD:
                     age = target.acoustic_age_s or 0.0
                     x = field(f"[{fresh.value} {age:.1f}s]", x, C_OFF)
 
-                readout = C_OFF if stale else C_TEXT
-                x = field(f"CONF {acoustic.p_smoothed:.0%}", x, readout)
-                x = field(f"BRG {acoustic.bearing_text()}", x, readout)
-                x = field(f"RNG {acoustic.distance_text()}", x, readout)
+                # ⚠️ During ALARM_COASTING the signal is GONE. The bearing
+                # and range still on screen are the last valid ones, held
+                # deliberately so the operator does not lose the direction
+                # to a gust or a manoeuvre — but presenting them in the
+                # same form as live readings would assert a measurement
+                # that is not being made. They are prefixed and dimmed, and
+                # the smoothed probability is dropped entirely rather than
+                # shown decaying, because a falling number next to a red
+                # target reads as "the drone is leaving", which is not what
+                # it means.
+                coasting = acoustic.coasting
+                readout = C_OFF if (stale or coasting) else C_TEXT
+                if coasting:
+                    # Ordered by what an operator loses least by losing:
+                    # the held BEARING is the entire reason the coasting
+                    # state exists, so it is drawn before the countdown,
+                    # and RANGE is the field allowed to drop for width.
+                    x = field(f"LAST BRG {acoustic.bearing_text()}", x, readout)
+                    if acoustic.miss_tolerance:
+                        x = field(f"HOLD {acoustic.misses}/"
+                                  f"{acoustic.miss_tolerance}", x, C_WARN)
+                    x = field(f"LAST RNG {acoustic.distance_text()}", x,
+                              readout)
+                else:
+                    x = field(f"CONF {acoustic.p_smoothed:.0%}", x, readout)
+                    x = field(f"BRG {acoustic.bearing_text()}", x, readout)
+                    x = field(f"RNG {acoustic.distance_text()}", x, readout)
 
+                # Closure is NOT suppressed during coasting, and the radar
+                # widget must not disagree with this row. It is a
+                # least-squares fit over the last velocity_window_s of REAL
+                # distance measurements — coasting observations are kept out
+                # of that history (see SensorFusion.update) — so the estimate
+                # simply ages out to UNKNOWN on its own as the window empties.
+                # Hiding it here while the radar still drew it produced two
+                # widgets stating different things about one target.
                 k = target.kinematics
                 if target.state.has_target and not stale:
                     if k.approach is Approach.UNKNOWN:
@@ -761,11 +810,47 @@ if __name__ == "__main__":
         s = f.update(None, vis((track,)), offline, healthy)
     scenarios.append(("06_mic_offline", s))
 
+    # 12. ALARM_COASTING — the signal is gone, the target is still held.
+    # This is the state the whole coasting change exists to display, so it
+    # gets a preview: every positional readout must be prefixed LAST and
+    # dimmed, and the HOLD countdown must be visible.
+    f = SensorFusion(cfg, proj)
+    for i in range(10):
+        s = f.update(AcousticObservation(
+            engine_state="ALARM", p_smoothed=0.89, threshold=0.775,
+            hold_threshold=0.5, confirmations=2, confirm_needed=2,
+            miss_tolerance=6, bearing_deg=142.0, bearing_confidence=0.85,
+            distance_m=87.0, distance_lo_m=52.0, distance_hi_m=145.0,
+            seq=i, timestamp=now()), vis(), healthy, healthy)
+    s = f.update(AcousticObservation(
+        engine_state="ALARM_COASTING", p_smoothed=0.31, threshold=0.775,
+        hold_threshold=0.5, confirmations=2, confirm_needed=2, misses=3,
+        miss_tolerance=6, bearing_deg=142.0, bearing_confidence=0.85,
+        distance_m=87.0, distance_lo_m=52.0, distance_hi_m=145.0,
+        seq=99, timestamp=now()), vis(), healthy, healthy)
+    scenarios.append(("12_acoustic_coasting", s))
+
+    # LED lamp states. The lamp is drawn only when the ring subsystem is in
+    # play, so the first two previews below must be byte-comparable in
+    # layout to the existing ones apart from the extra lamp.
+    led_states = {
+        "12_acoustic_coasting": SubsystemState.ONLINE,
+    }
+
     for name, snap in scenarios:
-        img = hud.render(snap, 0.033, camera_fps=37.0, ui_fps=20.0)
+        img = hud.render(snap, 0.033, camera_fps=37.0, ui_fps=20.0,
+                         led_state=led_states.get(name))
         cv2.imwrite(str(out / f"{name}.png"), img)
         print(f"   {name:<24} state={snap.state.value:<26} "
               f"priority={snap.priority.value}")
+
+    # 13. The LED ring reported UNAVAILABLE while detection carries on —
+    # the case an operator most needs to see, because it means the hardware
+    # indication they may be relying on is not actually running.
+    img = hud.render(scenarios[3][1], 0.033, camera_fps=37.0, ui_fps=20.0,
+                     led_state=SubsystemState.OFFLINE)
+    cv2.imwrite(str(out / "13_led_unavailable.png"), img)
+    print(f"   {'13_led_unavailable':<24} (LED lamp red, detection unaffected)")
 
     # Help overlay
     hud.show_help = True

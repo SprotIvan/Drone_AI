@@ -84,7 +84,10 @@ class AudioLogger:
             if state == "ALARM" and not self._alarm_handled:
                 self._alarm_handled = True
                 self._start_recording(angle_deg, distance_str)
-            elif state not in ("ALARM", "TRACK"):
+            # ALARM_COASTING — та сама тривога, у якої тимчасово зник
+            # сигнал. Якби вона скидала прапорець, кожен порив вітру
+            # створював би новий WAV-файл на ту саму ціль.
+            elif state not in ("ALARM", "TRACK", "ALARM_COASTING"):
                 self._alarm_handled = False
 
     def _start_recording(self, angle: float | None, dist: str) -> None:

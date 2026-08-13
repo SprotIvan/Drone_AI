@@ -24,13 +24,24 @@ THREADING
     └──────────────┘                         │   + HUD        │
     ┌──────────────┐    VisualObservation    │  (main thread) │
     │ camera thread│ ──────────────────────► │                │
-    │   ~30 Hz     │      (LatestValue)      └────────────────┘
-    └──────────────┘
+    │   ~30 Hz     │      (LatestValue)      └───────┬────────┘
+    └──────────────┘                                 │ LedFrame
+                                             ┌───────▼────────┐
+                                             │   LED thread   │
+                                             │  (subprocess   │
+                                             │   writes only) │
+                                             └────────────────┘
 
 Neither sensor thread ever waits on the other or on the UI: they publish
 into a one-slot mailbox and move on. The UI never waits on a sensor: it
 renders whatever the newest snapshot is, including "nothing yet" and
 "that subsystem is offline".
+
+The LED ring hangs off the SAME FusedTarget the HUD renders, so the ring,
+the radar widget and the camera cue cannot show three different opinions
+about the target. It is a third mailbox for the same reason as the other
+two: one LED write is a subprocess spawn (200-500 ms), which would stall
+the UI thread and, through the GIL, the sensors behind it.
 
 The UI runs on the MAIN thread because `cv2.imshow`/`waitKey` require it on
 macOS and are only reliably safe there on Linux/X11 too.
@@ -65,6 +76,7 @@ from acoustic_worker import AcousticWorker  # noqa: E402
 from camera_cue import BearingProjector  # noqa: E402
 from camera_worker import CameraWorker  # noqa: E402
 from hud import HUD  # noqa: E402
+from respeaker_led import RespeakerLed, frame_for_target  # noqa: E402
 from sensor_fusion import SensorFusion, SystemState  # noqa: E402
 from station_logging import EventLogger  # noqa: E402
 from target_state import SubsystemHealth, SubsystemState, now  # noqa: E402
@@ -106,6 +118,18 @@ def print_banner(config: fusion_config.StationConfig, hef_path: str) -> None:
              config.switching.switch_to_near_below_m,
              config.switching.switch_to_far_above_m,
              config.switching.confirm_frames)
+
+    led = config.led
+    if not led.enabled:
+        log.info("  LED ring: disabled")
+    elif led.led_count is None:
+        log.warning("  LED ring: led.led_count NOT SET -> ring not driven. "
+                    "Count the LEDs on your array and set it in "
+                    "fusion_config.json (run: python respeaker_led.py --probe)")
+    else:
+        log.info("  LED ring: %d LEDs, %d-LED target sector, zero at %.0f deg",
+                 led.led_count, led.sector_leds, led.led_zero_offset_deg)
+
     log.info("  HEF: %s", hef_path)
     log.info("-" * 62)
 
@@ -119,7 +143,8 @@ class Station:
 
     def __init__(self, config: fusion_config.StationConfig, hef_path: str,
                  events: EventLogger, headless: bool = False,
-                 no_audio: bool = False, no_camera: bool = False):
+                 no_audio: bool = False, no_camera: bool = False,
+                 no_led: bool = False):
         self.config = config
         self.events = events
         self.headless = headless
@@ -132,6 +157,16 @@ class Station:
 
         self.acoustic: Optional[AcousticWorker] = None
         self.camera: Optional[CameraWorker] = None
+
+        # The LED ring needs the DOA mount offset to convert a displayed
+        # bearing back into the array's own frame — the ring is bolted to
+        # the array, not to the compass. calibration.load() is the same
+        # source the acoustic worker uses, so the two can never disagree.
+        import calibration
+        led_cfg = config.led
+        if no_led:
+            led_cfg = fusion_config.LedConfig(enabled=False)
+        self.led = RespeakerLed(led_cfg, calibration.load())
 
         self._disabled = SubsystemHealth(SubsystemState.DISABLED,
                                          "disabled on the command line")
@@ -157,12 +192,19 @@ class Station:
             self.acoustic.start()
         if self.camera is not None:
             self.camera.start()
+        # Started last and never waited on: the ring is an indicator, and
+        # an indicator must not be able to delay the sensors it indicates.
+        self.led.start()
 
     def stop(self) -> None:
         self.running = False
 
     def shutdown(self) -> None:
         log.info("shutting down...")
+        # The ring is stopped FIRST so it is restored to a safe state while
+        # the process is still healthy. A ring left showing a red target
+        # after the station exited would be actively misleading.
+        self.led.stop(timeout=2.0)
         for worker in (self.camera, self.acoustic):
             if worker is not None:
                 worker.stop()
@@ -189,6 +231,8 @@ class Station:
         if self.camera is not None:
             log.info("camera: %.1f fps, inference %.0f ms",
                      self.camera.fps, self.camera.inference_ms)
+        log.info("LED ring: %s, %d hardware writes",
+                 self.led.status.value, self.led.writes)
         log.info("stopped.")
 
     # ── Health helpers ─────────────────────────────────────────
@@ -224,6 +268,22 @@ class Station:
         return self._watchdog(health, self.acoustic.latest.get(),
                               self.config.acoustic.lost_after_s * 3.0,
                               "acoustic")
+
+    def _led_lamp_state(self) -> Optional[SubsystemState]:
+        """
+        Lamp state for the LED ring, or None to hide the lamp entirely.
+
+        Hidden when the ring is switched off, so a station that does not use
+        it looks exactly as it did before this feature existed. Shown in
+        every other case — including UNAVAILABLE, which is the state an
+        operator most needs to see, because it means the hardware
+        indication they may be relying on is not actually running.
+        """
+        # self.led.cfg, not self.config.led: --no-led substitutes a disabled
+        # copy, and the lamp must follow what is actually running.
+        if not self.led.cfg.enabled:
+            return None
+        return self.led.status.as_subsystem_state()
 
     def _visual_health(self) -> SubsystemHealth:
         if self.camera is None:
@@ -296,6 +356,16 @@ class Station:
                     acoustic_obs, visual_obs,
                     self._acoustic_health(), self._visual_health())
 
+                # ── The one authoritative state, fanned out ──
+                # LED ring, radar widget and camera cue are all rendered
+                # from THIS `target` and nothing else. The ring is fed here,
+                # immediately after the state is computed and before any
+                # drawing, so it can never be driven by a repaint cycle:
+                # frame_for_target() is a pure function of the fused state,
+                # and submit() is a single publish into a one-slot mailbox
+                # (all device I/O happens on the LED worker thread).
+                self.led.submit(frame_for_target(target))
+
                 if target.state is not last_state:
                     self._announce(target, last_state)
                     last_state = target.state
@@ -307,9 +377,9 @@ class Station:
                     # rate is reported separately and deliberately smaller.
                     camera_fps = (visual_obs.loop_fps
                                   if visual_obs is not None else 0.0)
-                    frame = self.hud.render(target, since_render,
-                                            camera_fps=camera_fps,
-                                            ui_fps=self._ui_fps)
+                    frame = self.hud.render(
+                        target, since_render, camera_fps=camera_fps,
+                        ui_fps=self._ui_fps, led_state=self._led_lamp_state())
                     cv2.imshow(window, frame)
 
                 inst = 1.0 / max(since_render, 1e-6)
@@ -427,6 +497,8 @@ def main(argv: Optional[list] = None) -> int:
                         help="run without the acoustic subsystem")
     parser.add_argument("--no-camera", action="store_true",
                         help="run without the camera subsystem")
+    parser.add_argument("--no-led", action="store_true",
+                        help="run without the ReSpeaker LED ring indicator")
     parser.add_argument("--log-level", default=None,
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument("--duration", type=float, default=None,
@@ -449,7 +521,8 @@ def main(argv: Optional[list] = None) -> int:
     print_banner(config, args.hef)
 
     station = Station(config, args.hef, events, headless=args.headless,
-                      no_audio=args.no_audio, no_camera=args.no_camera)
+                      no_audio=args.no_audio, no_camera=args.no_camera,
+                      no_led=args.no_led)
 
     # Ctrl+C must run the same orderly shutdown as 'q'.
     def on_signal(signum, _frame):

@@ -107,6 +107,62 @@ class AcousticConfig:
     # checking that it is not reported as approaching.
     velocity_deadband_mps: float = 1.5
 
+    # ── Detector tuning (overrides radar.DetectorTuning) ───────
+    #
+    # ⚠️ These are the ONLY place the station may retune the acoustic
+    # detector. radar.py holds the defaults so that `python radar.py`
+    # standalone behaves identically; None here means "use radar.py's
+    # default" rather than a second, competing set of numbers.
+    #
+    # Every count below is in BLOCKS of radar.BLOCK_SEC (0.5 s). Do not
+    # write seconds here — `detector_tuning()` is the only converter, and
+    # it multiplies by the real block period so the two can never drift.
+
+    # [POLICY] Blocks above P_START required to raise the alarm.
+    # radar.py default 2 -> 2 x 0.5 s = 1.0 s confirmation latency.
+    # Raising this is the correct response to too many false alarms; do NOT
+    # raise the probability threshold, which was fitted on validation data.
+    detector_confirm_blocks: Optional[int] = None
+
+    # [POLICY] Blocks the alarm is HELD after the signal disappears before
+    # the target is dropped (ALARM_COASTING). radar.py default 6 -> 3.0 s.
+    # Must stay <= lost_after_s below, or the fusion layer declares the
+    # sensor lost while the engine is still holding the target. The
+    # acoustic worker logs a warning if that invariant is broken.
+    detector_miss_tolerance: Optional[int] = None
+
+    # [POLICY] Absolute P_HOLD — smoothed probability required to KEEP an
+    # already-raised alarm. radar.py default 0.50 against a P_START of
+    # 0.775 (P_START itself comes from training and is NOT settable here).
+    # None = keep radar.py's 0.50. To revert to the older proportional
+    # rule (P_START x HOLD_FACTOR = 0.542) set radar.HOLD_THRESHOLD = None.
+    detector_hold_threshold: Optional[float] = None
+
+    # [POLICY] EMA weight on the instantaneous probability. 1.0 = no
+    # smoothing at all. radar.py default 0.5.
+    detector_prob_ema: Optional[float] = None
+
+    def detector_tuning(self):
+        """
+        Build a radar.DetectorTuning, leaving unset fields at radar.py's
+        defaults.
+
+        Imported lazily: fusion_config must stay importable on a machine
+        with no numpy/onnxruntime (the config self-test, the docs build),
+        and radar.py pulls in the whole DSP stack.
+        """
+        from radar import DetectorTuning
+
+        tuning = DetectorTuning()
+        for attr, value in (
+                ("confirm_blocks", self.detector_confirm_blocks),
+                ("miss_tolerance", self.detector_miss_tolerance),
+                ("hold_threshold", self.detector_hold_threshold),
+                ("prob_ema", self.detector_prob_ema)):
+            if value is not None:
+                setattr(tuning, attr, value)
+        return tuning
+
 
 # ═══════════════════════════════════════════════════════════════
 #  Camera / visual subsystem
@@ -395,6 +451,109 @@ class UIConfig:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  ReSpeaker LED ring
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class LedConfig:
+    """
+    Hardware indicator on the ReSpeaker XVF3800 microphone array.
+
+    ⚠️ READ THIS BEFORE EXPECTING THE RING TO LIGHT UP.
+
+    This repository contains NO LED control code and NO USB protocol
+    implementation. The only verified control path to the array is the one
+    doa.py already uses: running Seeed's external `xvf_host.py` utility as a
+    subprocess with a control-command name (`xvf_host.py AEC_AZIMUTH_VALUES`).
+    That utility is NOT part of this project — it ships with the array.
+
+    Consequently the LED command NAMES cannot be taken from this repository,
+    and they are not guessed here. `respeaker_led.py` asks the installed
+    xvf_host.py for its own command list at startup and uses only names that
+    the installed firmware actually reports. If nothing matches, the LED
+    subsystem reports UNAVAILABLE, logs why, and the detection pipeline runs
+    exactly as it does today.
+
+    To see what your array supports:   python respeaker_led.py --probe
+    Then put the confirmed names in fusion_config.json under "led".
+    """
+
+    # [POLICY] Master switch. True is safe: with nothing configured and no
+    # array attached the controller reports UNAVAILABLE and costs one
+    # idle thread that never writes anything.
+    enabled: bool = True
+
+    # [CALIBRATE] Number of LEDs on the physical ring. None = unknown, and
+    # the ring is then NOT driven, because "light up the LED at 142°"
+    # has no answer without it. NEVER guess this — count them, or read it
+    # from `--probe` output if the firmware reports it.
+    led_count: Optional[int] = None
+
+    # [POLICY] How many LEDs the red target sector spans. Kept odd so the
+    # sector is symmetric about the bearing. Clamped to led_count.
+    sector_leds: int = 3
+
+    # [CALIBRATE] Physical azimuth, in the ARRAY's own frame (before
+    # radar_calibration.json's doa_offset_deg), that LED index 0 sits at.
+    # 0.0 means "LED 0 is at the array's own 0 degrees".
+    led_zero_offset_deg: float = 0.0
+
+    # [CALIBRATE] True if LED indices increase clockwise when the array's
+    # azimuth increases counter-clockwise (or vice versa). Verify by
+    # driving a known bearing and looking at which LED lights.
+    led_index_clockwise: bool = True
+
+    # ── Command names (filled in from --probe) ─────────────────
+    #
+    # None = not configured. A None here is never substituted with a guess;
+    # the controller simply reports which one is missing.
+
+    # Command that takes the ring out of the firmware's own automatic
+    # speech/DOA animation and into host control. This is the
+    # "LED_AUTO_MODE = 0" step: without it the firmware keeps repainting
+    # the ring on claps and speech and fights every frame written here.
+    cmd_auto_mode: Optional[str] = None
+    auto_mode_off_value: str = "0"
+
+    # Command that sets the whole ring, or one LED, to a colour. The
+    # controller adapts to whichever of the two the firmware exposes.
+    cmd_ring_colour: Optional[str] = None      # takes R G B for all LEDs
+    cmd_led_colour: Optional[str] = None       # takes INDEX R G B
+
+    # [POLICY] Colours as 0-255 RGB triples.
+    # Dim blue is deliberately dim: this ring sits next to the operator and
+    # a bright idle indicator ruins night vision and hides the alarm.
+    colour_searching: tuple = (0, 0, 40)
+    colour_alarm: tuple = (255, 0, 0)
+    colour_coasting: tuple = (255, 0, 0)       # same red — the target is
+                                               # still held, see report
+
+    # [POLICY] Minimum seconds between two hardware writes. Each write is a
+    # subprocess spawn (200-500 ms of python start-up, measured in doa.py),
+    # so this is a hard floor, not a preference. 10 Hz of *requests* is
+    # fine; the controller only writes when the effective frame changes.
+    min_write_interval_s: float = 0.15
+
+    # [POLICY] Bearing change, in degrees, that is worth a hardware write.
+    # Below this the sector would land on the same LED anyway. Set from the
+    # ring geometry at runtime if led_count is known.
+    bearing_quantum_deg: float = 10.0
+
+    # [POLICY] If no frame is submitted for this long the ring falls back
+    # to the searching colour. This is the safety net for requirement 14:
+    # a wedged audio thread must not leave the ring stuck showing red.
+    watchdog_s: float = 3.0
+
+    # [POLICY] Consecutive failed writes before the controller gives up and
+    # reports UNAVAILABLE. It keeps retrying at a slow backoff so a
+    # replugged array recovers without restarting the station.
+    max_consecutive_failures: int = 5
+
+    # [POLICY] Seconds to wait for one xvf_host.py invocation.
+    command_timeout_s: float = 3.0
+
+
+# ═══════════════════════════════════════════════════════════════
 #  Logging
 # ═══════════════════════════════════════════════════════════════
 
@@ -451,6 +610,7 @@ class StationConfig:
     geometry: GeometryConfig = field(default_factory=GeometryConfig)
     fusion: FusionConfig = field(default_factory=FusionConfig)
     ui: UIConfig = field(default_factory=UIConfig)
+    led: LedConfig = field(default_factory=LedConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     integrations: IntegrationConfig = field(default_factory=IntegrationConfig)
 
@@ -530,6 +690,7 @@ _SECTIONS = {
     "geometry": GeometryConfig,
     "fusion": FusionConfig,
     "ui": UIConfig,
+    "led": LedConfig,
     "logging": LoggingConfig,
     "integrations": IntegrationConfig,
 }

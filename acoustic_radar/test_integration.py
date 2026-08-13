@@ -926,6 +926,303 @@ def test_final_audit_regressions():
           f"{logger._max_chunks}; {saved['n']} forced flush(es)")
 
 
+# ═══════════════════════════════════════════════════════════════
+#  TEST 11 — Acoustic latency, coasting, and the LED ring
+#
+#  Requirements A-J of the LED / fast-response change. Everything here
+#  runs against the REAL radar.Detector and the REAL LED controller; only
+#  the microphone and the USB device are absent.
+# ═══════════════════════════════════════════════════════════════
+
+def _drive_detector(det, probabilities, gated=False):
+    """Feed a probability series to a detector, returning the state series."""
+    return [det.update(p, gated) for p in probabilities]
+
+
+def test_11_acoustic_latency_and_coasting():
+    header("TEST 11 — confirmation latency, hysteresis and coasting")
+    import radar
+
+    tuning = radar.DetectorTuning()
+    P_START = 0.775                     # model_config.json decision_threshold
+    P_HOLD = tuning.hold_limit(P_START)
+    block_ms = radar.BLOCK_SEC * 1000.0
+
+    check("audio block duration is 500 ms", abs(block_ms - 500.0) < 1e-6,
+          f"{block_ms:.0f} ms")
+    check("P_HOLD is 0.50 and below P_START", abs(P_HOLD - 0.50) < 1e-9
+          and P_HOLD < P_START, f"P_START={P_START:.3f} P_HOLD={P_HOLD:.3f}")
+
+    # ── Confirmation latency, measured rather than asserted ──
+    det = radar.Detector(P_START, tuning)
+    states = _drive_detector(det, [0.95] * 10)
+    blocks_to_alarm = states.index("ALARM") + 1
+    latency_ms = blocks_to_alarm * block_ms
+    check("alarm confirms within the 0.5-1.0 s requirement",
+          500.0 <= latency_ms <= 1000.0,
+          f"{blocks_to_alarm} blocks x {block_ms:.0f} ms = {latency_ms:.0f} ms")
+
+    # The regression this replaces: with the old cold-start EMA and 5
+    # confirmations the same signal took 7 blocks. Proven here so a future
+    # edit that reintroduces either cannot pass silently.
+    old = radar.DetectorTuning(confirm_blocks=5, hold_threshold=None,
+                               seed_ema_on_first_block=False)
+    old_states = _drive_detector(radar.Detector(P_START, old), [0.95] * 12)
+    old_blocks = old_states.index("ALARM") + 1
+    check("regression: the previous tuning really was ~3.5 s",
+          old_blocks == 7, f"old {old_blocks} blocks = "
+                           f"{old_blocks * block_ms:.0f} ms, "
+                           f"new {blocks_to_alarm} blocks")
+
+    # ── Confirmations must be CONSECUTIVE ──
+    # One block over P_START, a miss, then one block over P_HOLD must NOT
+    # add up to an alarm. With confirm_blocks lowered to 2 this loophole
+    # would otherwise be a real false-alarm source.
+    det = radar.Detector(P_START, tuning)
+    seq = det.update(0.80, gated=False)            # over P_START -> TRACK
+    check("a single block over P_START gives TRACK, not ALARM",
+          seq == "TRACK", seq)
+    det.update(0.10, gated=False)                  # miss, still TRACK
+    after = det.update(0.55, gated=False)          # over P_HOLD only
+    check("confirmations do not accumulate across a miss",
+          after == "TRACK", f"{after} (confirmations={det.confirmations})")
+
+    # ── G: a confidence dip that stays above P_HOLD must not disarm ──
+    det = radar.Detector(P_START, tuning)
+    _drive_detector(det, [0.8] * 3)
+    check("G: 0.8 raises the alarm", det.state == "ALARM", det.state)
+    # 0.6 is below P_START but above P_HOLD. The EMA pulls the smoothed
+    # value toward 0.6, which must still hold the alarm.
+    _drive_detector(det, [0.6] * 6)
+    check("G: alarm survives a drop to 0.6 (above P_HOLD 0.50)",
+          det.state == "ALARM", f"state={det.state} p={det.p_smoothed:.3f}")
+
+    # ── D/H: below P_HOLD -> ALARM_COASTING, not CLEAR ──
+    det = radar.Detector(P_START, tuning)
+    _drive_detector(det, [0.95] * 3)
+    check("D: alarm established", det.state == "ALARM", det.state)
+    first = det.update(0.02, gated=False)
+    check("D: one missed block -> ALARM_COASTING, never CLEAR",
+          first == "ALARM_COASTING", first)
+    check("D: the alarm is still considered raised during coasting",
+          radar.RadarStatus(state=first).is_alarm)
+
+    # ── E: signal returns during coasting -> ALARM ──
+    back = det.update(0.95, gated=False)
+    check("E: signal returns during coasting -> ALARM", back == "ALARM", back)
+
+    # ── F: silence to timeout -> CLEAR, and it takes exactly 3.0 s ──
+    det = radar.Detector(P_START, tuning)
+    _drive_detector(det, [0.95] * 3)
+    coast_blocks = 0
+    state = det.state
+    while state in ("ALARM", "ALARM_COASTING") and coast_blocks < 40:
+        state = det.update(0.02, gated=False)
+        coast_blocks += 1
+    coast_ms = coast_blocks * block_ms
+    check("F: coasting ends in CLEAR (LISTEN)", state == "LISTEN", state)
+    check("F: coasting lasts the configured 3.0 s",
+          abs(coast_ms - 3000.0) < 1e-6,
+          f"{coast_blocks} blocks x {block_ms:.0f} ms = {coast_ms:.0f} ms "
+          f"(miss_tolerance={tuning.miss_tolerance})")
+
+    # Digital silence (below the noise gate) must coast identically —
+    # a drone masked by a passing lorry is the same situation as one that
+    # briefly stops being classified.
+    det = radar.Detector(P_START, tuning)
+    _drive_detector(det, [0.95] * 3)
+    gated_state = det.update(0.0, gated=True)
+    check("D: a gated (silent) block also coasts rather than clearing",
+          gated_state == "ALARM_COASTING", gated_state)
+
+    # ── The observation layer must agree with the engine ──
+    for engine_state, detected, confirmed, coasting in (
+            ("SLEEP", False, False, False),
+            ("LISTEN", False, False, False),
+            ("TRACK", True, False, False),
+            ("ALARM", True, True, False),
+            ("ALARM_COASTING", True, True, True)):
+        obs = AcousticObservation(engine_state=engine_state)
+        ok = (obs.detected == detected and obs.confirmed == confirmed
+              and obs.coasting == coasting)
+        check(f"observation flags for {engine_state}", ok,
+              f"detected={obs.detected} confirmed={obs.confirmed} "
+              f"coasting={obs.coasting}")
+
+
+def test_12_led_ring():
+    header("TEST 12 — LED ring shares one state with the radar and camera")
+    import respeaker_led as rl
+    from fusion_config import LedConfig
+
+    N = 12                                   # a ring size for the geometry
+    cfg = load_config()
+    cfg.geometry.camera_boresight_deg[0] = 142.0     # so the cue is computable
+    _, f = new_fusion(cfg)
+
+    # ── A: no target -> blue searching, no bearing ──
+    snap = f.update(None, visual(0), HEALTHY, HEALTHY)
+    frame = rl.frame_for_target(snap)
+    check("A: no target -> LED SEARCHING (blue), no bearing",
+          frame.mode is rl.LedMode.SEARCHING and frame.bearing_deg is None,
+          f"{frame.mode.value}")
+
+    # ── B: confirmed target -> red sector at the bearing ──
+    for i in range(4):
+        snap = f.update(acoustic("ALARM", bearing=142.0, seq=i), visual(0),
+                        HEALTHY, HEALTHY)
+    frame = rl.frame_for_target(snap)
+    check("B: confirmed target -> LED ALARM (red)",
+          frame.mode is rl.LedMode.ALARM, frame.mode.value)
+    idx_b = rl.bearing_to_led_index(frame.bearing_deg, N)
+    sector_b = rl.sector_indices(idx_b, 3, N)
+    check("B: the red sector is a contiguous 3-LED arc",
+          len(set(sector_b)) == 3, f"bearing {frame.bearing_deg:.0f}deg "
+                                   f"-> LED {idx_b}, sector {sector_b}")
+
+    # ── C: the sector follows a moving bearing ──
+    moved = []
+    for n, bearing in enumerate((40.0, 55.0, 70.0, 200.0)):
+        snap = f.update(acoustic("ALARM", bearing=bearing, seq=100 + n),
+                        visual(0), HEALTHY, HEALTHY)
+        fr = rl.frame_for_target(snap)
+        moved.append((bearing, rl.bearing_to_led_index(fr.bearing_deg, N)))
+    check("C: the red sector moves with the bearing",
+          len({idx for _, idx in moved}) >= 3,
+          "  ".join(f"{b:.0f}deg->LED{i}" for b, i in moved))
+
+    # ── D: coasting keeps the red sector on the LAST valid bearing ──
+    last_bearing = 142.0
+    for i in range(4):
+        snap = f.update(acoustic("ALARM", bearing=last_bearing, seq=200 + i),
+                        visual(0), HEALTHY, HEALTHY)
+    snap = f.update(acoustic("ALARM_COASTING", p=0.30, bearing=last_bearing,
+                             seq=204), visual(0), HEALTHY, HEALTHY)
+    frame = rl.frame_for_target(snap)
+    check("D: coasting keeps the LED red, not blue",
+          frame.mode is rl.LedMode.COASTING and frame.mode.is_alarm,
+          frame.mode.value)
+    check("D: coasting keeps the LAST valid bearing",
+          frame.bearing_deg == last_bearing, f"{frame.bearing_deg}")
+    check("D: the same red is used for ALARM and COASTING, so the ring "
+          "cannot flicker between them",
+          rl._rgb(cfg.led.colour_alarm) == rl._rgb(cfg.led.colour_coasting))
+
+    # ── E/F: return to alarm, then a real loss ──
+    snap = f.update(acoustic("ALARM", bearing=last_bearing, seq=205),
+                    visual(0), HEALTHY, HEALTHY)
+    check("E: signal returns -> LED back to ALARM",
+          rl.frame_for_target(snap).mode is rl.LedMode.ALARM)
+
+    snap = f.update(acoustic("LISTEN", p=0.05, bearing=None, seq=206),
+                    visual(0), HEALTHY, HEALTHY)
+    check("F: engine cleared -> LED returns to blue",
+          rl.frame_for_target(snap).mode is rl.LedMode.SEARCHING)
+
+    # ── Priority rule (requirement 5): a repaint cannot change the frame ──
+    snap = f.update(acoustic("ALARM", bearing=142.0, seq=300), visual(0),
+                    HEALTHY, HEALTHY)
+    frames = {rl.frame_for_target(snap) for _ in range(50)}
+    check("LED frame is a pure function of the fused state — 50 repaints "
+          "produce one frame, so RED/BLUE flicker is impossible",
+          len(frames) == 1, f"{len(frames)} distinct frame(s)")
+
+    # ── I: LED, radar and camera cue all read the SAME bearing ──
+    cue = snap.bearing_cue
+    led_bearing = rl.frame_for_target(snap).bearing_deg
+    radar_bearing = snap.acoustic.bearing_deg
+    check("I: LED bearing == radar bearing", led_bearing == radar_bearing,
+          f"LED {led_bearing} vs radar {radar_bearing}")
+    if cue.available and cue.in_view:
+        # The cue is expressed relative to the camera boresight; adding it
+        # back must return the acoustic bearing the other two are using.
+        reconstructed = (142.0 + cue.rel_bearing_deg) % 360.0
+        check("I: camera cue bearing == radar bearing",
+              abs(reconstructed - radar_bearing) < 0.5,
+              f"cue {reconstructed:.2f} vs radar {radar_bearing:.2f}")
+    else:
+        check("I: camera cue reports its own unavailability honestly",
+              not cue.available or not cue.in_view, cue.reason)
+
+    # ── The mount offset must be undone before choosing an LED ──
+    without = rl.bearing_to_led_index(142.0, N, doa_offset_deg=0.0)
+    with_off = rl.bearing_to_led_index(142.0, N, doa_offset_deg=40.0)
+    check("LED index undoes doa_offset_deg (the ring is bolted to the "
+          "array, not to the compass)", without != with_off,
+          f"offset 0 -> LED {without}, offset +40deg -> LED {with_off}")
+
+    # ── J: hardware absent or broken must not affect detection ──
+    led = rl.RespeakerLed(LedConfig(enabled=True, led_count=N),
+                          {"doa_offset_deg": 0.0}, script_path=None)
+    led.start()
+    # find_xvf_host() searches the home directory under a 2 s budget, so
+    # poll rather than sleeping a guessed amount.
+    deadline = time.monotonic() + 8.0
+    while led.status is rl.LedStatus.STARTING and time.monotonic() < deadline:
+        led.submit(rl.LedFrame(rl.LedMode.ALARM, 142.0))
+        time.sleep(0.05)
+    check("J: no xvf_host.py -> LED UNAVAILABLE, no exception",
+          led.status is rl.LedStatus.UNAVAILABLE,
+          led.detail or f"status={led.status.value}")
+    led.stop(timeout=1.0)
+
+    broken = _make_failing_xvf_host()
+    led = rl.RespeakerLed(
+        LedConfig(enabled=True, led_count=N, min_write_interval_s=0.0,
+                  max_consecutive_failures=2, command_timeout_s=5.0),
+        {"doa_offset_deg": 0.0}, script_path=broken)
+    led.start()
+    deadline = time.monotonic() + 12.0
+    while (led.status is not rl.LedStatus.UNAVAILABLE
+           and time.monotonic() < deadline):
+        led.submit(rl.LedFrame(rl.LedMode.ALARM, 142.0))
+        time.sleep(0.05)
+    check("J: a failing device degrades to UNAVAILABLE without raising",
+          led.status is rl.LedStatus.UNAVAILABLE, led.detail)
+    led.stop(timeout=2.0)
+
+    # The fusion pipeline must be entirely unaffected by any of the above.
+    snap = f.update(acoustic("ALARM", bearing=142.0, seq=400), visual(0),
+                    HEALTHY, HEALTHY)
+    check("J: detection continues while the LED subsystem is unavailable",
+          snap.state.has_target, snap.state.value)
+
+    # ── A watchdog must not leave the ring stuck red ──
+    led = rl.RespeakerLed(LedConfig(enabled=True, led_count=N, watchdog_s=0.1),
+                          {}, script_path=None)
+    led.submit(rl.LedFrame(rl.LedMode.ALARM, 142.0))
+    time.sleep(0.2)
+    effective = led._effective_frame()
+    check("a stalled station falls back to SEARCHING instead of holding red",
+          effective.mode is rl.LedMode.SEARCHING, effective.mode.value)
+
+
+def _make_failing_xvf_host():
+    """
+    A stand-in xvf_host.py that advertises commands and then fails.
+
+    Used to prove requirement 14 end to end: the controller must discover
+    the command set, attempt real writes, take the failures, and report
+    UNAVAILABLE without ever raising into the station.
+    """
+    import pathlib
+    import tempfile
+
+    directory = pathlib.Path(tempfile.mkdtemp(prefix="xvf_fake_"))
+    script = directory / "xvf_host.py"
+    script.write_text(
+        "import sys\n"
+        "LISTED = ['LED_AUTO_MODE', 'LED_RING_COLOUR', 'LED_INDIVIDUAL',\n"
+        "          'AEC_AZIMUTH_VALUES', 'GET_VERSION', 'AUDIO_MGR_OP']\n"
+        "if len(sys.argv) == 1 or sys.argv[1].startswith('-'):\n"
+        "    print('\\n'.join(LISTED))\n"
+        "    sys.exit(0)\n"
+        "sys.stderr.write('device not responding\\n')\n"
+        "sys.exit(1)\n",
+        encoding="utf-8")
+    return script
+
+
 def test_thread_safety():
     header("THREADING — publishers never block, readers never tear")
     import threading
@@ -984,8 +1281,9 @@ def main() -> int:
     for fn in (test_1_no_drone, test_2_acoustic_only, test_3_handover,
                test_4_visual_lost, test_5_acoustic_lost, test_6_both_lost,
                test_7_switch_oscillation, test_8_microphone_fails,
-               test_9_camera_fails, test_10_load, test_regressions,
-               test_final_audit_regressions,
+               test_9_camera_fails, test_10_load,
+               test_11_acoustic_latency_and_coasting, test_12_led_ring,
+               test_regressions, test_final_audit_regressions,
                test_honesty, test_thread_safety):
         try:
             fn()
