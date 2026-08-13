@@ -1589,6 +1589,32 @@ def test_15_camera_search_region():
     check("a LOST acoustic reading withdraws the region",
           stale.cue_role is CueRole.NONE, stale.cue_role.value)
 
+    # ── The marker renders in both styles, without touching the state ──
+    # Style is a DISPLAY choice. It must not be able to change what the
+    # system believes about the target — only how loudly the unmeasured
+    # elevation is stated.
+    import cv2 as _cv2
+
+    from hud import HUD
+    _, f6 = new_fusion(cfg)
+    frame = np.full((480, 640, 3), 60, np.uint8)
+    for style in ("box", "band"):
+        cfg.ui.cue_style = style
+        hud = HUD(cfg, BearingProjector(cfg.geometry, cfg.visual.frame_width))
+        vo = VisualObservation(frame=frame.copy(), frame_width=640,
+                               frame_height=480, tracks=(), active_camera=1,
+                               timestamp=now(), seq=1)
+        for i in range(4):
+            snap = f6.update(ac(seq=i + 500), vo, HEALTHY, HEALTHY)
+        img = hud.render(snap, 0.033, camera_fps=37.0)
+        red = int(((img[:, :, 2] > 150) & (img[:, :, 0] < 140)).sum())
+        check(f"cue_style={style!r} renders the region", red > 200,
+              f"{red:,} marker pixels, role={snap.cue_role.value}")
+        check(f"cue_style={style!r} does not alter the fused state",
+              snap.cue_role is CueRole.SEARCH)
+    cfg.ui.cue_style = "box"
+    del _cv2
+
     # ── SCENARIO G: a camera switch must use the NEW camera's optics ──
     proj = BearingProjector(cfg.geometry, cfg.visual.frame_width)
     far = proj.project(0, 160.0, 0.8)

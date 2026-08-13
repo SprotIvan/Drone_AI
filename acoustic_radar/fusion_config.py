@@ -476,6 +476,46 @@ class UIConfig:
     # for free.
     display_scale: float = 1.0
 
+    # ── Acoustic search region on the camera image ─────────────
+
+    # [POLICY] "box" or "band".
+    #
+    # box   a compact rectangle marking where to look. Its WIDTH is the
+    #       real azimuth uncertainty; its top and bottom edges are drawn
+    #       OPEN, because the array measures azimuth only and the drone's
+    #       height is genuinely unknown. This is the default: it is what an
+    #       operator can find instantly on a busy frame.
+    # band  the same region extended over the full image height. Makes the
+    #       missing elevation impossible to overlook, at the cost of
+    #       covering much more of the picture.
+    #
+    # Both are equally honest — the difference is how loudly the unknown
+    # elevation is stated, not whether it is stated.
+    cue_style: str = "box"
+
+    # [POLICY] Height of the box, as a fraction of the image height, and
+    # where its centre sits (0 = top, 1 = bottom).
+    #
+    # ⚠️ THE VERTICAL POSITION IS NOT A MEASUREMENT. Nothing in this system
+    # measures elevation. The box is placed slightly above the middle
+    # because that is where an airborne target usually appears in a level
+    # camera, and its open top and bottom edges plus the ELEV NOT MEASURED
+    # caption say so on the picture. Do not read the box's height as a
+    # claim about the drone's altitude.
+    cue_box_height_frac: float = 0.34
+    cue_box_centre_frac: float = 0.42
+
+    # [POLICY] Size of the compact MARKER at the centre of the region, as a
+    # fraction of the image height.
+    #
+    # The marker and the uncertainty area are two different statements and
+    # are sized independently on purpose: the marker says "the bearing
+    # points HERE", the surrounding area says "and it cannot be narrower
+    # than THIS". Sizing the marker to the uncertainty buries the first
+    # message in a slab of colour; sizing the uncertainty to the marker
+    # would claim a precision the array does not have.
+    cue_marker_frac: float = 0.16
+
     # [POLICY] Radar widget size in pixels, and its inset from the frame
     # corner. Sized as a fraction of the DISPLAYED frame so it scales with
     # display_scale.
