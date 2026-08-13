@@ -493,28 +493,24 @@ class UIConfig:
     # elevation is stated, not whether it is stated.
     cue_style: str = "box"
 
-    # [POLICY] Height of the box, as a fraction of the image height, and
-    # where its centre sits (0 = top, 1 = bottom).
+    # [POLICY] Size of the marker, as a fraction of the image height, and
+    # where it sits vertically (0 = top, 1 = bottom).
     #
-    # ⚠️ THE VERTICAL POSITION IS NOT A MEASUREMENT. Nothing in this system
-    # measures elevation. The box is placed slightly above the middle
-    # because that is where an airborne target usually appears in a level
-    # camera, and its open top and bottom edges plus the ELEV NOT MEASURED
-    # caption say so on the picture. Do not read the box's height as a
-    # claim about the drone's altitude.
-    cue_box_height_frac: float = 0.34
-    cue_box_centre_frac: float = 0.42
-
-    # [POLICY] Size of the compact MARKER at the centre of the region, as a
-    # fraction of the image height.
+    # ⚠️ NEITHER NUMBER IS A MEASUREMENT, and neither may be derived from
+    # one. The marker is a reticle: it says "the bearing points along this
+    # column". Its size carries no information, so it is FIXED — an earlier
+    # version scaled it with the bearing uncertainty, which made the marker
+    # grow precisely when the estimate got worse, i.e. it looked most
+    # confident when it was least trustworthy.
     #
-    # The marker and the uncertainty area are two different statements and
-    # are sized independently on purpose: the marker says "the bearing
-    # points HERE", the surrounding area says "and it cannot be narrower
-    # than THIS". Sizing the marker to the uncertainty buries the first
-    # message in a slab of colour; sizing the uncertainty to the marker
-    # would claim a precision the array does not have.
-    cue_marker_frac: float = 0.16
+    # The vertical position is a display convention only: a level camera
+    # usually shows airborne targets slightly above the middle. The
+    # ELEV NOT MEASURED caption and the arrows above and below the marker
+    # say that on the picture. Nothing in this system measures elevation.
+    #
+    # 0.06 x 480 = ~29 px, which is a marker rather than a slab.
+    cue_marker_frac: float = 0.06
+    cue_marker_centre_frac: float = 0.42
 
     # [POLICY] Radar widget size in pixels, and its inset from the frame
     # corner. Sized as a fraction of the DISPLAYED frame so it scales with

@@ -479,19 +479,19 @@ class HUD:
 
         # ── The search REGION ──
         #
-        # WIDTH is a real measurement: the bearing uncertainty projected
-        # through this camera's own lens, so a low-confidence bearing is
-        # visibly a wider search.
+        # Exactly two things are drawn, because exactly two things are
+        # known, and they are different in kind:
         #
-        # HEIGHT is NOT a measurement, and the drawing says so rather than
-        # the region being withheld. The array reports azimuth only, so the
-        # box's top and bottom edges are drawn OPEN — solid sides, corner
-        # brackets, and arrows continuing past the top and bottom — which
-        # reads as "this column, height unknown" while still being a
-        # compact marker an operator can find at a glance.
+        #   THE COLUMN   where the drone can be. Its WIDTH is measured (the
+        #                bearing uncertainty through this lens). Its HEIGHT
+        #                is the WHOLE FRAME, because elevation is not
+        #                measured at all — the drone can be anywhere up or
+        #                down that column.
         #
-        # `ui.cue_style = "band"` extends it over the whole frame height for
-        # anyone who wants the unknown elevation stated more loudly.
+        #   THE MARKER   a small fixed reticle on the best-estimate bearing.
+        #                It marks a DIRECTION. Its size carries no
+        #                information whatsoever and must therefore not be
+        #                derived from any measurement.
         x0 = max(0, cx - half)
         x1 = min(width, cx + half)
         if x1 <= x0:
@@ -499,67 +499,53 @@ class HUD:
 
         # ⚠️ A region covering most of the frame stops being a region. On
         # the FAR camera (28 deg lens) a +/-30 deg bearing projects wider
-        # than the whole picture; tinting everything hides the very obstacle
-        # the operator is studying while saying nothing. Edges and caption
-        # only in that case.
+        # than the whole picture; tinting everything hides the obstacle the
+        # operator is studying while saying nothing.
         covers_most = (x1 - x0) >= 0.6 * width
 
-        if str(self.config.ui.cue_style).lower() == "band":
-            y0, y1 = top, bot
-            open_ended = False
-        else:
-            bh = int(height * float(self.config.ui.cue_box_height_frac))
-            cyc = top + int(height * float(self.config.ui.cue_box_centre_frac))
-            y0 = max(top, cyc - bh // 2)
-            y1 = min(bot, cyc + bh // 2)
-            open_ended = True
-
-        # ── 1. The UNCERTAINTY area: faint, wide, honest ──
-        # This is how much of the picture the bearing genuinely cannot
-        # narrow down. It is drawn faintly so it never competes with the
-        # marker or hides the obstacle.
-        if not covers_most:
-            roi = canvas[y0:y1, x0:x1]
-            tint = np.full_like(roi, C_CUE_FILL)
-            cv2.addWeighted(tint, 0.22, roi, 0.78, 0.0, dst=roi)
-        _dashed_v(canvas, x0, y0, y1, C_CUE_DIM)
-        _dashed_v(canvas, x1 - 1, y0, y1, C_CUE_DIM)
-
-        if not open_ended:
-            cv2.line(canvas, (cx, top), (cx, bot), C_CUE, 1, cv2.LINE_AA)
-            return
-
-        # ── 2. The MARKER: compact, bright, the thing the eye finds ──
+        # ── 1. The column — ALWAYS full height ──
         #
-        # A reticle at the best estimate, exactly as a targeting display
-        # puts a small mark at the solution and a wider figure around it for
-        # the error. Making the MARKER as wide as the uncertainty (which an
-        # earlier version did) buries the "look here" in a slab of colour;
-        # making the UNCERTAINTY as small as the marker would claim a
-        # precision the array does not have. Both are drawn, each saying
-        # its own thing.
-        mh = max(18, int(height * float(self.config.ui.cue_marker_frac)))
-        mw = min(mh, max(12, (x1 - x0) // 2))
-        mx0, mx1 = cx - mw // 2, cx + mw // 2
-        my0, my1 = (y0 + y1) // 2 - mh // 2, (y0 + y1) // 2 + mh // 2
+        # ⚠️ FIXED: this used to be given a vertical extent from
+        # `cue_box_height_frac` whenever the style was "box". That quietly
+        # asserted an UPPER AND LOWER BOUND on the drone's elevation, which
+        # is the one thing this sensor cannot supply at all. A faint band
+        # 34% of the frame tall reads as "it is somewhere in here
+        # vertically" — and that was simply false.
+        if not covers_most:
+            roi = canvas[top:bot, x0:x1]
+            cv2.addWeighted(np.full_like(roi, C_CUE_FILL), 0.20, roi, 0.80,
+                            0.0, dst=roi)
+        _dashed_v(canvas, x0, top, bot, C_CUE_DIM)
+        _dashed_v(canvas, x1 - 1, top, bot, C_CUE_DIM)
+        cv2.line(canvas, (cx, top), (cx, bot), C_CUE_DIM, 1, cv2.LINE_AA)
 
-        # Sides SOLID — the horizontal position is measured.
-        cv2.line(canvas, (mx0, my0), (mx0, my1), C_CUE, 2, cv2.LINE_AA)
-        cv2.line(canvas, (mx1, my0), (mx1, my1), C_CUE, 2, cv2.LINE_AA)
-        # Top and bottom DASHED, with arrows running past them — the
-        # vertical position is NOT measured, and the marker must never read
-        # like a YOLO box, which asserts both dimensions.
-        _dashed_h(canvas, my0, mx0, mx1, C_CUE)
-        _dashed_h(canvas, my1, mx0, mx1, C_CUE)
-        _corner_brackets(canvas, mx0, my0, mx1 + 1, my1 + 1, C_CUE, arm=8)
-        for y, dy in ((my0, -1), (my1, 1)):
-            cv2.arrowedLine(canvas, (cx, y), (cx, int(y + dy * 20)), C_CUE, 1,
-                            cv2.LINE_AA, tipLength=0.4)
+        # ── 2. The marker ──
+        if str(self.config.ui.cue_style).lower() != "band":
+            # ⚠️ FIXED: the size used to be
+            #     mh = height * cue_marker_frac
+            #     mw = min(mh, (x1 - x0) // 2)
+            # — a width derived from a height, capped by half the bearing
+            # uncertainty. Neither expression meant anything: the reticle
+            # marks a direction, so tying its size to the error made it grow
+            # exactly when the estimate got WORSE. It is now a fixed square.
+            m = max(12, int(round(height * float(
+                self.config.ui.cue_marker_frac))))
+            my = top + int(round(height * float(
+                self.config.ui.cue_marker_centre_frac)))
+            mx0, mx1 = cx - m // 2, cx + m // 2
+            my0, my1 = my - m // 2, my + m // 2
 
-        # The bearing line, drawn only OUTSIDE the marker so the marker's
-        # interior stays clear for whatever is hiding the drone.
-        cv2.line(canvas, (cx, top), (cx, my0 - 20), C_CUE_DIM, 1, cv2.LINE_AA)
-        cv2.line(canvas, (cx, my1 + 20), (cx, bot), C_CUE_DIM, 1, cv2.LINE_AA)
+            # Corner brackets only. At this size dashed edges turn to mush,
+            # and brackets leave all four edges open anyway — which is the
+            # honest shape: nothing here is a closed, measured boundary.
+            _corner_brackets(canvas, mx0, my0, mx1, my1, C_CUE,
+                             arm=max(4, m // 3))
+            # Short arrows above and below, saying the drone may be higher
+            # or lower along this column.
+            for y, dy in ((my0, -1), (my1, 1)):
+                cv2.arrowedLine(canvas, (cx, int(y + dy * 4)),
+                                (cx, int(y + dy * 16)), C_CUE, 1,
+                                cv2.LINE_AA, tipLength=0.45)
 
         # ── Caption ──
         # Deliberately worded so it can never be mistaken for a detection:
@@ -577,10 +563,9 @@ class HUD:
             # its angles, so it could be mirrored. Say so on the picture
             # rather than withhold the picture.
             lines.append("BEARING UNVERIFIED - run calibrate.py doa")
-        if str(self.config.ui.cue_style).lower() != "band":
-            # The one thing about this marker that is NOT measured, said in
-            # words as well as in the open edges above.
-            lines.append("ELEV NOT MEASURED - SEARCH THE FULL COLUMN")
+        # The one thing about this marker that is NOT measured, said in
+        # words as well as by the open brackets and the arrows.
+        lines.append("ELEV NOT MEASURED - SEARCH THE FULL COLUMN")
         if cue.uncertainty_exceeds_fov:
             # Honest caveat: a +/-15-45 deg DOA cannot localise inside a
             # 28 deg lens, so the "region" is most of the picture.

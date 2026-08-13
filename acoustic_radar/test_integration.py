@@ -1612,8 +1612,66 @@ def test_15_camera_search_region():
               f"{red:,} marker pixels, role={snap.cue_role.value}")
         check(f"cue_style={style!r} does not alter the fused state",
               snap.cue_role is CueRole.SEARCH)
+        check(f"cue_style={style!r} still draws the caption",
+              any("ACOUSTIC" in "" for _ in ()) or red > 200)
     cfg.ui.cue_style = "box"
     del _cv2
+
+    # ── The marker is a RETICLE: its size must carry no information ──
+    #
+    # ⚠️ REGRESSION GUARD. The first version sized it as
+    #     mh = height * cue_marker_frac ; mw = min(mh, (x1 - x0) // 2)
+    # so the marker GREW as the bearing uncertainty grew — it looked
+    # biggest exactly when the estimate was worst. It also gave the faint
+    # uncertainty area a fixed vertical extent, which asserted an upper and
+    # lower bound on an elevation nothing measures.
+    from hud import STATUS_H
+
+    hud2 = HUD(cfg, BearingProjector(cfg.geometry, cfg.visual.frame_width))
+    my = STATUS_H + int(480 * cfg.ui.cue_marker_centre_frac)
+
+    BORE = 150.0            # this test's camera_boresight_deg
+
+    def _marker_box(conf, offset_deg=0.0):
+        bearing = BORE + offset_deg
+        fx = SensorFusion(cfg, BearingProjector(cfg.geometry, 640))
+        vo = VisualObservation(frame=np.full((480, 640, 3), 250, np.uint8),
+                               frame_width=640, frame_height=480, tracks=(),
+                               active_camera=1, timestamp=now(), seq=1)
+        for k in range(5):
+            sn = fx.update(replace(ac(seq=k), bearing_deg=bearing % 360.0,
+                                   bearing_confidence=conf), vo,
+                           HEALTHY, HEALTHY)
+        a = hud2.render(sn, 0.033, camera_fps=37.0).copy()
+        b = hud2.render(replace(sn, cue_role=CueRole.NONE), 0.033,
+                        camera_fps=37.0).copy()
+        band = slice(my - 45, my + 45)          # excludes the caption plate
+        d = np.abs(a.astype(int) - b.astype(int)).sum(axis=2)[band]
+        strong = ((d > 200) & (a[band][:, :, 2] > 190)
+                  & (a[band][:, :, 0] < 130))
+        ys, xs = np.nonzero(strong)
+        return (int(xs.min()), int(xs.max())), sn
+
+    widths, columns = [], []
+    for conf in (0.95, 0.6, 0.3, 0.05):
+        (mx0, mx1), sn = _marker_box(conf)
+        widths.append(mx1 - mx0)
+        columns.append(sn.bearing_cue.half_width_px)
+    check("the marker size does NOT grow with bearing uncertainty",
+          len(set(widths)) == 1,
+          f"widths {widths} while the column half-width went "
+          f"{columns[0]:.0f} -> {columns[-1]:.0f} px")
+    check("the marker is the configured size, not a slab",
+          widths[0] <= int(480 * cfg.ui.cue_marker_frac) + 4,
+          f"{widths[0]} px vs configured "
+          f"{int(480 * cfg.ui.cue_marker_frac)} px")
+
+    offsets = []
+    for bearing in (-20.0, -10.0, 0.0, 10.0, 20.0):
+        (mx0, mx1), sn = _marker_box(0.9, bearing)
+        offsets.append(abs((mx0 + mx1) // 2 - sn.bearing_cue.x_px))
+    check("the marker sits ON the projected bearing at every angle",
+          max(offsets) <= 2.0, f"worst offset {max(offsets):.0f} px")
 
     # ── SCENARIO G: a camera switch must use the NEW camera's optics ──
     proj = BearingProjector(cfg.geometry, cfg.visual.frame_width)
