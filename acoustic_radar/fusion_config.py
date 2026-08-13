@@ -520,6 +520,18 @@ class LedConfig:
     cmd_ring_colour: Optional[str] = None      # takes R G B for all LEDs
     cmd_led_colour: Optional[str] = None       # takes INDEX R G B
 
+    # [MEASURED] Flag the utility expects command values behind. Taken from
+    # the usage line the installed xvf_host.py prints on a bad call:
+    #
+    #   xvf_host.py [-h] [-l] [--vid VID] [--pid PID]
+    #               [--values VALUES [VALUES ...]] [COMMAND]
+    #
+    # so a write is `xvf_host.py LED_RING_COLOR --values 0 0 40`. Passing
+    # the numbers positionally makes argparse reject them as unrecognized
+    # arguments and every LED write fails. Set to null if some other
+    # release of the utility really does take values positionally.
+    values_flag: Optional[str] = "--values"
+
     # [POLICY] Colours as 0-255 RGB triples.
     # Dim blue is deliberately dim: this ring sits next to the operator and
     # a bright idle indicator ruins night vision and hides the alarm.

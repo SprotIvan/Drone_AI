@@ -688,15 +688,32 @@ class RespeakerLed:
         """
         Run one xvf_host.py control command. Returns success.
 
+        ⚠️ VALUES GO BEHIND A FLAG, NOT POSITIONALLY. The utility's own
+        usage line is
+
+            xvf_host.py [-h] [-l] [--vid VID] [--pid PID]
+                        [--values VALUES [VALUES ...]] [COMMAND]
+
+        so a write is `xvf_host.py LED_RING_COLOR --values 0 0 40`.
+        Appending the numbers straight after the command name — which is
+        what doa.py's READ path looks like, because a read passes no values
+        at all — makes argparse reject them as unrecognized arguments and
+        every write silently fails. `led.values_flag` exists so a different
+        release of the utility can be accommodated without editing code.
+
         Never raises. Every failure mode of the array — unplugged, busy,
         permission denied, utility missing — has to end up as a log line and
         a status change, because the microphone, the camera and the radar
         must keep working regardless of what the indicator is doing.
         """
         assert self._script_path is not None
+        argv = [command]
+        if args:
+            flag = self.cfg.values_flag
+            argv += ([flag, *args] if flag else list(args))
         try:
             out = subprocess.run(
-                [sys.executable, str(self._script_path), command, *args],
+                [sys.executable, str(self._script_path), *argv],
                 capture_output=True, text=True,
                 timeout=self.cfg.command_timeout_s,
                 cwd=str(self._script_path.parent))

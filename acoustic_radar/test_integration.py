@@ -1187,6 +1187,35 @@ def test_12_led_ring():
     check("J: detection continues while the LED subsystem is unavailable",
           snap.state.has_target, snap.state.value)
 
+    # ── The command line handed to xvf_host.py must be the one it
+    #    actually accepts. This is a real defect that reached hardware:
+    #    values were passed positionally, argparse rejected them as
+    #    unrecognized arguments, and EVERY write failed while the code
+    #    looked correct. The stand-in below parses exactly like the real
+    #    utility, so the wrong form cannot pass again.
+    strict, calls = _make_strict_xvf_host()
+    led = rl.RespeakerLed(
+        LedConfig(enabled=True, led_count=N, sector_leds=3,
+                  min_write_interval_s=0.0, command_timeout_s=10.0),
+        {"doa_offset_deg": 0.0}, script_path=strict)
+    led.start()
+    deadline = time.monotonic() + 20.0
+    while led.status is rl.LedStatus.STARTING and time.monotonic() < deadline:
+        time.sleep(0.05)
+    check("values are passed in the form xvf_host.py accepts",
+          led.status is rl.LedStatus.ACTIVE, led.detail)
+    deadline = time.monotonic() + 20.0
+    while led.writes < 2 and time.monotonic() < deadline:
+        led.submit(rl.LedFrame(rl.LedMode.ALARM, 142.0))
+        time.sleep(0.05)
+    led.stop(timeout=3.0)
+    logged = calls.read_text(encoding="utf-8").splitlines() if calls.exists() \
+        else []
+    check("the array accepted real colour writes",
+          any("--values" in ln for ln in logged),
+          f"{len(logged)} accepted call(s): "
+          + (logged[0] if logged else "none"))
+
     # ── A watchdog must not leave the ring stuck red ──
     led = rl.RespeakerLed(LedConfig(enabled=True, led_count=N, watchdog_s=0.1),
                           {}, script_path=None)
@@ -1195,6 +1224,45 @@ def test_12_led_ring():
     effective = led._effective_frame()
     check("a stalled station falls back to SEARCHING instead of holding red",
           effective.mode is rl.LedMode.SEARCHING, effective.mode.value)
+
+
+def _make_strict_xvf_host():
+    """
+    A stand-in that parses its command line exactly like the real utility.
+
+    The real xvf_host.py uses argparse with this signature:
+
+        xvf_host.py [-h] [-l] [--vid VID] [--pid PID]
+                    [--values VALUES [VALUES ...]] [COMMAND]
+
+    so anything after COMMAND that is not behind --values is an error. This
+    fake reproduces that, which is what turns "the LED code runs" into "the
+    LED code speaks the protocol the device speaks".
+    """
+    import pathlib
+    import tempfile
+
+    directory = pathlib.Path(tempfile.mkdtemp(prefix="xvf_strict_"))
+    script = directory / "xvf_host.py"
+    script.write_text(
+        "import argparse, os, sys\n"
+        "LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)),\n"
+        "                   'accepted.log')\n"
+        "LISTED = ['LED_AUTO_MODE', 'LED_RING_COLOR', 'LED_INDIVIDUAL',\n"
+        "          'AEC_AZIMUTH_VALUES', 'GET_VERSION', 'AUDIO_MGR_OP']\n"
+        "p = argparse.ArgumentParser()\n"
+        "p.add_argument('-l', action='store_true')\n"
+        "p.add_argument('--vid'); p.add_argument('--pid')\n"
+        "p.add_argument('--values', nargs='+')\n"
+        "p.add_argument('COMMAND', nargs='?')\n"
+        "a = p.parse_args()\n"
+        "if a.l or not a.COMMAND:\n"
+        "    print('\\n'.join(LISTED)); sys.exit(0)\n"
+        "with open(LOG, 'a', encoding='utf-8') as fh:\n"
+        "    fh.write(f\"{a.COMMAND} --values {' '.join(a.values or [])}\\n\")\n"
+        "print('OK')\n",
+        encoding="utf-8")
+    return script, directory / "accepted.log"
 
 
 def _make_failing_xvf_host():
