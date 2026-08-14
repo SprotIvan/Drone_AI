@@ -52,10 +52,11 @@ class AcousticConfig:
     """
     Parameters of the acoustic early-warning sensor.
 
-    The acoustic engine (radar.RadarEngine) decides at a fixed rate of
-    1 / radar.BLOCK_SEC = 2 Hz. All timeouts below are expressed in seconds
-    and were chosen as whole multiples of that 0.5 s period so that they
-    correspond to an exact number of missed updates.
+    The acoustic engine (radar.RadarEngine) decides once per `block_seconds`.
+    Every timing value below is expressed in SECONDS and converted to block
+    counts against the hop actually in use — see `effective_block_seconds`.
+    Nothing here is a raw block count, because a raw block count changes
+    meaning silently when the hop changes.
     """
 
     # [POLICY] OPTIONAL extra gate on smoothed P(drone). None = disabled,
@@ -78,11 +79,6 @@ class AcousticConfig:
     # instead of disagreeing.
     lost_after_s: float = 3.0
 
-    # [DERIVED] Number of consecutive acoustic updates a target must remain
-    # inside the camera-range gate before visual acquisition is armed.
-    # 4 updates = 2.0 s of agreement. Prevents a single noisy distance
-    # estimate from flipping the system into VISUAL_ACQUISITION.
-    stable_updates_for_acquisition: int = 4
 
     # [POLICY] If the acoustic ranging is not calibrated there is no
     # distance at all, so the "is it in camera range?" gate cannot be
@@ -118,53 +114,81 @@ class AcousticConfig:
     # write seconds here — `detector_tuning()` is the only converter, and
     # it multiplies by the real block period so the two can never drift.
 
-    # [POLICY] Blocks above P_START required to raise the alarm.
-    # radar.py default 2 -> 2 x 0.5 s = 1.0 s confirmation latency.
-    # Raising this is the correct response to too many false alarms; do NOT
-    # raise the probability threshold, which was fitted on validation data.
-    detector_confirm_blocks: Optional[int] = None
+    # ── TIMING INTENT, IN SECONDS ─────────────────────────────
+    #
+    # ⚠️ SECONDS, NOT BLOCKS, ARE THE AUTHORITATIVE FORM.
+    #
+    # A block count silently changes meaning when the hop changes:
+    # `confirm_blocks = 2` is 1.0 s at a 0.5 s hop and 0.5 s at a 0.25 s
+    # hop, from the same line of configuration. The INTENT ("confirm for
+    # three quarters of a second") is independent of the hop, so that is
+    # what is stored; DetectorTuning.from_seconds does the conversion in
+    # one place against the hop actually in use.
 
-    # [POLICY] Blocks the alarm is HELD after the signal disappears before
-    # the target is dropped (ALARM_COASTING). radar.py default 6 -> 3.0 s.
-    # Must stay <= lost_after_s below, or the fusion layer declares the
-    # sensor lost while the engine is still holding the target. The
-    # acoustic worker logs a warning if that invariant is broken.
+    # [POLICY] How long the smoothed probability must stay above P_START
+    # before the alarm is raised. This IS the evidence — shortening it
+    # trades detection confidence for reaction time, and nothing else in
+    # the system compensates.
+    #
+    # 0.75 s at the default 0.25 s hop = 3 consecutive 2 s windows.
+    confirm_seconds: float = 0.75
+
+    # [POLICY] How long the alarm and the last valid bearing are HELD after
+    # the signal disappears (ALARM_COASTING). Must stay <= lost_after_s or
+    # the fusion layer declares the sensor lost while the engine is still
+    # holding the target; the acoustic worker warns if that is violated.
+    coast_seconds: float = 3.0
+
+    # [POLICY] How long a target must remain inside the camera-range gate
+    # before visual acquisition is armed. Was a raw update count, which had
+    # the same hop-dependence problem as the two above.
+    stable_seconds_for_acquisition: float = 2.0
+
+    # [POLICY] Explicit block-count overrides. None = derive from the
+    # seconds above. Set these only to pin an exact number of blocks.
+    detector_confirm_blocks: Optional[int] = None
     detector_miss_tolerance: Optional[int] = None
 
     # [POLICY] Absolute P_HOLD — smoothed probability required to KEEP an
     # already-raised alarm. radar.py default 0.50 against a P_START of
     # 0.775 (P_START itself comes from training and is NOT settable here).
-    # None = keep radar.py's 0.50. To revert to the older proportional
-    # rule (P_START x HOLD_FACTOR = 0.542) set radar.HOLD_THRESHOLD = None.
     detector_hold_threshold: Optional[float] = None
 
     # [POLICY] EMA weight on the instantaneous probability. 1.0 = no
     # smoothing at all. radar.py default 0.5.
     detector_prob_ema: Optional[float] = None
 
-    # [POLICY] Audio hop, in seconds. None = radar.BLOCK_SEC (0.5).
+    # [POLICY] Audio hop, in seconds. None = radar.BLOCK_SEC.
     #
-    # ⚠️ THE LAST REMAINING LATENCY LEVER, AND IT IS NOT FREE.
+    # ⚠️ THE ONE LATENCY LEVER THAT COSTS NO DETECTION QUALITY.
     #
-    # Measured budget from audible to indication (see latency.py):
-    #     read wait     = block_seconds / 2   (mean quantisation delay)
-    #     confirmation  = confirm_blocks x block_seconds
-    #     everything else measured at ~30 ms combined
+    # The 2 s ANALYSIS WINDOW is unchanged by this — only how often it is
+    # re-evaluated. Every individual classification sees exactly the same
+    # amount of audio as before, so per-decision accuracy is identical.
+    # What shrinks is the QUANTISATION delay: the wait for the current
+    # block to finish before anything can look at it, which averages half
+    # a hop.
     #
-    # Shortening the hop cuts the READ WAIT without weakening the decision,
-    # because the 2 s analysis window is unchanged — only how often it is
-    # re-evaluated. Shortening the CONFIRMATION cuts the evidence itself.
+    # Measured budget, audible -> indication (see latency.py):
+    #     0.50 s hop, 1.00 s confirm -> ~1279 ms   (previous default)
+    #     0.25 s hop, 0.75 s confirm -> ~ 905 ms   (current default)
     #
-    #     0.50 s hop, 2 confirmations -> ~1.28 s   (default, measured)
-    #     0.25 s hop, 4 confirmations -> ~1.15 s   same evidence, 2x CPU
-    #     0.25 s hop, 3 confirmations -> ~0.90 s   25% less evidence, 2x CPU
-    #
-    # DEFAULT LEFT UNCHANGED ON PURPOSE. Halving the hop doubles the
-    # inference rate, and on the Raspberry Pi 5 the acoustic thread shares
-    # its cores with the camera pipeline and Hailo. Measure block_total on
-    # the Pi before spending that CPU: if it is not comfortably under the
-    # new hop, the audio buffer overruns and detection gets WORSE.
-    block_seconds: Optional[float] = None
+    # COST: the inference rate doubles. Measured block_total is a few ms
+    # against a 250 ms budget, so this is affordable — but VERIFY IT ON THE
+    # PI. If block_total approaches the hop the device buffer overruns and
+    # detection gets WORSE, and the acoustic worker logs a warning when the
+    # processing exceeds 90% of the hop.
+    block_seconds: Optional[float] = 0.25
+
+    def effective_block_seconds(self) -> float:
+        """The hop actually in use. One converter, used by everything."""
+        from radar import BLOCK_SEC
+        return float(self.block_seconds or BLOCK_SEC)
+
+    def acquisition_updates(self) -> int:
+        """`stable_seconds_for_acquisition` expressed in acoustic updates."""
+        hop = self.effective_block_seconds()
+        return max(1, int(round(self.stable_seconds_for_acquisition / hop)))
 
     def detector_tuning(self):
         """
@@ -177,7 +201,10 @@ class AcousticConfig:
         """
         from radar import DetectorTuning
 
-        tuning = DetectorTuning()
+        tuning = DetectorTuning.from_seconds(
+            self.effective_block_seconds(),
+            confirm_seconds=self.confirm_seconds,
+            coast_seconds=self.coast_seconds)
         for attr, value in (
                 ("confirm_blocks", self.detector_confirm_blocks),
                 ("miss_tolerance", self.detector_miss_tolerance),
@@ -812,6 +839,19 @@ class StationConfig:
         if self.geometry.drone_real_width_m is None:
             out.append("drone_real_width_m NOT SET -> no visual distance")
         return out
+
+    def describe_bearing_sources(self, calibration_cfg: dict) -> list[str]:
+        """
+        State, at start-up, whether each DOA source's convention is measured.
+
+        ⚠️ BUG-023. The banner listed focal lengths and boresights but never
+        the ANGLE CONVENTION — the single value that decides whether every
+        direction on screen, on the ring and on the camera is real or
+        mirrored. It appeared only buried in the DOA line, if at all.
+        """
+        from bearing_frame import source_convention
+        return [source_convention(src, calibration_cfg).describe()
+                for src in ("usb", "srp")]
 
     def check_bearing_frames(self, calibration_cfg: dict) -> list[str]:
         """

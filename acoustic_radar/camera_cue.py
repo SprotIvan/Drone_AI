@@ -171,7 +171,18 @@ class BearingProjector:
     # ── Projection ─────────────────────────────────────────────
 
     def project(self, camera_id: int, bearing_deg: Optional[float],
-                confidence: float = 0.0) -> BearingCue:
+                confidence: float = 0.0,
+                width_px: Optional[int] = None) -> BearingCue:
+        """
+        ⚠️ BUG-013: `width_px` overrides the configured frame width.
+
+        The projector is constructed once from `visual.frame_width`, but the
+        HUD sizes its canvas from the frame the camera ACTUALLY delivered and
+        scales YOLO boxes in that same real space. If the two ever differ,
+        the boxes stayed correct while the cue — computed against the config
+        width and scaled only by display_scale — landed in the wrong column.
+        Passing the real width keeps both in one pixel space.
+        """
         if bearing_deg is None:
             return BearingCue(False, "no acoustic bearing")
 
@@ -186,7 +197,14 @@ class BearingProjector:
             return BearingCue(False, "camera boresight azimuth not calibrated")
 
         focal = float(focal)
-        hfov = horizontal_fov_deg(focal, self.width_px)
+        # The frame this cue will be drawn on, not the configured default.
+        width = int(width_px) if width_px else self.width_px
+        # The focal length was measured at the CONFIGURED width, so a frame
+        # of a different size has a proportionally different focal length in
+        # its own pixels. Scaling it keeps the angle-per-pixel identical.
+        if width != self.width_px and self.width_px > 0:
+            focal *= width / float(self.width_px)
+        hfov = horizontal_fov_deg(focal, width)
         # THE camera's own output transform, and its only one. The input
         # is the canonical bearing; nothing here re-applies a sensor
         # calibration or a mount offset.
@@ -199,10 +217,10 @@ class BearingProjector:
                 x_px=None, half_width_px=None, in_view=False,
                 off_screen_side=1 if rel > 0 else -1,
                 rel_bearing_deg=rel, hfov_deg=hfov,
-                frame_width_px=self.width_px)
+                frame_width_px=width)
 
         # Inside: project through the pinhole model.
-        x = self.width_px / 2.0 + focal * math.tan(math.radians(rel))
+        x = width / 2.0 + focal * math.tan(math.radians(rel))
 
         # Uncertainty band. Confidence 1.0 -> MIN, 0.0 -> MAX.
         c = min(max(float(confidence), 0.0), 1.0)
@@ -212,20 +230,20 @@ class BearingProjector:
         # correctly toward the frame edges where tan() is non-linear.
         lo = max(-hfov / 2.0 + 1e-3, rel - unc_deg)
         hi = min(hfov / 2.0 - 1e-3, rel + unc_deg)
-        x_lo = self.width_px / 2.0 + focal * math.tan(math.radians(lo))
-        x_hi = self.width_px / 2.0 + focal * math.tan(math.radians(hi))
+        x_lo = width / 2.0 + focal * math.tan(math.radians(lo))
+        x_hi = width / 2.0 + focal * math.tan(math.radians(hi))
         half_width = max(4.0, abs(x_hi - x_lo) / 2.0)
 
         return BearingCue(available=True, reason="", x_px=x,
                           half_width_px=half_width, in_view=True,
                           off_screen_side=0, rel_bearing_deg=rel,
-                          hfov_deg=hfov, frame_width_px=self.width_px,
+                          hfov_deg=hfov, frame_width_px=width,
                           uncertainty_deg=unc_deg)
 
     # ── Reverse direction: pixel → bearing ─────────────────────
 
-    def bearing_of_pixel(self, camera_id: int,
-                         x_px: float) -> Optional[float]:
+    def bearing_of_pixel(self, camera_id: int, x_px: float,
+                         width_px: Optional[int] = None) -> Optional[float]:
         """
         Azimuth of an image column, in the acoustic frame.
 
@@ -238,19 +256,28 @@ class BearingProjector:
         boresight = self.geometry.camera_boresight_deg.get(camera_id)
         if not focal or boresight is None:
             return None
-        rel = math.degrees(math.atan((float(x_px) - self.width_px / 2.0)
-                                     / float(focal)))
+        # SECOND-AUDIT FIX. `project()` gained a width override (BUG-013) but
+        # this did not, so the forward and the reverse projection could end
+        # up in DIFFERENT pixel spaces: the cue placed against the real frame
+        # width while the agreement check measured the YOLO box against the
+        # configured one. Both now scale identically.
+        width = int(width_px) if width_px else self.width_px
+        focal = float(focal)
+        if width != self.width_px and self.width_px > 0:
+            focal *= width / float(self.width_px)
+        rel = math.degrees(math.atan((float(x_px) - width / 2.0) / focal))
         return (float(boresight) + rel) % 360.0
 
     def agreement_deg(self, camera_id: int, x_px: float,
-                      bearing_deg: Optional[float]) -> Optional[float]:
+                      bearing_deg: Optional[float],
+                      width_px: Optional[int] = None) -> Optional[float]:
         """
         Absolute angular disagreement between a visual track and the
         acoustic bearing, or None if it cannot be computed.
         """
         if bearing_deg is None:
             return None
-        visual_bearing = self.bearing_of_pixel(camera_id, x_px)
+        visual_bearing = self.bearing_of_pixel(camera_id, x_px, width_px)
         if visual_bearing is None:
             return None
         return abs(wrap_signed_deg(visual_bearing - float(bearing_deg)))

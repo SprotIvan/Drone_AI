@@ -104,7 +104,10 @@ def print_banner(config: fusion_config.StationConfig, hef_path: str) -> None:
     # change to doa_offset_deg rotates that frame under every boresight
     # already measured, and nothing about the resulting numbers looks wrong.
     import calibration
-    for line in config.check_bearing_frames(calibration.load()):
+    calib = calibration.load()
+    for line in config.describe_bearing_sources(calib):
+        log.info("  %s", line)
+    for line in config.check_bearing_frames(calib):
         log.warning("  %s", line)
 
     gate = config.activation_distance_m(0)
@@ -201,6 +204,10 @@ class Station:
     # ── Lifecycle ──────────────────────────────────────────────
 
     def start(self) -> None:
+        # Each run reports its own latency, not a blend with a previous
+        # Station in the same process (BUG-021).
+        BUDGET.reset()
+
         # Workers are started in parallel and each reports its own health.
         # Neither is allowed to block the other's startup, so a camera that
         # takes seconds to warm up does not delay the microphone.
@@ -242,8 +249,9 @@ class Station:
         log.info("session: %.0f s, %d UI frames (%.1f fps average)",
                  uptime, self._frames, self._frames / max(uptime, 1e-6))
         if self.acoustic is not None and self.acoustic.mean_block_ms:
-            log.info("acoustic block time: mean %.0f ms (budget 500 ms)",
-                     self.acoustic.mean_block_ms)
+            log.info("acoustic block time: mean %.0f ms (budget %.0f ms)",
+                     self.acoustic.mean_block_ms,
+                     self.config.acoustic.effective_block_seconds() * 1000.0)
         if self.camera is not None:
             log.info("camera: %.1f fps, inference %.0f ms",
                      self.camera.fps, self.camera.inference_ms)

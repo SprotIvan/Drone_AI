@@ -350,6 +350,26 @@ class CameraWorker:
                     SubsystemState.ONLINE if self._detector_available
                     else SubsystemState.DEGRADED, "recovered")
 
+            # ⚠️ BUG-002. WHICH CAMERA PRODUCED **THIS** FRAME.
+            #
+            # Read once, here, immediately after the capture returned — and
+            # never re-read for the rest of this iteration. Later in the
+            # loop the switching policy may select the other camera, and an
+            # earlier version re-read `get_active_camera()` after that and
+            # published the NEW id alongside THIS (old) camera's image.
+            #
+            # The consequence was not cosmetic: sensor_fusion projects the
+            # acoustic cue with `visual.active_camera`'s boresight and focal
+            # length (FAR 1274 px / 28 deg vs NEAR 502 px / 65 deg) and
+            # evaluates the camera-range gate with it, so for one frame after
+            # every switch the cue was drawn through the wrong optics onto
+            # the wrong picture.
+            #
+            # A switch decided during this iteration takes effect on the NEXT
+            # capture, which is exactly when the frame will actually come
+            # from the other sensor.
+            frame_camera = self._manager.get_active_camera()
+
             self._frame_count += 1
 
             # ⚠️ Preserved exactly from the original main(): the detector is
@@ -393,24 +413,28 @@ class CameraWorker:
                 self.events.rate("tracker-error", logging.ERROR,
                                  "tracker failed: %s", exc)
 
-            active = self._manager.get_active_camera()
-            tracks, max_box_h, max_box_w = self._collect_tracks(active)
+            # Everything that DESCRIBES this frame uses frame_camera: the
+            # optics that produced the pixels are the optics the distances,
+            # the cue and the range gate must be computed with.
+            tracks, max_box_h, max_box_w = self._collect_tracks(frame_camera)
 
             # ── Camera selection ──
-            switch_distance = tc.estimate_distance_m(max_box_w, active)
+            # Decided FROM this frame, applied to the NEXT one.
+            switch_distance = tc.estimate_distance_m(max_box_w, frame_camera)
             try:
-                switched = self._policy.evaluate(self._manager, active,
+                switched = self._policy.evaluate(self._manager, frame_camera,
                                                  switch_distance, max_box_h)
                 if switched:
-                    log.info("camera switched: %s", switched)
-                    active = self._manager.get_active_camera()
+                    # Deliberately does NOT update frame_camera — see above.
+                    log.info("camera switched: %s (takes effect next frame)",
+                             switched)
             except Exception as exc:
                 self.events.rate("switch-error", logging.WARNING,
                                  "camera switch failed: %s", exc)
 
             if self._calibrate_request.is_set():
                 self._calibrate_request.clear()
-                self._print_calibration(active, max_box_w)
+                self._print_calibration(frame_camera, max_box_w)
 
             # ── Publish ──
             dt = frame_start - last_time
@@ -428,8 +452,8 @@ class CameraWorker:
                 tracks=tuple(tracks),
                 detector_ran=run_detector,
                 detection_count=len(detections),
-                active_camera=active,
-                camera_name=self._camera_name(active),
+                active_camera=frame_camera,
+                camera_name=self._camera_name(frame_camera),
                 available_cameras=tuple(self._manager.available_cameras()),
                 inference_ms=(self._infer_ema if self._infer_ema else None),
                 tracker_ms=None,
@@ -440,7 +464,7 @@ class CameraWorker:
             self.events.rate(
                 "camera-heartbeat", logging.DEBUG,
                 "camera: %.1f fps, %d track(s), infer %.0f ms, cam %d",
-                self._fps_ema, len(tracks), self._infer_ema, active,
+                self._fps_ema, len(tracks), self._infer_ema, frame_camera,
                 interval=5.0)
 
     # ── Track extraction ───────────────────────────────────────

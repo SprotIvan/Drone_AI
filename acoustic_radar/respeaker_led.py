@@ -173,12 +173,20 @@ def frame_for_target(target) -> LedFrame:
             not target.acoustic_health.ok:
         return LedFrame(LedMode.SEARCHING, None)
 
-    # The ring aims with the same bearing the radar plots and the camera
-    # region draws — one number, four consumers, no consumer second-
-    # guessing it. Whether the convention was ever WRITTEN DOWN is
-    # reported once at startup (see RespeakerLed._warn_unverified), not
-    # enforced by silently refusing to point.
-    calibrated = True
+    # ⚠️ BUG-001. THIS MUST COME FROM THE OBSERVATION, NOT BE ASSERTED.
+    #
+    # An earlier version wrote `calibrated = True` here. That made
+    # LedFrame.calibrated unable to take any other value, which in turn made
+    # BOTH consumers of the flag unreachable: `_warn_unverified` could never
+    # fire and `_render`'s uncalibrated branch could never be taken. The ring
+    # aimed a confident sector from a possibly mirrored bearing and nothing
+    # anywhere said so — on the one indicator that cannot carry a caption.
+    #
+    # The ring still AIMS with an unverified bearing (the radar plots it, the
+    # camera region draws it; one number, four consumers, none second-
+    # guessing it). What the flag controls is whether the station SAYS the
+    # convention is unrecorded — see _warn_unverified.
+    calibrated = bool(getattr(acoustic, "bearing_calibrated", False))
     if acoustic.coasting:
         return LedFrame(LedMode.COASTING, acoustic.bearing_deg, calibrated)
     if acoustic.confirmed:
@@ -788,11 +796,18 @@ class RespeakerLed:
         alarm = _rgb(cfg.colour_alarm if frame.mode is LedMode.ALARM
                      else cfg.colour_coasting)
 
-        if (frame.bearing_deg is None or not frame.calibrated
-                or not self._commands.can_drive_sector(n)):
+        if frame.bearing_deg is None or not self._commands.can_drive_sector(n):
             # An alarm with no bearing must not point anywhere. Lighting the
             # whole ring red says "a drone is confirmed, direction unknown",
             # which is true; lighting one arbitrary LED would not be.
+            #
+            # ⚠️ `frame.calibrated` is deliberately NOT a condition here.
+            # An unrecorded convention does not make the direction unusable
+            # — the radar and the camera region both point with it, and an
+            # operator who has watched the ring track a source has better
+            # evidence than the config key would carry. Withholding the
+            # sector would remove working behaviour to enforce paperwork.
+            # The uncertainty is REPORTED instead, by _warn_unverified.
             return {i: alarm for i in range(n)}
 
         centre = bearing_to_led_index(

@@ -187,10 +187,14 @@ class AcousticWorker:
             BLOCK_SAMPLES if self._block_seconds == BLOCK_SEC
             else int(features.SAMPLE_RATE * self._block_seconds))
         if self._block_seconds != BLOCK_SEC:
-            log.warning("audio hop overridden to %.0f ms (radar.py default "
-                        "%.0f ms) — verify block_total stays well under it, "
-                        "or the device buffer will overrun",
-                        self._block_seconds * 1000.0, BLOCK_SEC * 1000.0)
+            # Not an error — 0.25 s is the shipped default and 0.5 s is
+            # radar.py's standalone default. Stated so the processing budget
+            # in the log is unambiguous.
+            log.info("audio hop %.0f ms (radar.py standalone default is "
+                     "%.0f ms); processing must stay well under %.0f ms or "
+                     "the device buffer overruns",
+                     self._block_seconds * 1000.0, BLOCK_SEC * 1000.0,
+                     self._block_seconds * 1000.0)
         self._stream = open_stream(inp, self._block_samples)
 
         # ── Optional side channels ──
@@ -351,7 +355,7 @@ class AcousticWorker:
                 block_np = np.asarray(block)
 
                 try:
-                    status = self._engine.process_block(block_np)
+                    status = self._engine.process_block(block_np, overflowed)
                 except Exception as exc:
                     # An inference failure must not kill the thread; skip
                     # this block and keep the stream draining.
@@ -507,9 +511,10 @@ class AcousticWorker:
                         self._overflow_count)
         if self._block_times:
             avg = sum(self._block_times) / len(self._block_times)
+            budget_ms = float(getattr(self, "_block_seconds", 0.5)) * 1000.0
             log.info("acoustic block processing: mean %.0f ms, max %.0f ms "
-                     "(budget 500 ms)", avg * 1000.0,
-                     max(self._block_times) * 1000.0)
+                     "(budget %.0f ms)", avg * 1000.0,
+                     max(self._block_times) * 1000.0, budget_ms)
         self._set_health(SubsystemState.OFFLINE, "stopped")
         log.info("acoustic worker stopped")
 

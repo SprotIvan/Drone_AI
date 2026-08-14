@@ -13,8 +13,8 @@ from __future__ import annotations
 import json
 import sys
 import time
+import urllib.parse
 import urllib.request
-import urllib.error
 from pathlib import Path
 from threading import Thread, Lock
 
@@ -62,7 +62,10 @@ class TelegramAlerter:
     def _api(self, method: str, params: dict | None = None) -> dict | None:
         url = f"https://api.telegram.org/bot{self.token}/{method}"
         if params:
-            import urllib.parse
+            # AUDIT: this import used to live here, which created a LOCAL
+            # `urllib` binding that shadowed the module-level one — so the
+            # `urllib.request.urlopen` below resolved only because the
+            # package attribute happened to already exist. Hoisted.
             url += "?" + urllib.parse.urlencode(params)
         try:
             with urllib.request.urlopen(url, timeout=5) as resp:
@@ -93,7 +96,6 @@ class TelegramAlerter:
             max_id = max(max_id, upd.get("update_id", 0))
             msg = upd.get("message", {})
             chat_id = msg.get("chat", {}).get("id")
-            text = msg.get("text", "")
             if chat_id and chat_id not in self.chat_ids:
                 self.chat_ids.append(chat_id)
                 added += 1
@@ -129,7 +131,8 @@ class TelegramAlerter:
                 self._alarm_active = False
 
     def _try_send(self, angle: float | None, dist: str, conf: float) -> None:
-        now = time.time()
+        # ⚠️ BUG-012: monotonic — this is a DURATION against COOLDOWN_SEC.
+        now = time.monotonic()
         if now - self._last_sent < COOLDOWN_SEC:
             return
         self._last_sent = now

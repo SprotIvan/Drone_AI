@@ -75,7 +75,7 @@ import numpy as np
 import calibration
 import features
 from audio_io import InputConfig, open_stream, resolve_input, to_mono
-from doa import DOAProvider, DOAReading
+from doa import DOAProvider
 from features import MelFrontend
 from latency import BUDGET
 from ranging import RangeEstimate, RangeEstimator
@@ -179,6 +179,24 @@ class DetectorTuning:
     # рахувати одразу. Згладжування в усталеному режимі не змінюється:
     # від поодиноких спалахів захищає лічильник підтверджень, а не EMA.
     seed_ema_on_first_block: bool = True
+
+    @classmethod
+    def from_seconds(cls, block_sec: float, confirm_seconds: float,
+                     coast_seconds: float, **kwargs) -> "DetectorTuning":
+        """
+        Побудувати налаштування з НАМІРУ в секундах під фактичний крок.
+
+        ⚠️ Лічильники тут — у блоках, і саме тому їх не можна задавати
+        напряму, якщо крок може змінитись: `confirm_blocks = 2` означає
+        1.0 с при кроці 0.5 с і 0.5 с при кроці 0.25 с. Той самий рядок
+        конфігурації тихо змінює сенс. Намір («підтверджувати 0.75 с»)
+        від кроку не залежить, тому саме він і зберігається, а блоки
+        рахуються тут — в одному місці.
+        """
+        block_sec = float(block_sec) or BLOCK_SEC
+        return cls(confirm_blocks=max(1, int(round(confirm_seconds / block_sec))),
+                   miss_tolerance=max(1, int(round(coast_seconds / block_sec))),
+                   **kwargs)
 
     def hold_limit(self, threshold: float) -> float:
         """Поріг утримання вже піднятої тривоги (P_HOLD)."""
@@ -297,16 +315,11 @@ class Detector:
         if gated:
             self.p_smoothed *= (1.0 - tun.prob_ema)
             if self.state in TRACKING_STATES:
-                # Цифрова тиша — це теж пропуск. Підтверджена ціль іде в
-                # утримання, непідтверджена (TRACK) просто накопичує
-                # пропуски і скидається за тим самим лімітом.
-                self.misses += 1
-                if self.state in ALARM_STATES:
-                    self.state = "ALARM_COASTING"
-                else:
-                    self.confirmations = 0      # див. _miss() нижче
-                if self.misses >= tun.miss_tolerance:
-                    self.reset()
+                # Цифрова тиша — це теж пропуск, обробляється тим самим
+                # кодом, що й слабкий сигнал (BUG-025: раніше ці дві гілки
+                # виражали один інваріант по-різному і звірити їх читанням
+                # було важко).
+                if self._miss(tun):
                     self.state = "SLEEP"
             else:
                 self.state = "SLEEP"
@@ -339,33 +352,42 @@ class Detector:
                           else "TRACK")
         else:
             if self.state in TRACKING_STATES:
-                self.misses += 1
-                if self.state in ALARM_STATES:
-                    # Тривога вже піднята — утримуємо ціль. Лічильник
-                    # підтверджень НЕ чіпаємо: він уже перевищив ліміт, і
-                    # завдяки цьому повернення сигналу піднімає ALARM тим
-                    # самим блоком, а не через ще confirm_blocks блоків.
-                    self.state = "ALARM_COASTING"
-                else:
-                    # ⚠️ TRACK, тривоги ще не було. Підтвердження мають
-                    # бути ПОСЛІДОВНИМИ, інакше сигнал, що стрибає навколо
-                    # порога, накопичує їх через пропуски: один блок на
-                    # 0.78, пропуск, ще один на 0.51 — і тривога піднята,
-                    # хоча жодних двох блоків поспіль не було.
-                    #
-                    # Старий код теж не скидав лічильник, але там треба
-                    # було 5 підтверджень, і зібрати їх «по одному через
-                    # пропуск» практично не виходило. Із 2 підтвердженнями
-                    # ця лазівка стає реальним джерелом хибних тривог,
-                    # тому вона закрита разом зі зниженням порога.
-                    self.confirmations = 0
-                if self.misses >= tun.miss_tolerance:
-                    self.reset()
+                self._miss(tun)
             else:
                 self.state = "LISTEN"
                 self.confirmations = 0
 
         return self.state
+
+    def _miss(self, tun: "DetectorTuning") -> bool:
+        """
+        Один блок без придатного сигналу, поки ціль у супроводі.
+
+        ⚠️ BUG-025. ЄДИНЕ місце, де живе цей інваріант — раніше він був
+        продубльований у гейт-гілці і в гілці слабкого сигналу, різними
+        словами, і звірити їх можна було тільки дуже уважним читанням.
+
+        Повертає True, якщо ціль скинуто.
+
+        ALARM/ALARM_COASTING: лічильник підтверджень НЕ чіпаємо — він уже
+        перевищив ліміт, і завдяки цьому повернення сигналу піднімає ALARM
+        тим самим блоком, а не через ще confirm_blocks блоків.
+
+        TRACK: підтвердження мають бути ПОСЛІДОВНИМИ. Інакше сигнал, що
+        стрибає навколо порога, накопичує їх через пропуски — один блок на
+        0.78, пропуск, ще один на 0.51 — і тривога піднята, хоча двох
+        блоків поспіль не було. Зі старими 5 підтвердженнями зібрати їх так
+        практично не виходило; із 2 це реальне джерело хибних тривог.
+        """
+        self.misses += 1
+        if self.state in ALARM_STATES:
+            self.state = "ALARM_COASTING"
+        else:
+            self.confirmations = 0
+        if self.misses >= tun.miss_tolerance:
+            self.reset()
+            return True
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -491,12 +513,22 @@ class RadarEngine:
 
     # ── Обробка одного блоку ───────────────────────────────────
 
-    def process_block(self, block: np.ndarray) -> RadarStatus:
+    def process_block(self, block: np.ndarray,
+                      overflowed: bool = False) -> RadarStatus:
         """
         Args:
-            block: [samples, channels] — черговий шматок аудіо (0.5 с)
+            block: [samples, channels] — черговий шматок аудіо
+            overflowed: пристрій повідомив про переповнення буфера перед
+                цим блоком, тобто частину звуку втрачено назавжди.
+
         Returns:
             RadarStatus — актуальний стан
+
+        ⚠️ BUG-008: `overflowed` раніше не приймався взагалі. Поле
+        RadarStatus.overflow виставлялось у False і більше ніколи не
+        змінювалось, тож AcousticObservation.overflow був завжди False і
+        жоден елемент інтерфейсу не міг повідомити про втрачене аудіо —
+        хоча аудіопотік цю подію справно виявляв.
         """
         # Тільки мікрофонні канали — див. audio_io.to_mono.
         mono = to_mono(block, getattr(self.input, "mic_channels", None))
@@ -512,7 +544,7 @@ class RadarEngine:
             self._filled = min(WINDOW_SAMPLES, self._filled + n)
 
         st = self.status
-        st.overflow = False
+        st.overflow = bool(overflowed)
 
         # Поки вікно не заповнилось — рішення не приймаємо
         if self._filled < WINDOW_SAMPLES:
@@ -563,8 +595,7 @@ class RadarEngine:
                 # рахувати геометрію по опорних каналах.
                 self.doa.update(self._mic_block(block))
             else:
-                self.doa.tracker.update(DOAReading(None))
-                self.doa.canonical = self.doa._to_canonical(DOAReading(None))
+                self.doa.hold()
             # ⚠️ КАНОНІЧНИЙ кут, а не сирий кут трекера. Перетворення
             # конвенції джерела виконує DOAProvider РІВНО ОДИН РАЗ; радар,
             # LED і камера далі не мають права нічого «довертати».
@@ -690,7 +721,10 @@ class UartSender:
     def send(self, st: RadarStatus) -> None:
         if self.serial is None or not st.is_alarm or st.angle_deg is None:
             return
-        now = time.time()
+        # ⚠️ BUG-011: monotonic. This is a DURATION against MIN_INTERVAL;
+        # a backward NTP step on an RTC-less Pi would silence the bearing
+        # output on /dev/serial0 for the length of the jump.
+        now = time.monotonic()
         changed = (self._last_angle is None
                    or abs(st.angle_deg - self._last_angle) >= self.MIN_CHANGE_DEG)
         if now - self._last_time < self.MIN_INTERVAL and not changed:
@@ -778,7 +812,7 @@ def main() -> None:
                     # правильніше їх обробити і просто відзначити подію.
                     overflow_count += 1
 
-                st = engine.process_block(np.asarray(block))
+                st = engine.process_block(np.asarray(block), overflowed)
                 if uart is not None:
                     uart.send(st)
 

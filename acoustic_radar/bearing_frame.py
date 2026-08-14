@@ -150,39 +150,80 @@ class SourceConvention:
     says whether its angles already run clockwise (add) or run the other
     way (subtract).
 
-    UNKNOWN handedness is NOT silently treated as clockwise. A source whose
-    handedness has never been measured produces an UNCALIBRATED bearing,
-    which the display marks and the LED and camera cue refuse to point
-    with — they assert a physical direction, and a coin-flip on handedness
-    is a 50% chance of pointing an operator at the opposite horizon.
+    The two halves fail in different ways and are tracked separately:
+
+        zero_measured = False   the direction is ROTATED by an unknown
+                                amount — wrong, but consistently wrong
+        handedness = UNKNOWN    the direction may be MIRRORED — wrong in a
+                                way that reverses as the target moves
+
+    An UNKNOWN handedness still yields a number (see `assumed_handedness`):
+    a circle has no third direction, so producing nothing would mean the
+    radar, the ring and the camera cue all going dark over a config key.
+    What it does NOT do is claim to be calibrated — `calibrated` is False,
+    and every consumer is expected to say so in its own way.
     """
 
     zero_deg: float = 0.0
     handedness: Handedness = Handedness.UNKNOWN
     label: str = ""
+    #: Was `zero_deg` actually measured? Separate from `handedness` because
+    #: the two fail differently: an unmeasured zero is a ROTATION error of
+    #: unknown size, an unknown handedness is a MIRROR. SRP-PHAT can have a
+    #: proven handedness and an unmeasured zero at the same time.
+    zero_measured: bool = True
 
     @property
     def calibrated(self) -> bool:
-        return self.handedness is not Handedness.UNKNOWN
+        """Both halves of the convention are known."""
+        return (self.handedness is not Handedness.UNKNOWN
+                and self.zero_measured)
+
+    @property
+    def assumed_handedness(self) -> Handedness:
+        """
+        The handedness the arithmetic actually uses.
+
+        ⚠️ BUG-010. UNKNOWN is not a third direction — there is no third way
+        for a circle to run — so something has to be assumed to produce any
+        number at all. An earlier version made that assumption implicitly, by
+        letting UNKNOWN fall through an `if COUNTER_CLOCKWISE` to the
+        clockwise branch, while the class docstring claimed the opposite. The
+        assumption is now named, made in ONE place, and testable.
+
+        Refusing to produce a bearing instead was considered and rejected: the
+        radar, the LED ring and the camera cue all point with this number
+        today, and withdrawing it would remove working behaviour to enforce a
+        config key. `calibrated` stays False so every consumer can say so.
+        """
+        if self.handedness is Handedness.UNKNOWN:
+            return Handedness.CLOCKWISE
+        return self.handedness
 
     def to_canonical(self, raw_deg: float) -> float:
-        signed = (raw_deg if self.handedness is Handedness.COUNTER_CLOCKWISE
-                  else raw_deg)
-        if self.handedness is Handedness.COUNTER_CLOCKWISE:
-            signed = -raw_deg
-        return wrap360(self.zero_deg + signed)
+        # BUG-015: the dead ternary that used to be here returned raw_deg on
+        # both branches; the sign was applied by the following `if`.
+        if self.assumed_handedness is Handedness.COUNTER_CLOCKWISE:
+            return wrap360(self.zero_deg - float(raw_deg))
+        return wrap360(self.zero_deg + float(raw_deg))
 
     def from_canonical(self, canonical_deg: float) -> float:
         """Inverse, for driving hardware that speaks the sensor's frame."""
         delta = wrap360(canonical_deg - self.zero_deg)
-        if self.handedness is Handedness.COUNTER_CLOCKWISE:
+        if self.assumed_handedness is Handedness.COUNTER_CLOCKWISE:
             delta = wrap360(-delta)
         return delta
 
     def describe(self) -> str:
-        if not self.calibrated:
-            return (f"{self.label or 'source'}: UNKNOWN — REQUIRES PHYSICAL "
-                    f"CALIBRATION (run: python calibrate.py doa)")
+        if self.handedness is Handedness.UNKNOWN:
+            return (f"{self.label or 'source'}: HANDEDNESS UNKNOWN — may be "
+                    f"MIRRORED, assuming {self.assumed_handedness.value}. "
+                    f"REQUIRES PHYSICAL CALIBRATION "
+                    f"(run: python calibrate.py doa, TWO points)")
+        if not self.zero_measured:
+            return (f"{self.label or 'source'}: {self.handedness.value} "
+                    f"(proven), but ZERO NOT MEASURED — direction is rotated "
+                    f"by an unknown amount. REQUIRES PHYSICAL CALIBRATION")
         return (f"{self.label or 'source'}: zero at {self.zero_deg:+.0f}deg, "
                 f"{self.handedness.value}")
 
@@ -204,12 +245,23 @@ def source_convention(source: str, cfg: dict) -> SourceConvention:
     thing — is the shared-calibration bug this function exists to end.
     """
     if source == "srp":
+        # ⚠️ BUG-016. SRP-PHAT's HANDEDNESS IS PROVEN FROM THE CODE and is
+        # therefore always applied — `ArrayDOA` builds its steering vectors
+        # as (cos, sin) over mic_positions_m, which is atan2, which is
+        # counter-clockwise. Only the ZERO is unmeasured.
+        #
+        # An earlier version returned UNKNOWN handedness when the zero was
+        # missing, which (via assumed_handedness) silently applied the
+        # CLOCKWISE fallback to a source known to run the other way — the
+        # one case where the fallback is provably wrong. The zero being
+        # unknown is a ROTATION error of unknown size; pretending the
+        # handedness is unknown too turned it into a MIRROR error as well.
         zero = cfg.get("srp_zero_deg")
         if zero is None:
-            # Not measured. The handedness is known, the rotation is not,
-            # so the result is still uncalibrated.
-            return SourceConvention(0.0, Handedness.UNKNOWN, "SRP-PHAT")
-        return SourceConvention(float(zero), SRP_HANDEDNESS, "SRP-PHAT")
+            return SourceConvention(0.0, SRP_HANDEDNESS, "SRP-PHAT",
+                                    zero_measured=False)
+        return SourceConvention(float(zero), SRP_HANDEDNESS, "SRP-PHAT",
+                                zero_measured=True)
 
     if source == "usb":
         # ⚠️ HANDEDNESS IS KNOWN ONLY IF `doa_handedness` WAS WRITTEN.
@@ -227,17 +279,17 @@ def source_convention(source: str, cfg: dict) -> SourceConvention:
         # absence of the measurement invisible. Only `doa_handedness` —
         # which nothing but `calibrate.py doa` ever writes — counts.
         explicit = cfg.get("doa_handedness")
+        zero = float(cfg.get("doa_offset_deg", 0.0))
         if explicit is None:
-            return SourceConvention(
-                float(cfg.get("doa_offset_deg", 0.0)),
-                Handedness.UNKNOWN, "XVF3800 USB")
+            return SourceConvention(zero, Handedness.UNKNOWN, "XVF3800 USB",
+                                    zero_measured=False)
         hand = (Handedness.COUNTER_CLOCKWISE
                 if str(explicit).upper() in ("CCW", "COUNTER_CLOCKWISE")
                 else Handedness.CLOCKWISE)
-        return SourceConvention(float(cfg.get("doa_offset_deg", 0.0)), hand,
-                                "XVF3800 USB")
+        return SourceConvention(zero, hand, "XVF3800 USB", zero_measured=True)
 
-    return SourceConvention(0.0, Handedness.UNKNOWN, source or "unknown")
+    return SourceConvention(0.0, Handedness.UNKNOWN, source or "unknown",
+                            zero_measured=False)
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -121,11 +121,12 @@ class CueRole(Enum):
     This is the whole of the "drone behind a tree" feature, decided in one
     place so the overlay can never contradict the state machine.
 
-        NONE       nothing to draw — no acoustic target, the reading is
-                   LOST, or the bearing's source convention was never
-                   measured so it may be mirrored. Drawing a region from an
-                   uncalibrated bearing would send an operator to the wrong
-                   half of the sky with full confidence.
+        NONE       nothing to draw — no acoustic bearing at all, the
+                   reading is old enough to be LOST, or the projection is
+                   impossible because the camera has no boresight/focal
+                   calibration. An UNVERIFIED angle convention is NOT in
+                   this list: it is drawn and labelled, exactly as the
+                   radar and the ring do with the same number.
 
         SEARCH     the microphone has a target the CAMERA HAS NOT
                    CONFIRMED — either YOLO sees nothing there, or what it
@@ -133,14 +134,28 @@ class CueRole(Enum):
                    case: tree, building, roof, car. The image gets a
                    translucent red search region labelled ACOUSTIC ONLY.
 
-        CONFIRMED  YOLO has a box that agrees with the acoustic bearing.
-                   The box becomes the primary indication and the search
-                   region is withdrawn, so the display never shows two
-                   competing positions for one drone.
+        CONFIRMED  YOLO has a LIVE box that agrees with the acoustic
+                   bearing. The box becomes the primary indication and the
+                   search region is withdrawn, so the display never shows
+                   two competing LIVE positions for one drone.
 
     Losing the visual track moves CONFIRMED back to SEARCH on the very next
     update, which is the reacquisition behaviour: the region reappears
     exactly where the microphone still hears the target.
+
+    ⚠️ BUG-007 — WHAT HAPPENS DURING A DROPOUT, DECIDED EXPLICITLY.
+    While the visual track is coasting, the HUD draws BOTH the last-known
+    box and the acoustic region. That is deliberate and it is not a
+    contradiction, because the two are making different statements:
+
+        amber, DASHED, "LAST KNOWN"   where the camera last SAW it
+        red, bracketed, "ACOUSTIC ONLY" where the microphone hears it NOW
+
+    An earlier version of this docstring claimed the display "never" shows
+    two positions, which was simply false — `hud._draw_boxes` appends the
+    coasting track explicitly. The guarantee that actually holds, and that
+    the styling enforces, is that never more than ONE of them is presented
+    as a live visual detection.
     """
     NONE = "NONE"
     SEARCH = "ACOUSTIC ONLY"
@@ -301,6 +316,11 @@ class SensorFusion:
         self._in_range_streak = 0
         self._visual_confirm_streak = 0
 
+        #: The camera that most recently produced a frame. Used when the
+        #: camera worker has published nothing, so the cue and the range
+        #: gate keep using the optics that were actually in play.
+        self._last_active_camera = 0
+
         # Last-known-good visual position, kept across a visual dropout so
         # reacquisition has somewhere to look (STATE 7).
         self._last_visual_track: Optional[VisualTrack] = None
@@ -422,7 +442,23 @@ class SensorFusion:
                               and acoustic.p_smoothed >= conf_gate)
         acoustic_confirmed = acoustic_live and acoustic.confirmed
 
-        active_camera = 0 if visual is None else visual.active_camera
+        # ⚠️ BUG-006. Which camera's OPTICS apply.
+        #
+        # `0 if visual is None` silently assumed the FAR camera whenever the
+        # camera worker had not published — while the hardware might well be
+        # on NEAR. That is not only a display question: the same id chooses
+        # activation_distance_m()/release_distance_m(), so the camera-RANGE
+        # GATE, a fusion decision, was evaluated with the wrong optics
+        # (~20 m for FAR against ~8 m for NEAR).
+        #
+        # The last camera that actually produced a frame is remembered
+        # instead. It is the best available answer, and it is a measurement
+        # rather than an assumption.
+        if visual is not None:
+            active_camera = visual.active_camera
+            self._last_active_camera = active_camera
+        else:
+            active_camera = self._last_active_camera
         visual_track = None
         if visual is not None and v_fresh is Freshness.FRESH:
             visual_track = visual.best_track(
@@ -456,12 +492,18 @@ class SensorFusion:
         # ── Cross-sensor checks ──
         bearing = acoustic.bearing_deg if acoustic is not None else None
         bearing_conf = acoustic.bearing_confidence if acoustic is not None else 0.0
-        cue = self.projector.project(active_camera, bearing, bearing_conf)
+        # BUG-013: project into the pixel space of the frame that will
+        # actually carry the overlay.
+        frame_w = (visual.frame_width if visual is not None
+                   and visual.frame_width else None)
+        cue = self.projector.project(active_camera, bearing, bearing_conf,
+                                     width_px=frame_w)
 
         agreement = None
         if visual_track is not None:
             agreement = self.projector.agreement_deg(
-                active_camera, visual_track.center[0], bearing)
+                active_camera, visual_track.center[0], bearing,
+                width_px=frame_w)
 
         cue_role = self._cue_role(acoustic, a_fresh, visual_track, cue,
                                   agreement)
@@ -630,7 +672,7 @@ class SensorFusion:
                             and self._visual_confirm_streak
                             >= cfg.visual.confirm_frames)
         range_ready = (self._in_range_streak
-                       >= cfg.acoustic.stable_updates_for_acquisition)
+                       >= cfg.acoustic.acquisition_updates())
 
         # ── Camera confirmation wins from any state ──
         # This is the "CAMERA BECOMES PRIMARY" rule, and it applies even

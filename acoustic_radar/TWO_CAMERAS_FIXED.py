@@ -1140,6 +1140,9 @@ class HailoInference:
         self._cls_logit_min   = float('inf')
         self._cls_logit_max   = float('-inf')
         self._cls_calls_seen  = 0
+        # Source frame size, set by _letterbox on every predict (BUG-014).
+        self._src_h = 0
+        self._src_w = 0
         self._CLS_MIN_CALLS   = 3
 
         self._ltrb_mode: Optional[str] = None   # 'stride' or 'pixel'
@@ -1181,12 +1184,15 @@ class HailoInference:
     def _letterbox(self, img: np.ndarray) -> Tuple[np.ndarray, float, float, float]:
         """Letterbox into pre-allocated buffer. Returns (buf, ratio, pad_w, pad_h)."""
         sh, sw = img.shape[:2]
+        # AUDIT BUG-014: remember the SOURCE size so _decode_head can clip
+        # un-letterboxed boxes back into the real image.
+        self._src_h, self._src_w = sh, sw
         dw, dh = self.input_shape
         r      = min(dh/sh, dw/sw)
         nw, nh = int(round(sw*r)), int(round(sh*r))
         pw     = (dw - nw) / 2.0
         ph     = (dh - nh) / 2.0
-        l      = int(round(pw - 0.1))
+        left   = int(round(pw - 0.1))   # AUDIT BUG-018: was `l` (reads as 1)
         t      = int(round(ph - 0.1))
         self._lb_buf[:] = 114
         if nw == sw and nh == sh:
@@ -1196,15 +1202,15 @@ class HailoInference:
             # cv2.resize entirely: resizing to the identical size does the
             # same work as a plain copy but slower, since it still runs a
             # full interpolation pass over every pixel.
-            self._lb_buf[t:t+nh, l:l+nw] = img
+            self._lb_buf[t:t+nh, left:left+nw] = img
         else:
-            self._lb_buf[t:t+nh, l:l+nw] = cv2.resize(
+            self._lb_buf[t:t+nh, left:left+nw] = cv2.resize(
                 img, (nw, nh), interpolation=cv2.INTER_LINEAR)
         # AUDIT BUG #7: return the actual integer offsets (l, t) used to
         # place the pixels, not the unrounded float (pw, ph) — the inverse
         # transform in _decode_head must undo the same offset that was
         # applied here, or every decoded box carries a sub-pixel error.
-        return self._lb_buf, r, float(l), float(t)
+        return self._lb_buf, r, float(left), float(t)
 
     def _update_ltrb_vote(self, regs: np.ndarray, stride: int) -> None:
         iw, ih = self.input_shape
@@ -1333,7 +1339,10 @@ class HailoInference:
                      stride: int, ratio: float, pad_w: float, pad_h: float
                      ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """Decode a single detection head. Returns (boxes, scores) or (None, None)."""
-        fh, fw = bbox_arr.shape[0], bbox_arr.shape[1]
+        # AUDIT BUG-018: the grid dimensions used to be unpacked here and
+        # never used. Verified during the audit that the decode does NOT
+        # need them — `gy, gx = np.where(mask)` already carries the grid
+        # position — so this was dead, not a missing clamp.
         if self._cls_needs_sigmoid is None:
             cmin = float(cls_arr.min()); cmax = float(cls_arr.max())
             self._cls_logit_min = min(self._cls_logit_min, cmin)
@@ -1393,9 +1402,31 @@ class HailoInference:
         x2o = (x2p - pad_w) / ratio
         y2o = (y2p - pad_h) / ratio
 
+        # AUDIT BUG-014: clip to the image before returning.
+        #
+        # Un-letterboxing can place a corner outside the sensor. The HUD
+        # clips for DRAWING, but sensor_fusion feeds the box CENTRE to
+        # BearingProjector.bearing_of_pixel(), which extrapolates
+        # atan((x - W/2) / focal) past the real field of view — so an
+        # out-of-frame centre produced a bearing the lens cannot see and
+        # could wrongly cancel, or wrongly sustain, the acoustic search
+        # region through cue_agreement_deg.
+        iw = float(getattr(self, "_src_w", 0) or 0)
+        ih = float(getattr(self, "_src_h", 0) or 0)
+        if iw > 0 and ih > 0:
+            x1o = np.clip(x1o, 0.0, iw)
+            x2o = np.clip(x2o, 0.0, iw)
+            y1o = np.clip(y1o, 0.0, ih)
+            y2o = np.clip(y2o, 0.0, ih)
+
         wo = x2o - x1o
         ho = y2o - y1o
-        return np.column_stack((x1o, y1o, wo, ho)).astype(np.float32), scores
+        keep = (wo > 1.0) & (ho > 1.0)
+        if not np.any(keep):
+            return None, None
+        return (np.column_stack((x1o[keep], y1o[keep],
+                                 wo[keep], ho[keep])).astype(np.float32),
+                scores[keep])
 
     def release(self):
         try:
@@ -1408,9 +1439,17 @@ class HailoInference:
             pass
 def _check_camera_manager_is_current():
 
+    # AUDIT BUG-024: RuntimeError, not SystemExit.
+    #
+    # SystemExit derives from BaseException, so it slipped past every
+    # `except Exception` in the project and only degraded gracefully because
+    # camera_worker happens to catch BaseException. A stale camera_manager is
+    # an ordinary recoverable configuration problem: the acoustic side must
+    # keep running, which an ordinary exception guarantees at every call site
+    # rather than at one.
     params = inspect.signature(CameraManager.__init__).parameters
     if "max_fps" not in params:
-        raise SystemExit(
+        raise RuntimeError(
             "\n[SETUP ERROR] The camera_manager.py being imported is OUT OF DATE.\n"
             f"  Loaded from : {inspect.getfile(CameraManager)}\n"
             "  Problem     : it does not accept the 'max_fps' argument that\n"

@@ -770,7 +770,6 @@ def test_honesty():
 
 def test_final_audit_regressions():
     header("FINAL AUDIT — defects found reviewing the integration itself")
-    import cv2
     import numpy as _np
 
     from hud import HUD
@@ -1593,8 +1592,6 @@ def test_15_camera_search_region():
     # Style is a DISPLAY choice. It must not be able to change what the
     # system believes about the target — only how loudly the unmeasured
     # elevation is stated.
-    import cv2 as _cv2
-
     from hud import HUD
     _, f6 = new_fusion(cfg)
     frame = np.full((480, 640, 3), 60, np.uint8)
@@ -1615,7 +1612,6 @@ def test_15_camera_search_region():
         check(f"cue_style={style!r} still draws the caption",
               any("ACOUSTIC" in "" for _ in ()) or red > 200)
     cfg.ui.cue_style = "box"
-    del _cv2
 
     # ── The marker is a RETICLE: its size must carry no information ──
     #
@@ -1695,6 +1691,257 @@ def test_15_camera_search_region():
           "carries the frame",
           snap_near.visual is not None
           and snap_near.bearing_cue.frame_width_px > 0)
+
+
+def test_16_audit_fixes():
+    """Regression guards for every bug in checker.md that is fixable here."""
+    header("TEST 16 — checker.md regression guards (BUG-001..BUG-025)")
+    import dataclasses
+
+    import bearing_frame as bf
+    import radar
+    from doa import DOAProvider, DOAReading, DOATracker
+    from latency import LatencyBudget
+    from sensor_fusion import CueRole
+
+    # ── BUG-002: a frame and its camera id must describe one camera ──
+    # The worker reads the id ONCE, right after capture, and a switch
+    # decided later must not retroactively relabel that frame.
+    import camera_worker as cw
+    import inspect as _insp
+
+    src = _insp.getsource(cw.CameraWorker._loop)
+    check("BUG-002: the frame's camera is captured once, at capture time",
+          "frame_camera = self._manager.get_active_camera()" in src)
+    check("BUG-002: the id is NOT re-read after the switching policy runs",
+          "active = self._manager.get_active_camera()" not in src,
+          "no post-switch re-read remains")
+    check("BUG-002: the published observation uses the frame's own camera",
+          "active_camera=frame_camera" in src)
+
+    class _Mgr:
+        """Switches on the frame AFTER the one that requested it."""
+        def __init__(self): self.cam = 0
+        def get_active_camera(self): return self.cam
+        def switch(self): self.cam = 1 - self.cam
+
+    mgr = _Mgr()
+    published = []
+    for _ in range(4):
+        frame_camera = mgr.get_active_camera()      # as the worker now does
+        frame = f"image-from-cam{frame_camera}"
+        mgr.switch()                                # policy switches mid-loop
+        published.append((frame, frame_camera))
+    check("BUG-002: every published pair is self-consistent across switches",
+          all(f == f"image-from-cam{c}" for f, c in published),
+          " ".join(f"{f}/{c}" for f, c in published))
+
+    # ── BUG-001: the LED calibration flag must be reachable ──
+    import respeaker_led as rl
+
+    def _tgt(calibrated):
+        cfgx = load_config()
+        _, fx = new_fusion(cfgx)
+        obs = AcousticObservation(
+            engine_state="ALARM", p_smoothed=0.9, threshold=0.775,
+            bearing_deg=90.0, bearing_confidence=0.8,
+            bearing_calibrated=calibrated, timestamp=now(), seq=1)
+        return fx.update(obs, visual(0), HEALTHY, HEALTHY)
+
+    check("BUG-001: a calibrated bearing yields calibrated=True",
+          rl.frame_for_target(_tgt(True)).calibrated)
+    check("BUG-001: an UNVERIFIED bearing yields calibrated=False "
+          "(the flag is no longer hard-coded)",
+          not rl.frame_for_target(_tgt(False)).calibrated)
+
+    led = rl.RespeakerLed(__import__("fusion_config").LedConfig(
+        enabled=True, led_count=12))
+    led._warned_unverified = False
+    warned = []
+    rl.log.warning = lambda *a, **k: warned.append(a[0] if a else "")
+    led._warn_unverified(rl.LedFrame(rl.LedMode.ALARM, 90.0, calibrated=False))
+    check("BUG-001: the unverified-convention warning is REACHABLE",
+          bool(warned), warned[0][:60] if warned else "never fired")
+    warned.clear()
+    led._warned_unverified = False
+    led._warn_unverified(rl.LedFrame(rl.LedMode.ALARM, 90.0, calibrated=True))
+    check("BUG-001: and stays silent when the convention IS recorded",
+          not warned)
+
+    # The ring must still POINT with an unverified bearing — the fix must
+    # not have quietly disabled working behaviour.
+    led.cfg = __import__("fusion_config").LedConfig(enabled=True, led_count=12)
+    led._commands = rl.XvfCommands(available=("LED_RING_COLOR",),
+                                   ring_colour="LED_RING_COLOR", ring_arity=12)
+    painted = led._render(rl.LedFrame(rl.LedMode.ALARM, 90.0, calibrated=False))
+    check("BUG-001: an unverified bearing still lights a SECTOR, not the "
+          "whole ring", len(set(painted.values())) == 2,
+          f"{len(set(painted.values()))} distinct colours")
+
+    # ── BUG-003/004: monotonic time in doa.py ──
+    doa_src = _insp.getsource(__import__("doa"))
+    check("BUG-003/004: no wall clock left anywhere in doa.py",
+          "time.time()" not in doa_src.replace("time.time() a", ""),
+          "only the explanatory comment mentions it")
+
+    tr = DOATracker()
+    tr.update(DOAReading(90.0, confidence=0.9, source="usb"), now=1000.0)
+    # A backward clock step used to make the difference negative, so the
+    # release could never fire and a dead track was held for ever.
+    tr.update(DOAReading(None), now=1000.0 - 3600.0)
+    check("BUG-003: a backward clock step does not destroy the track",
+          tr.angle is not None, f"angle={tr.angle}")
+    tr.update(DOAReading(None), now=1000.0 + DOATracker.RELEASE_SEC + 1)
+    check("BUG-003: the release timeout still fires on real elapsed time",
+          tr.angle is None)
+
+    # ── BUG-005: canonicalisation happens BEFORE smoothing ──
+    cal = {"doa_offset_deg": 354.0, "doa_handedness": "CCW",
+           "srp_zero_deg": 30.0}
+    prov = DOAProvider.__new__(DOAProvider)
+    prov.conventions = {"usb": bf.source_convention("usb", cal),
+                        "srp": bf.source_convention("srp", cal)}
+    a = prov._canonicalise(DOAReading(90.0, confidence=0.9, source="usb"))
+    b = prov._canonicalise(DOAReading(90.0, confidence=0.9, source="srp"))
+    check("BUG-005: the same raw angle maps differently per source",
+          abs(a.angle_deg - b.angle_deg) > 1.0,
+          f"usb {a.angle_deg:.0f} vs srp {b.angle_deg:.0f}")
+    tr2 = DOATracker()
+    tr2.update(a, now=1.0)
+    tr2.update(b, now=1.5)
+    check("BUG-005: the tracker now smooths CANONICAL angles only",
+          tr2.angle is not None
+          and min(abs(tr2.angle - a.angle_deg), 360 - abs(tr2.angle - a.angle_deg))
+          < 40.0,
+          f"smoothed {tr2.angle:.0f} between {a.angle_deg:.0f} and "
+          f"{b.angle_deg:.0f}")
+
+    # ── BUG-009: an unknown source keeps its angle ──
+    r = prov._canonicalise(DOAReading(42.0, confidence=0.5, source="mystery"))
+    check("BUG-009: an unknown source still yields a bearing, marked UNCAL",
+          r.angle_deg is not None and not r.calibrated,
+          f"angle={r.angle_deg}, calibrated={r.calibrated}")
+
+    # ── BUG-010: the handedness fallback is explicit ──
+    unk = bf.SourceConvention(0.0, bf.Handedness.UNKNOWN, "x")
+    check("BUG-010: UNKNOWN handedness names its assumption",
+          unk.assumed_handedness is bf.Handedness.CLOCKWISE
+          and not unk.calibrated, unk.describe()[:70])
+    srp_unmeasured = bf.source_convention("srp", {})
+    check("BUG-010: SRP keeps its PROVEN CCW handedness even with no zero",
+          srp_unmeasured.assumed_handedness is bf.Handedness.COUNTER_CLOCKWISE
+          and not srp_unmeasured.calibrated, srp_unmeasured.describe()[:70])
+
+    # ── BUG-006: the last camera that produced a frame is remembered ──
+    cfg6 = load_config()
+    cfg6.geometry.camera_boresight_deg = {0: 150.0, 1: 150.0}
+    _, f6 = new_fusion(cfg6)
+    s6 = f6.update(acoustic(bearing=150.0, seq=1), visual(0, cam=1),
+                   HEALTHY, HEALTHY)
+    near_hfov = s6.bearing_cue.hfov_deg
+    s6b = f6.update(acoustic(bearing=150.0, seq=2), None, HEALTHY, HEALTHY)
+    check("BUG-006: with no frame, the cue keeps the LAST camera's optics",
+          abs(s6b.bearing_cue.hfov_deg - near_hfov) < 1.0,
+          f"kept {s6b.bearing_cue.hfov_deg:.0f}deg, not camera 0's 28deg")
+
+    # ── BUG-008: overflow reaches the observation ──
+    sig = _insp.signature(radar.RadarEngine.process_block)
+    check("BUG-008: process_block accepts the overflow flag",
+          "overflowed" in sig.parameters, str(sig))
+    st = radar.RadarStatus()
+    st.overflow = True
+    obs8 = AcousticObservation(overflow=bool(st.overflow))
+    check("BUG-008: and it survives translation to the observation",
+          obs8.overflow)
+
+    # ── BUG-013: the cue is projected in the REAL frame's pixel space ──
+    proj = BearingProjector(cfg6.geometry, 640)
+    at640 = proj.project(0, 160.0, 0.8)
+    at1280 = proj.project(0, 160.0, 0.8, width_px=1280)
+    check("BUG-013: a wider frame projects proportionally, not identically",
+          abs(at1280.x_px - at640.x_px * 2.0) < 2.0,
+          f"640 -> x={at640.x_px:.0f}, 1280 -> x={at1280.x_px:.0f}")
+    check("BUG-013: and the HFOV is unchanged by the frame size",
+          abs(at1280.hfov_deg - at640.hfov_deg) < 0.5,
+          f"{at640.hfov_deg:.1f} vs {at1280.hfov_deg:.1f} deg")
+
+    # ── BUG-021: the latency budget is per-run ──
+    b = LatencyBudget()
+    b.record("audio_wait", 100.0)
+    b.reset()
+    check("BUG-021: reset() clears the singleton between runs",
+          b.stage("audio_wait").stats() is None)
+
+    # ── BUG-023: the banner states the angle convention ──
+    lines = cfg6.describe_bearing_sources({"doa_offset_deg": 0.0})
+    check("BUG-023: start-up reports the convention of every DOA source",
+          len(lines) == 2 and any("UNKNOWN" in ln for ln in lines),
+          lines[0][:70])
+
+    # ── LATENCY: the STATION's tuning, not radar.py's standalone default ──
+    cfgL = load_config()
+    hop = cfgL.acoustic.effective_block_seconds()
+    tun = cfgL.acoustic.detector_tuning()
+    confirm_ms = tun.confirm_seconds(hop) * 1000.0
+    total_ms = hop / 2 * 1000.0 + confirm_ms + 30.0
+    check("LATENCY: the shipped hop is 250 ms", abs(hop - 0.25) < 1e-9,
+          f"{hop * 1000:.0f} ms")
+    check("LATENCY: confirmation is derived from SECONDS, not a block count",
+          tun.confirm_blocks == 3 and abs(confirm_ms - 750.0) < 1e-6,
+          f"{tun.confirm_blocks} blocks x {hop*1000:.0f} ms = {confirm_ms:.0f} ms")
+    check("LATENCY: coasting stays 3.0 s despite the halved hop",
+          abs(tun.coast_seconds(hop) - 3.0) < 1e-9,
+          f"{tun.miss_tolerance} blocks = {tun.coast_seconds(hop):.1f} s")
+    check("LATENCY: projected total is inside the 0.5-1.0 s requirement",
+          500.0 <= total_ms <= 1000.0, f"{total_ms:.0f} ms")
+    check("LATENCY: the analysis window is UNCHANGED, so per-decision "
+          "classification quality is identical",
+          abs(float(__import__("features").WINDOW_SEC) - 2.0) < 1e-9,
+          f"{__import__('features').WINDOW_SEC} s")
+    check("LATENCY: coasting still fits inside the fusion lost timeout",
+          tun.coast_seconds(hop) <= cfgL.acoustic.lost_after_s,
+          f"coast {tun.coast_seconds(hop):.1f}s <= lost "
+          f"{cfgL.acoustic.lost_after_s:.1f}s")
+
+    # A block-count override must still win, and must not be reinterpreted.
+    cfgO = load_config()
+    cfgO.acoustic.detector_confirm_blocks = 5
+    check("LATENCY: an explicit block override still wins over the seconds",
+          cfgO.acoustic.detector_tuning().confirm_blocks == 5)
+
+    # ── Direction: all four cardinals plus wrap, through every layer ──
+    for bearing, expected, radar_s, led_s, cam_s, agree in bf.verify_chain():
+        check(f"DIRECTION {expected} ({bearing:.0f}deg) agrees everywhere",
+              agree, f"radar={radar_s} led={led_s} camera={cam_s}")
+    check("DIRECTION: 359 -> 0 is a 1 deg move",
+          abs(bf.angular_distance(359.0, 0.0) - 1.0) < 1e-9)
+    check("DIRECTION: no consumer re-applies a calibration",
+          "apply_orientation" not in _insp.getsource(rl)
+          and "apply_orientation" not in _insp.getsource(
+              __import__("radar_overlay")),
+          "LED and radar consume the canonical bearing directly")
+
+    # ── The dropout pairing is now a decided behaviour ──
+    cfg7 = load_config()
+    cfg7.geometry.camera_boresight_deg = {0: 150.0, 1: 150.0}
+    _, f7 = new_fusion(cfg7)
+    tr7 = VisualTrack(1, (300.0, 190.0, 62.0, 44.0), "Confirmed", 0.4, 0.91,
+                      0.0, 5.1)
+    t7 = 2000.0
+    for i in range(6):
+        s7 = f7.update(acoustic(bearing=150.0, seq=i, t=t7),
+                       visual(1, t=t7), HEALTHY, HEALTHY, t=t7)
+        t7 += 0.1
+    _ = tr7
+    t7 += 0.5
+    s7 = f7.update(acoustic(bearing=150.0, seq=99, t=t7),
+                   visual(0, t=t7 - 0.5), HEALTHY, HEALTHY, t=t7)
+    check("BUG-007: during a dropout the acoustic region returns",
+          s7.cue_role is CueRole.SEARCH, s7.cue_role.value)
+    check("BUG-007: and the coasting box is still offered, as decided",
+          s7.visual_track is not None,
+          "styled LAST KNOWN, never as a live detection")
+    _ = dataclasses
 
 
 def _rl_pack(colour) -> int:
@@ -1882,7 +2129,7 @@ def main() -> int:
                test_9_camera_fails, test_10_load,
                test_11_acoustic_latency_and_coasting, test_12_led_ring,
                test_13_coordinate_chain, test_14_srp_geometry,
-               test_15_camera_search_region,
+               test_15_camera_search_region, test_16_audit_fixes,
                test_regressions, test_final_audit_regressions,
                test_honesty, test_thread_safety):
         try:

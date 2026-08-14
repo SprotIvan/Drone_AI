@@ -62,7 +62,7 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -78,13 +78,23 @@ SPEED_OF_SOUND = 343.0   # м/с при +20 °C
 
 @dataclass
 class DOAReading:
-    """Одне вимірювання напрямку."""
+    """
+    Одне вимірювання напрямку.
+
+    ⚠️ `angle_deg` після DOAProvider._canonicalise() уже КАНОНІЧНИЙ
+    (bearing_frame). До нього — сирий кут джерела. Ці два стани розрізняються
+    полем `calibrated`/`convention`, які заповнює саме канонізація.
+    """
     angle_deg: float | None      # None = напрямок невідомий
     confidence: float = 0.0      # 0..1
     source: str = "none"         # "usb" | "srp" | "none"
     ambiguous: bool = False      # True = можлива дзеркальна неоднозначність
     raw: list[float] = field(default_factory=list)
     error: str | None = None
+    #: Конвенцію джерела виміряно повністю (і нуль, і напрямок обертання).
+    calibrated: bool = False
+    #: Людський опис конвенції — показується, коли вона неповна.
+    convention: str = ""
 
     @property
     def ok(self) -> bool:
@@ -415,7 +425,14 @@ class HardwareDOA:
             reading = self._query_once()
             with self._lock:
                 self._reading = reading
-                self._stamp = time.time()
+                # ⚠️ BUG-004: monotonic, never wall clock. A Raspberry Pi has
+                # no battery-backed RTC and steps its clock when NTP first
+                # syncs after boot, often by hours. With time.time() a
+                # forward step made every cached azimuth look older than
+                # max_age, silently dropping the array to the SRP fallback
+                # while it was answering normally; a backward step served
+                # arbitrarily stale azimuths as fresh.
+                self._stamp = time.monotonic()
             if reading.error and reading.error != self._reported_error:
                 # Друкуємо кожну НОВУ помилку рівно один раз —
                 # мовчазний провал і був причиною сталого кута 90°.
@@ -461,7 +478,7 @@ class HardwareDOA:
     def read(self, max_age: float = 2.0) -> DOAReading:
         with self._lock:
             reading, stamp = self._reading, self._stamp
-        if reading.ok and time.time() - stamp > max_age:
+        if reading.ok and time.monotonic() - stamp > max_age:
             return DOAReading(None, error="дані застаріли")
         return reading
 
@@ -685,6 +702,11 @@ class DOATracker:
         self.confidence = 0.0
         self.ambiguous = False
         self.source = "none"
+        #: Provenance of the readings currently in the history. The tracker
+        #: now smooths CANONICAL angles only (see DOAProvider._canonicalise),
+        #: so these describe the frame the smoothed angle is already in.
+        self.calibrated = False
+        self.convention = ""
 
     def reset(self) -> None:
         self._history.clear()
@@ -692,9 +714,17 @@ class DOATracker:
         self.angle = None
         self.confidence = 0.0
         self.source = "none"
+        self.calibrated = False
+        self.convention = ""
 
     def update(self, reading: DOAReading, now: float | None = None) -> None:
-        now = time.time() if now is None else now
+        # ⚠️ BUG-003: monotonic by default. This value is only ever used as
+        # `now - self._last_update` against RELEASE_SEC, i.e. a DURATION, and
+        # target_state.py states the project rule: wall clock can jump, and a
+        # backward jump makes the difference negative so the release never
+        # fires and a dead track is held for ever. Callers may still inject a
+        # clock for deterministic tests.
+        now = time.monotonic() if now is None else now
 
         if not reading.ok or reading.confidence <= 0.0:
             # Немає даних — упевненість повільно згасає
@@ -705,6 +735,8 @@ class DOATracker:
         angle = float(reading.angle_deg)
         self.ambiguous = reading.ambiguous
         self.source = reading.source
+        self.calibrated = reading.calibrated
+        self.convention = reading.convention
 
         if self.angle is None:
             self._accept(angle, reading.confidence, now)
@@ -829,35 +861,81 @@ class DOAProvider:
             elif reading.ok:
                 self._degenerate_streak = 0
 
-        self.tracker.update(reading)
-        self.canonical = self._to_canonical(reading)
-        return reading
+        # ⚠️ BUG-005. КАНОНІЗАЦІЯ ВІДБУВАЄТЬСЯ **ДО** ЗГЛАДЖУВАННЯ.
+        #
+        # Раніше трекер згладжував СИРІ кути, а конвенція застосовувалась до
+        # результату — і бралась та, чиє джерело відповіло останнім. Оскільки
+        # update() перемикається між USB і SRP-PHAT поблочно, у одному
+        # циркулярному середньому опинялись кути у ДВОХ різних системах
+        # координат, а потім до цієї суміші застосовувалась одна конвенція.
+        # Виправити такий пеленг неможливо жодним калібруванням.
+        #
+        # Тепер кожен вимір переводиться у канонічний кадр СВОЄЮ конвенцією
+        # одразу, і трекер згладжує вже однорідні числа. Побічний ефект:
+        # перемикання джерела більше не рухає трек стрибком.
+        canonical_reading = self._canonicalise(reading)
+        self.tracker.update(canonical_reading)
+        self.canonical = self._to_canonical(canonical_reading)
+        return canonical_reading
+
+    def _canonicalise(self, reading: DOAReading) -> DOAReading:
+        """
+        Один сирий вимір → той самий вимір у КАНОНІЧНОМУ кадрі.
+
+        Єдине місце, де застосовується конвенція джерела.
+        """
+        if not reading.ok:
+            return reading
+
+        conv = self.conventions.get(reading.source)
+        if conv is None:
+            # ⚠️ BUG-009. Невідоме джерело раніше означало «викинути кут».
+            # Кут при цьому був цілком дійсним — невідомою була лише його
+            # конвенція. Тепер він проходить далі як НЕКАЛІБРОВАНИЙ: краще
+            # показати напрямок і сказати, що його система координат
+            # невідома, ніж мовчки не показати нічого.
+            conv = source_convention(reading.source, {})
+            self.conventions[reading.source] = conv
+            print(f"\n⚠️  DOA: невідоме джерело «{reading.source}» — "
+                  f"кут показується як НЕКАЛІБРОВАНИЙ")
+
+        return replace(reading,
+                       angle_deg=conv.to_canonical(reading.angle_deg),
+                       calibrated=conv.calibrated,
+                       convention=conv.describe())
 
     def _to_canonical(self, reading: DOAReading) -> CanonicalBearing:
         """
-        Згладжений кут трекера → канонічний пеленг.
+        Згладжений (уже канонічний) кут трекера → CanonicalBearing.
 
-        ЄДИНЕ місце, де сира конвенція джерела перетворюється на спільну.
-        Перетворення застосовується РІВНО ОДИН РАЗ і саме тут; далі радар,
-        LED і камера виконують лише власні вихідні перетворення.
+        Тут перетворень більше НЕМАЄ — тільки пакування. Радар, LED і
+        камера далі виконують лише власні вихідні перетворення.
         """
         if self.tracker.angle is None:
             return CanonicalBearing(reason="напрямок не виміряно")
 
-        source = self.tracker.source or reading.source or "none"
-        conv = self.conventions.get(source)
-        if conv is None:
-            return CanonicalBearing(
-                confidence=self.tracker.confidence, source=source,
-                reason=f"невідоме джерело «{source}»")
-
         return CanonicalBearing(
-            deg=conv.to_canonical(self.tracker.angle),
+            deg=self.tracker.angle,
             confidence=self.tracker.confidence,
-            source=source,
-            calibrated=conv.calibrated,
+            source=self.tracker.source or reading.source or "none",
+            calibrated=self.tracker.calibrated,
             ambiguous=self.tracker.ambiguous or reading.ambiguous,
-            reason="" if conv.calibrated else conv.describe())
+            reason="" if self.tracker.calibrated else self.tracker.convention)
+
+    def hold(self) -> CanonicalBearing:
+        """
+        Один блок БЕЗ вимірювання: трек лише старіє.
+
+        ⚠️ BUG-019. Раніше radar.py робив це вручну, викликаючи приватний
+        `_to_canonical` і сам присвоюючи `canonical` — тобто зовнішній
+        модуль тримав у руках внутрішній інваріант цього класу. Тепер
+        «блок без виміру» є частиною ПУБЛІЧНОГО контракту провайдера,
+        поруч з update(), і обидва шляхи оновлюють стан однаково.
+        """
+        empty = DOAReading(None)
+        self.tracker.update(empty)
+        self.canonical = self._to_canonical(empty)
+        return self.canonical
 
     def stop(self) -> None:
         self.hardware.stop()

@@ -139,6 +139,23 @@ class LatencyBudget:
         if self.enabled:
             self.stage(name).add(value_ms)
 
+    def reset(self) -> None:
+        """
+        Forget every sample.
+
+        ⚠️ BUG-021. BUDGET is a module-level singleton so the audio, UI and
+        LED threads can all reach it without threading it through every
+        constructor. That also means a second Station in the same process
+        (which the test suite creates) would report statistics blended with
+        the first one's. The Station clears it at start-up so each run
+        reports its own numbers.
+        """
+        with self._lock:
+            self._stages.clear()
+        self.block_sec = None
+        self.confirm_blocks = None
+        self.window_sec = None
+
     def describe_config(self, block_sec: float, confirm_blocks: int,
                         window_sec: float) -> None:
         self.block_sec = block_sec
