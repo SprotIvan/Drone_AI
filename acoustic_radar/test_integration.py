@@ -668,8 +668,16 @@ def test_regressions():
     check("V1: the original 3-argument call still works unchanged",
           bool(c2) and c2[0].last_detection_score is None)
 
-    # Bearing cue must refuse to guess
+    # Bearing cue must refuse to guess.
+    #
+    # ⚠️ TEST ISOLATION. This used to call load_config() and assume the
+    # boresight would be None — i.e. it asserted a property of the code by
+    # relying on a config file NOT existing on disk. The repository now
+    # ships a fusion_config.json with a boresight set, and the test began
+    # failing for a reason that had nothing to do with the behaviour it
+    # checks. The uncalibrated state is now constructed explicitly.
     cfg = load_config()
+    cfg.geometry.camera_boresight_deg = {0: None, 1: None}
     proj = BearingProjector(cfg.geometry, 640)
     cue = proj.project(0, 142.0, 0.9)
     check("G1: bearing->pixel refuses without mount calibration",
@@ -1944,6 +1952,156 @@ def test_16_audit_fixes():
     _ = dataclasses
 
 
+def test_17_web_server():
+    header("TEST 17 — FastAPI/MJPEG viewer (no camera, no Hailo)")
+    import json as _json
+    import threading as _th
+    import urllib.request as _url
+
+    try:
+        import fastapi  # noqa: F401
+        import uvicorn  # noqa: F401
+    except ImportError as exc:
+        check("web dependencies present", False,
+              f"{exc} — run: pip install fastapi uvicorn")
+        return
+
+    import web_server as ws
+
+    # ── The viewer must never touch a sensor ──
+    import inspect as _insp
+
+    # Search the CODE, not the prose: the module docstring legitimately
+    # explains why it does not open a second Hailo VDevice.
+    src = _insp.getsource(ws)
+    code = "\n".join(ln for ln in src.splitlines()
+                     if not ln.lstrip().startswith("#"))
+    if ws.__doc__:
+        code = code.replace(ws.__doc__, "")
+    for forbidden, why in (("Picamera2(", "would open a second camera"),
+                           ("VDevice(", "would open a second Hailo device"),
+                           ("HailoInference(", "would run its own inference"),
+                           ("import flask", "Flask is explicitly excluded")):
+        check(f"web_server never calls {forbidden} ({why})",
+              forbidden not in code)
+
+    srv = ws.WebServer(port=5099)
+    srv.set_status_provider(lambda: {"state": "TEST", "detections": 3})
+    started = srv.start()
+    check("the server starts and binds its port", started, srv.error or "")
+    if not started:
+        return
+
+    stop = _th.Event()
+    published = [0]
+
+    def feed():
+        frame = np.zeros((120, 160, 3), dtype=np.uint8)
+        v = 0
+        while not stop.is_set():
+            v = (v + 9) % 250
+            frame[:] = v
+            srv.publish(frame)
+            srv.note_inference()
+            published[0] += 1
+            time.sleep(1.0 / 60.0)
+
+    _th.Thread(target=feed, daemon=True).start()
+    time.sleep(0.5)
+
+    base = "http://127.0.0.1:5099"
+    page = _url.urlopen(base + "/", timeout=5)
+    body = page.read().decode("utf-8", "replace")
+    check("GET / returns the dashboard", page.status == 200
+          and "/video_feed" in body, f"HTTP {page.status}")
+    check("the page uses a plain <img>, not a JS video player",
+          '<img src="/video_feed"' in body and "MediaSource" not in body)
+
+    resp = _url.urlopen(base + "/video_feed", timeout=5)
+    ctype = resp.headers.get("Content-Type", "")
+    check("GET /video_feed is a multipart MJPEG stream",
+          ctype.startswith("multipart/x-mixed-replace")
+          and "boundary=frame" in ctype, ctype)
+
+    # ── Real frames, at the pipeline's rate — no artificial cap ──
+    t0 = time.monotonic()
+    buf = b""
+    while buf.count(b"--frame") < 25 and time.monotonic() - t0 < 6.0:
+        chunk = resp.read(4096)
+        if not chunk:
+            break
+        buf += chunk
+    elapsed = time.monotonic() - t0
+    parts = buf.count(b"--frame")
+    rate = parts / elapsed if elapsed > 0 else 0.0
+    check("the stream carries real JPEG frames", b"\xff\xd8\xff" in buf,
+          f"{parts} parts")
+    check("the stream is NOT capped at 20/30 fps", rate > 31.0,
+          f"{rate:.1f} fps delivered against a 60 fps source")
+    resp.close()
+
+    # ── Four separate MEASURED rates ──
+    time.sleep(0.4)
+    st = _json.loads(_url.urlopen(base + "/status", timeout=5).read())
+    for key in ("camera_fps", "hailo_fps", "jpeg_fps", "mjpeg_fps"):
+        check(f"/status reports {key} separately", key in st,
+              f"{st.get(key)}")
+    check("hailo_fps is measured, not copied from camera_fps",
+          st["hailo_fps"] > 0.0 and st["hailo_fps"] != st["camera_fps"],
+          f"hailo {st['hailo_fps']:.1f} vs camera {st['camera_fps']:.1f}")
+    check("the status provider's fields reach the dashboard",
+          st.get("state") == "TEST" and st.get("detections") == 3)
+
+    # ── One encode per frame, however many clients ──
+    solo = st["jpeg_fps"]
+
+    def watch(seconds):
+        r = _url.urlopen(base + "/video_feed", timeout=5)
+        t = time.monotonic()
+        while time.monotonic() - t < seconds:
+            if not r.read(8192):
+                break
+        r.close()
+
+    threads = [_th.Thread(target=watch, args=(2.5,), daemon=True)
+               for _ in range(3)]
+    for t in threads:
+        t.start()
+    time.sleep(1.6)
+    multi = _json.loads(_url.urlopen(base + "/status", timeout=5).read())
+    check("three clients share ONE encode per frame",
+          multi["jpeg_fps"] < solo * 2.0,
+          f"{solo:.0f} fps solo -> {multi['jpeg_fps']:.0f} fps with "
+          f"{multi['clients']} clients (a per-client encode would be ~3x)")
+    check("every client is counted", multi["clients"] == 3,
+          str(multi["clients"]))
+    for t in threads:
+        t.join(timeout=5)
+
+    # ── Latest-frame, not a backlog ──
+    check("the bus holds exactly one frame, never a queue",
+          not hasattr(srv.bus, "queue") and "Queue" not in _insp.getsource(
+              ws.FrameBus))
+
+    # ── Shutdown must not hang on a live stream ──
+    stop.set()
+    t0 = time.monotonic()
+    srv.stop(timeout=3.0)
+    shutdown_s = time.monotonic() - t0
+    check("shutdown completes promptly even with clients attached",
+          shutdown_s < 3.0 and not srv.running, f"{shutdown_s:.2f}s")
+
+    # ── The station wiring: one render, two consumers ──
+    import main as _main
+
+    run_src = _insp.getsource(_main.Station.run)
+    check("the station renders ONCE and feeds both window and web",
+          run_src.count("self.hud.render(") == 1
+          and "self.web.publish(frame)" in run_src)
+    check("the web view renders even when the local window is disabled",
+          "if not self.headless or self.web is not None:" in run_src)
+
+
 def _rl_pack(colour) -> int:
     """The 0xRRGGBB packing the controller uses, for asserting on writes."""
     r, g, b = colour
@@ -2130,6 +2288,7 @@ def main() -> int:
                test_11_acoustic_latency_and_coasting, test_12_led_ring,
                test_13_coordinate_chain, test_14_srp_geometry,
                test_15_camera_search_region, test_16_audit_fixes,
+               test_17_web_server,
                test_regressions, test_final_audit_regressions,
                test_honesty, test_thread_safety):
         try:

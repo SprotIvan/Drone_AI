@@ -80,6 +80,7 @@ from hud import HUD  # noqa: E402
 from respeaker_led import RespeakerLed, frame_for_target  # noqa: E402
 from sensor_fusion import SensorFusion, SystemState  # noqa: E402
 from station_logging import EventLogger  # noqa: E402
+from web_server import WebServer  # noqa: E402
 from target_state import SubsystemHealth, SubsystemState, now  # noqa: E402
 
 DEFAULT_HEF = str(BASE_DIR / "bestty_yolo260508.hef")
@@ -162,11 +163,18 @@ class Station:
     def __init__(self, config: fusion_config.StationConfig, hef_path: str,
                  events: EventLogger, headless: bool = False,
                  no_audio: bool = False, no_camera: bool = False,
-                 no_led: bool = False):
+                 no_led: bool = False,
+                 web: Optional["WebServer"] = None):
         self.config = config
         self.events = events
         self.headless = headless
         self.running = True
+
+        #: Optional local web view. It is a VIEWER: it receives the frame
+        #: this loop has already composed and never touches the camera, the
+        #: Hailo device or any sensor. None = not requested.
+        self.web = web
+        self._last_web_visual_seq = -1
 
         self.projector = BearingProjector(config.geometry,
                                           config.visual.frame_width)
@@ -193,6 +201,8 @@ class Station:
 
         #: Deterministic test mode — see --inject-bearing. None = normal.
         self.inject_bearing: Optional[float] = None
+        #: Newest fused snapshot, for the web dashboard to report.
+        self.fusion_snapshot = None
         self._inject_seq = 0
 
         self._ui_dt = 1.0 / max(config.ui.max_ui_fps, 1.0)
@@ -218,12 +228,16 @@ class Station:
         # Started last and never waited on: the ring is an indicator, and
         # an indicator must not be able to delay the sensors it indicates.
         self.led.start()
+        if self.web is not None:
+            self.web.set_status_provider(self._web_status)
 
     def stop(self) -> None:
         self.running = False
 
     def shutdown(self) -> None:
         log.info("shutting down...")
+        if self.web is not None:
+            self.web.stop(timeout=3.0)
         # The ring is stopped FIRST so it is restored to a safe state while
         # the process is still healthy. A ring left showing a red target
         # after the station exited would be actively misleading.
@@ -322,6 +336,30 @@ class Station:
             bearing_confidence=1.0, bearing_source="injected",
             bearing_calibrated=True,
             timestamp=now(), seq=self._inject_seq)
+
+    def _web_status(self) -> dict:
+        """
+        Dashboard payload. Read-only: it reports what the station already
+        knows and computes nothing of its own, so a browser polling it can
+        never influence detection.
+        """
+        target = self.fusion_snapshot
+        visual = target.visual if target is not None else None
+        acoustic = target.acoustic if target is not None else None
+        led_state = self._led_lamp_state()
+        return {
+            "camera_fps": float(visual.loop_fps) if visual else 0.0,
+            "hailo": ("ONLINE" if visual is not None
+                      and visual.inference_ms is not None else
+                      self._visual_health().state.value),
+            "camera_health": self._visual_health().state.value,
+            "acoustic_health": self._acoustic_health().state.value,
+            "led": (led_state.value if led_state is not None else "DISABLED"),
+            "state": target.state.label if target is not None else "-",
+            "detections": (len(visual.tracks) if visual is not None else 0),
+            "bearing": (acoustic.bearing_text()
+                        if acoustic is not None else "N/A"),
+        }
 
     def _led_lamp_state(self) -> Optional[SubsystemState]:
         """
@@ -451,12 +489,26 @@ class Station:
                 # and submit() is a single publish into a one-slot mailbox
                 # (all device I/O happens on the LED worker thread).
                 self.led.submit(frame_for_target(target))
+                self.fusion_snapshot = target
 
                 if target.state is not last_state:
                     self._announce(target, last_state)
                     last_state = target.state
 
-                if not self.headless:
+                # Count Hailo/YOLO invocations, not camera frames: the
+                # detector is duty-cycled (visual.frame_skip), so the two
+                # rates are genuinely different numbers and the dashboard
+                # reports them separately.
+                if (self.web is not None and visual_obs is not None
+                        and visual_obs.seq != self._last_web_visual_seq):
+                    self._last_web_visual_seq = visual_obs.seq
+                    if visual_obs.detector_ran:
+                        self.web.note_inference()
+
+                # The frame is composed ONCE and reused by both consumers.
+                # The web view is the station's own display, not a second
+                # rendering path.
+                if not self.headless or self.web is not None:
                     # The FPS shown is the CAMERA pipeline rate — the number
                     # the original application displayed and the one that
                     # actually matters for detection. The UI's own refresh
@@ -469,7 +521,10 @@ class Station:
                         ui_fps=self._ui_fps, led_state=self._led_lamp_state())
                     BUDGET.record("hud_render",
                                   (time.monotonic() - _t_render) * 1000.0)
-                    cv2.imshow(window, frame)
+                    if not self.headless:
+                        cv2.imshow(window, frame)
+                    if self.web is not None:
+                        self.web.publish(frame)
 
                 inst = 1.0 / max(since_render, 1e-6)
                 self._ui_fps = (0.9 * self._ui_fps + 0.1 * inst
@@ -588,6 +643,19 @@ def main(argv: Optional[list] = None) -> int:
                         help="run without the camera subsystem")
     parser.add_argument("--no-led", action="store_true",
                         help="run without the ReSpeaker LED ring indicator")
+    parser.add_argument("--web", action="store_true",
+                        help="serve the station's display over HTTP as an "
+                             "MJPEG stream (FastAPI + uvicorn). The web view "
+                             "is the SAME composed frame the local window "
+                             "shows — no second camera, no second inference.")
+    parser.add_argument("--web-port", type=int, default=5000,
+                        help="TCP port for the web interface (default 5000)")
+    parser.add_argument("--web-host", default="0.0.0.0",
+                        help="bind address (default 0.0.0.0 — all "
+                             "interfaces, so the Ethernet link reaches it)")
+    parser.add_argument("--web-quality", type=int, default=80,
+                        metavar="1-100",
+                        help="JPEG quality for the MJPEG stream (default 80)")
     parser.add_argument("--inject-bearing", type=float, default=None,
                         metavar="DEG",
                         help="DETERMINISTIC TEST MODE: ignore the microphone "
@@ -617,9 +685,20 @@ def main(argv: Optional[list] = None) -> int:
 
     print_banner(config, args.hef)
 
+    web = None
+    if args.web:
+        web = WebServer(host=args.web_host, port=args.web_port,
+                        jpeg_quality=max(1, min(100, args.web_quality)))
+        if not web.start():
+            # A web-server failure must not take the detector down. Say so
+            # loudly and keep going without it.
+            log.error("web interface disabled: %s", web.error)
+            web = None
+
     station = Station(config, args.hef, events, headless=args.headless,
                       no_audio=args.no_audio or args.inject_bearing is not None,
-                      no_camera=args.no_camera, no_led=args.no_led)
+                      no_camera=args.no_camera, no_led=args.no_led,
+                      web=web)
     station.inject_bearing = args.inject_bearing
     if args.inject_bearing is not None:
         log.warning("TEST MODE: injecting a fixed canonical bearing of "

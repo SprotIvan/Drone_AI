@@ -26,6 +26,12 @@ sounddevice>=0.4.6
 pyserial>=3.5
 pygame-ce>=2.3.0         # лише для radar_gui.py
 
+# ── Опційно: локальний веб-інтерфейс (main.py --web) ──
+# MJPEG-трансляція вже готового кадру станції по HTTP. Другої камери і
+# другого Hailo не створює — див. web_server.py.
+fastapi>=0.110.0
+uvicorn>=0.27.0
+
 # ── Опційно: апаратний DOA від ReSpeaker XVF3800 ──
 # pyusb потрібен утиліті xvf_host.py від Seeed, а не цьому проєкту.
 pyusb>=1.2.1
