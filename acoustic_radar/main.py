@@ -92,10 +92,49 @@ log = logging.getLogger("station.main")
 #  Startup banner
 # ═══════════════════════════════════════════════════════════════
 
+def code_version() -> str:
+    """
+    Which revision of this code is actually running.
+
+    ⚠️ THIS EXISTS BECAUSE A `git pull` CAN SILENTLY DO NOTHING.
+
+    If any tracked file has uncommitted local edits — a hand-tuned
+    radar_calibration.json is the obvious one on a deployed Pi — git aborts
+    the ENTIRE merge rather than half-applying it. Every other file,
+    main.py included, stays at the old revision, and the only symptom is a
+    feature that "was not implemented": argparse rejecting a flag that
+    exists in the repository.
+
+    Printing the revision at start-up turns that into a one-glance check:
+    if the hash did not change after a pull, the pull did not land.
+    """
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(BASE_DIR), "log", "-1",
+             "--format=%h %cd", "--date=format:%Y-%m-%d %H:%M"],
+            capture_output=True, text=True, timeout=3.0)
+        if out.returncode == 0 and out.stdout.strip():
+            dirty = subprocess.run(
+                ["git", "-C", str(BASE_DIR), "status", "--porcelain"],
+                capture_output=True, text=True, timeout=3.0)
+            suffix = ""
+            if dirty.returncode == 0 and dirty.stdout.strip():
+                n = len(dirty.stdout.strip().splitlines())
+                suffix = (f"  [{n} file(s) modified locally — a `git pull` "
+                          f"will REFUSE to merge until they are resolved]")
+            return out.stdout.strip() + suffix
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.debug("could not read the git revision: %s", exc)
+    return "unknown (not a git checkout)"
+
+
 def print_banner(config: fusion_config.StationConfig, hef_path: str) -> None:
     log.info("=" * 62)
     log.info("DRONE DETECTION STATION — acoustic + visual sensor fusion")
     log.info("=" * 62)
+    log.info("  code version: %s", code_version())
 
     for line in config.describe_calibration():
         log.info("  %s", line)
