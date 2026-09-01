@@ -420,7 +420,7 @@ def cmd_doa(cfg: dict, seconds: float) -> None:
     # SourceConvention, яку станція застосовує під час роботи. Раніше тут
     # розвʼязувалась модель doa.apply_orientation, а застосовувалась інша —
     # калібрування, розвʼязане не для тієї моделі, хибне за побудовою.
-    best = None
+    fits: dict[Handedness, tuple[SourceConvention, float]] = {}
     for hand in (Handedness.CLOCKWISE, Handedness.COUNTER_CLOCKWISE):
         zeros = [(true - (-meas if hand is Handedness.COUNTER_CLOCKWISE
                           else meas)) % 360.0 for true, meas in points]
@@ -428,24 +428,53 @@ def cmd_doa(cfg: dict, seconds: float) -> None:
         conv = SourceConvention(zero, hand, source)
         residual = sum(angular_distance(conv.to_canonical(meas), true)
                        for true, meas in points) / len(points)
-        if best is None or residual < best[1]:
-            best = (conv, residual)
+        fits[hand] = (conv, residual)
 
-    conv, residual = best
-    print(f"\n   {conv.describe()}")
+    conv, residual = min(fits.values(), key=lambda f: f[1])
+
+    # ⚠️ ЧИ ВЗАГАЛІ ЦІ ДАНІ РОЗРІЗНЯЮТЬ НАПРЯМОК ОБЕРТАННЯ?
+    #
+    # Раніше тут стояло суворе `<` по residual, і переможець мовчки
+    # діставався тій гіпотезі, яку перевіряли ПЕРШОЮ — CLOCKWISE. З однією
+    # точкою обидві гіпотези дають residual рівно 0.0 (перевірено: true=90
+    # meas=30 → CW 0.0, CCW 0.0), тобто напрямок обертання не вимірювався
+    # взагалі — його визначав порядок циклу. Далі `doa_handedness: "CW"`
+    # записувався у файл, `bearing_frame` бачив непорожній ключ і оголошував
+    # джерело ПОВНІСТЮ КАЛІБРОВАНИМ, після чого зникали і «UNCAL» на радарі,
+    # і «BEARING UNVERIFIED» у HUD. Оператор отримував рівно ту саму
+    # дзеркальність, що й без калібрування, але вже без жодного попередження.
+    #
+    # Нічия між гіпотезами тепер називається нічиєю. Зсув усе одно
+    # зберігається — він виміряний; напрямок обертання не зберігається,
+    # тому джерело чесно лишається некаліброваним.
+    spread = abs(fits[Handedness.CLOCKWISE][1]
+                 - fits[Handedness.COUNTER_CLOCKWISE][1])
+    handedness_resolved = spread > 1.0
+
+    print(f"\n   CW  residual: {fits[Handedness.CLOCKWISE][1]:6.1f}°")
+    print(f"   CCW residual: {fits[Handedness.COUNTER_CLOCKWISE][1]:6.1f}°")
     print(f"   Середня похибка після корекції: {residual:.1f}°")
 
-    if len(points) == 1:
-        print("   ⚠️  ОДНА ТОЧКА НЕ ВИЗНАЧАЄ НАПРЯМОК ОБЕРТАННЯ.")
-        print("      Зсув і дзеркальність — два незалежні параметри. Одна")
-        print("      точка задає лише зсув, і результат буде правильним")
-        print("      РІВНО там, де ви міряли, а за чверть оберту — на 180°")
-        print("      хибним. Саме так виглядає «ціль на заході, а стрілка")
-        print("      іноді на сході». Зробіть другий вимір, краще ~90° від")
-        print("      першого.")
+    if not handedness_resolved:
+        print("\n   ⚠️  ЦІ ТОЧКИ НЕ ВИЗНАЧАЮТЬ НАПРЯМОК ОБЕРТАННЯ.")
+        print("      Обидві гіпотези описують ваші виміри однаково добре")
+        print(f"      (різниця {spread:.1f}°), тому обрати між ними —")
+        print("      підкинути монетку. Зсув і дзеркальність — два")
+        print("      НЕЗАЛЕЖНІ параметри: зсув правильний РІВНО там, де ви")
+        print("      міряли, а за чверть оберту помилка сягає 180°. Саме так")
+        print("      виглядає «ціль на заході, а стрілка іноді на сході».")
+        if len(points) == 1:
+            print("      Зробіть другий вимір, краще ~90° від першого.")
+        else:
+            print("      Точки, рознесені на ~180°, теж не розрізняють")
+            print("      напрямок обертання. Візьміть точку ~90° від решти.")
+        print("      Напрямок обертання НЕ буде записано, і напрямок")
+        print("      лишиться позначеним як НЕКАЛІБРОВАНИЙ — це навмисно.")
     elif residual > 30.0:
         print("   ⚠️  Похибка велика. Ймовірні причини: масив рахує кут")
         print("      нестабільно, або джерело було не в тому напрямку.")
+    else:
+        print(f"\n   {conv.describe()}")
 
     # Ключі належать ДЖЕРЕЛУ, яке справді вимірювали. Раніше сюди завжди
     # писались doa_offset_deg/doa_invert, тобто параметри USB DSP, навіть
@@ -454,13 +483,26 @@ def cmd_doa(cfg: dict, seconds: float) -> None:
         calibration.save({"srp_zero_deg": float(conv.zero_deg)})
         print("   Записано srp_zero_deg (власний SRP-PHAT). Його напрямок")
         print("   обертання відомий із коду і не зберігається.")
-    else:
+    elif handedness_resolved:
         calibration.save({
             "doa_offset_deg": float(conv.zero_deg),
             "doa_invert": conv.handedness is Handedness.COUNTER_CLOCKWISE,
             "doa_handedness": conv.handedness.value,
         })
         print("   Записано doa_offset_deg / doa_handedness (USB DSP).")
+    else:
+        # Зсув виміряний — його пишемо. Напрямок обертання НЕ виміряний —
+        # його не пишемо, і саме тому джерело лишається UNCAL. Ключ
+        # видаляється явно: у файлі могло лежати значення від попереднього
+        # (так само невизначеного) калібрування, і мовчки залишити його
+        # означало б успадкувати стару монетку.
+        calibration.save({
+            "doa_offset_deg": float(conv.zero_deg),
+            "doa_handedness": None,
+        })
+        print("   Записано ЛИШЕ doa_offset_deg. doa_handedness НЕ записано —")
+        print("   напрямок обертання цими точками не визначається, і")
+        print("   станція далі позначатиме напрямок як UNCAL.")
 
 
 # ═══════════════════════════════════════════════════════════════

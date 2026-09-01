@@ -53,9 +53,28 @@ WHAT EACH ELEMENT MEANS
                         not: a ring at the correct radius, all around,
                         because the direction genuinely is unknown.
     trail               previous positions, fading with age.
-    mirror ghost        for a 2-microphone array the direction is only
-                        known up to a mirror reflection; the alternative
-                        solution is drawn as a hollow marker.
+
+⚠️ THERE IS NO SECOND MARKER. An ambiguous bearing used to be drawn twice:
+the blip, plus a hollow "mirror ghost" at (180 - bearing). That angle was
+NEVER MEASURED BY ANYTHING. It was wrong for both sources it claimed to
+serve:
+
+  • USB (XVF3800). Here `ambiguous` means the DSP's beams split into two
+    competing clusters. The rival cluster is a REAL number, which
+    doa.select_azimuth discards; the radar drew (180 - bearing) instead.
+    Reproduced: beams [300, 302, 60, 62] -> bearing 61 deg, ghost 119 deg,
+    while the measured rival cluster sat at 301 deg. The ghost never once
+    landed on the direction the array actually reported.
+  • SRP-PHAT with 2 channels. Here `ambiguous` is a genuine mirror about
+    the microphone baseline, but the mirror of a canonical bearing is
+    (2*zero - bearing), not (180 - bearing) — the two agree only when
+    srp_zero_deg happens to be 90.
+
+One acoustic observation carries ONE measured direction, so the radar now
+draws one marker. The ambiguity itself is not hidden: it is disclosed in
+text by AcousticObservation.bearing_text() as "(±mirror)". A second marker
+returns only if a second direction is ever actually MEASURED and carried
+through the data model.
 """
 
 from __future__ import annotations
@@ -328,15 +347,12 @@ class RadarOverlay:
             cv2.circle(tile, (x, y), 5, colour, -1, cv2.LINE_AA)
             cv2.circle(tile, (x, y), 8, colour, 1, cv2.LINE_AA)
 
-        # ── Mirror ghost for a 2-mic ambiguity ──
-        if acoustic.bearing_ambiguous:
-            mirror = (180.0 - bearing) % 360.0
-            mr = (min(distance * px_per_m, R - 2) if distance is not None
-                  else R * 0.55)
-            mx, my = _polar_to_xy(cx, cy, mirror, mr)
-            cv2.circle(tile, (mx, my), 5, colour, 1, cv2.LINE_AA)
-            cv2.line(tile, (mx - 3, my - 3), (mx + 3, my + 3), colour, 1,
-                     cv2.LINE_AA)
+        # ⚠️ NO GHOST MARKER HERE — see the module docstring. An ambiguous
+        # bearing is ONE measurement whose direction is uncertain, not two
+        # measurements. The uncertainty is already carried by the wedge
+        # (which widens as confidence falls) and stated in words by
+        # AcousticObservation.bearing_text(); inventing (180 - bearing) as a
+        # second contact made one drone look like two.
 
     def _dashed_radial(self, tile: np.ndarray, bearing: float,
                        colour: Tuple[int, int, int]) -> None:

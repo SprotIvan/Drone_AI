@@ -2274,6 +2274,265 @@ def test_thread_safety():
 #  Runner
 # ═══════════════════════════════════════════════════════════════
 
+def test_18_doa_fix_regressions():
+    """
+    Regressions for the audio/DOA forensic audit (audio_doa_fix_report.md).
+
+    Every check here corresponds to a defect that was REPRODUCED BY
+    EXECUTION against the previous code, not merely read.
+    """
+    header("TEST 18 — DOA: duplicates, ties, ambiguity and the ghost target")
+
+    import ast
+    import itertools
+    import pathlib
+
+    import bearing_frame as bf
+    import calibration as _calib
+    from doa import (DOAReading, DOATracker, HardwareDOA, angular_diff,
+                     select_azimuth)
+
+    # ── A. HANDEDNESS: CW vs CCW is a LEFT/RIGHT mirror, not an offset ──
+    for zero in (0.0, 180.0, 353.7):
+        cw = bf.SourceConvention(zero, bf.Handedness.CLOCKWISE, "usb")
+        ccw = bf.SourceConvention(zero, bf.Handedness.COUNTER_CLOCKWISE, "usb")
+        broadside = [bf.angular_distance(cw.to_canonical(r), ccw.to_canonical(r))
+                     for r in (90.0, 270.0)]
+        inline = [bf.angular_distance(cw.to_canonical(r), ccw.to_canonical(r))
+                  for r in (0.0, 180.0)]
+        check(f"zero={zero:.0f}: wrong handedness is a FULL mirror at "
+              f"raw 90/270 and harmless at 0/180",
+              all(abs(d - 180.0) < 1e-6 for d in broadside)
+              and all(d < 1e-6 for d in inline),
+              f"broadside {broadside}, inline {inline}")
+
+    check("an UNKNOWN handedness is exactly the CLOCKWISE guess — it is a "
+          "GUESS, and the config must say so",
+          all(abs(bf.SourceConvention(180.0, bf.Handedness.UNKNOWN, "u",
+                                      zero_measured=False).to_canonical(r)
+                  - bf.SourceConvention(180.0, bf.Handedness.CLOCKWISE,
+                                        "u").to_canonical(r)) < 1e-9
+              for r in range(0, 360, 7))
+          and not bf.SourceConvention(180.0, bf.Handedness.UNKNOWN, "u",
+                                      zero_measured=False).calibrated)
+
+    # ── B. LEFT stays LEFT, RIGHT stays RIGHT under a MEASURED frame ──
+    ccw = bf.source_convention("usb", {"doa_offset_deg": 0.0,
+                                       "doa_handedness": "CCW"})
+    check("a measured CCW frame maps raw RIGHT to canonical RIGHT",
+          abs(ccw.to_canonical(270.0) - 90.0) < 1e-6,
+          f"raw 270 -> {ccw.to_canonical(270.0):.0f}deg")
+    check("a measured CCW frame maps raw LEFT to canonical LEFT",
+          abs(ccw.to_canonical(90.0) - 270.0) < 1e-6,
+          f"raw 90 -> {ccw.to_canonical(90.0):.0f}deg")
+
+    # ── C. ONE hardware measurement -> AT MOST ONE tracker update ──
+    # The audio loop reads the cache every 0.25 s; the DSP answers every
+    # ~0.35 s plus 200-500 ms of subprocess start-up. The same reading was
+    # therefore consumed 2-4 times (up to 8 while the cache stayed valid),
+    # so JUMP_CONFIRMATIONS=3 could be satisfied by ONE physical reading.
+    tr = DOATracker()
+    tr.update(DOAReading(100.0, confidence=0.9, source="usb", seq=1), now=0.0)
+    cached = DOAReading(200.0, confidence=0.9, source="usb", seq=2)
+    for i in range(4):
+        tr.update(cached, now=0.25 * (i + 1))
+    check("one cached measurement read 4x cannot flip the track",
+          angular_diff(tr.angle, 100.0) < 1.0, f"track {tr.angle:.0f}deg")
+
+    tr = DOATracker()
+    dup = DOAReading(90.0, confidence=0.9, source="usb", seq=7)
+    for i in range(8):
+        tr.update(dup, now=0.25 * i)
+    check("one measurement read 8x fills ONE history slot, not eight",
+          len(tr._history) == 1, f"{len(tr._history)} entries")
+
+    tr = DOATracker()
+    tr.update(DOAReading(100.0, confidence=0.9, source="usb", seq=1), now=0.0)
+    for i, s in enumerate((2, 3, 4)):
+        tr.update(DOAReading(200.0, confidence=0.9, source="usb", seq=s),
+                  now=0.25 * (i + 1))
+    check("but three DISTINCT measurements still follow a real manoeuvre",
+          angular_diff(tr.angle, 200.0) < 1.0, f"track {tr.angle:.0f}deg")
+
+    tr = DOATracker()
+    for i in range(4):
+        tr.update(DOAReading(50.0, confidence=0.9, source="srp"), now=0.25 * i)
+    check("SRP-PHAT (seq=0) is recomputed per block and is NOT deduplicated",
+          len(tr._history) == 4, f"{len(tr._history)} entries")
+
+    tr = DOATracker()
+    tr.update(DOAReading(90.0, confidence=0.9, source="usb", seq=1), now=0.0)
+    stale = DOAReading(90.0, confidence=0.9, source="usb", seq=1)
+    for t in (2.0, 4.0, 6.5):
+        tr.update(stale, now=t)
+    tr.update(DOAReading(None), now=7.0)
+    check("re-reading a stale cache does not keep a dead track alive",
+          tr.angle is None)
+
+    # ── D. A 2-vs-2 TIE must not be won by the smaller azimuth ──
+    ties = ([300., 302., 60., 62.], [350., 352., 170., 172.],
+            [10., 12., 190., 192.])
+    for beams in ties:
+        check(f"{beams} is reported ambiguous, not silently resolved",
+              select_azimuth(beams)[2])
+
+    # With a stable prior, the tie holds the CONFIRMED side — in both
+    # directions, so this is not a new bias in the opposite direction.
+    for beams, near, far in ((ties[0], 301.0, 61.0), (ties[1], 351.0, 171.0),
+                             (ties[2], 191.0, 11.0)):
+        got_near = select_azimuth(beams, prefer_deg=near)[0]
+        got_far = select_azimuth(beams, prefer_deg=far)[0]
+        check(f"tie on {beams} follows the established side, not the "
+              f"smaller angle",
+              angular_diff(got_near, near) < 2.0
+              and angular_diff(got_far, far) < 2.0,
+              f"prefer {near:.0f} -> {got_near:.0f}; "
+              f"prefer {far:.0f} -> {got_far:.0f}")
+
+    check("a tie is still decided independently of beam ORDER",
+          len({select_azimuth(list(p), prefer_deg=301.0)[0]
+               for p in itertools.permutations([300., 302., 60., 62.])}) == 1)
+
+    # Only an UNAMBIGUOUS reading may become the anchor, or a tie would
+    # confirm itself for ever.
+    hw = HardwareDOA.__new__(HardwareDOA)
+    hw.beam_index = -1
+    hw._seq = 0
+    hw._stable_raw = None
+    hw._stable_stamp = 0.0
+    check("HardwareDOA starts with no stable side to lean on",
+          hw._stable_raw is None)
+
+    # ── E/F. AMBIGUITY MUST NOT INVENT A SECOND PHYSICAL TARGET ──
+    # The renderers used to draw a hollow marker at (180 - bearing). That
+    # angle was never measured: for the USB branch the real rival cluster
+    # of [300,302,60,62] sits at 301 deg while the ghost was drawn at 119.
+    for name in ("radar_overlay.py", "radar_gui.py"):
+        path = pathlib.Path(__file__).with_name(name)
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        ghosts = [n for n in ast.walk(tree)
+                  if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Sub)
+                  and isinstance(n.left, ast.Constant)
+                  and n.left.value in (180, 180.0)]
+        check(f"{name} contains no executable (180 - bearing) ghost",
+              not ghosts,
+              f"line(s) {[n.lineno for n in ghosts]}" if ghosts else "")
+
+    amb = AcousticObservation(bearing_deg=61.0, bearing_confidence=0.25,
+                              bearing_source="usb", bearing_ambiguous=True,
+                              bearing_calibrated=True)
+    check("the ambiguity is still DISCLOSED, just not drawn as a target",
+          "mirror" in amb.bearing_text(), amb.bearing_text())
+
+    # ── G. An ambiguous reading must not seize an empty track ──
+    tr = DOATracker()
+    tr.update(DOAReading(90.0, confidence=0.25, source="usb", ambiguous=True,
+                         seq=1), now=0.0)
+    check("a single ambiguous reading does not acquire a target",
+          tr.angle is None, f"track {tr.angle}")
+
+    tr = DOATracker()
+    for i, a in enumerate((10.0, 200.0, 100.0, 300.0)):
+        tr.update(DOAReading(a, confidence=0.25, source="usb", ambiguous=True,
+                             seq=i + 1), now=0.25 * i)
+    check("scattered ambiguous readings never acquire a target",
+          tr.angle is None, f"track {tr.angle}")
+
+    # ...but hardware whose ambiguity is STRUCTURAL (a 2-mic array, where
+    # ambiguous is always True) must still be able to report a bearing.
+    tr = DOATracker()
+    for i in range(4):
+        tr.update(DOAReading(120.0, confidence=0.5, source="srp",
+                             ambiguous=True), now=0.25 * i)
+    check("a consistent 2-mic array still acquires after confirmations",
+          tr.angle is not None and angular_diff(tr.angle, 120.0) < 1.0,
+          f"track {tr.format()}")
+
+    # ── H. The ambiguous flag belongs to the ACCEPTED measurement ──
+    tr = DOATracker()
+    tr.update(DOAReading(90.0, confidence=0.9, source="usb", seq=1), now=0.0)
+    tr.update(DOAReading(250.0, confidence=0.25, source="usb", ambiguous=True,
+                         seq=2), now=0.25)
+    check("a REJECTED outlier does not flag the track ambiguous",
+          not tr.ambiguous and angular_diff(tr.angle, 90.0) < 1.0)
+
+    tr = DOATracker()
+    for i, s in enumerate((1, 2, 3)):
+        tr.update(DOAReading(90.0, confidence=0.25, source="usb",
+                             ambiguous=True, seq=s), now=0.3 * i)
+    check("a confirmed ambiguous track IS flagged ambiguous", tr.ambiguous)
+    tr.reset()
+    check("reset() clears the ambiguity — it cannot be inherited by the "
+          "next target", not tr.ambiguous)
+
+    # ── I. A single outlier must not poison the history ──
+    tr = DOATracker()
+    for i, a in enumerate((90.0, 90.0, 90.0, 200.0, 90.0, 90.0)):
+        tr.update(DOAReading(a, confidence=0.9, source="usb", seq=i + 1),
+                  now=0.25 * i)
+    check("one outlier never enters the smoothing history",
+          not any(abs(x - 200.0) < 1.0 for x, _ in tr._history)
+          and angular_diff(tr.angle, 90.0) < 1.0,
+          f"history {[round(x) for x, _ in tr._history]}")
+
+    # ── J. Wrap-around: 359 and 1 are neighbours ──
+    tr = DOATracker()
+    for i, a in enumerate((359.0, 1.0, 358.0, 2.0)):
+        tr.update(DOAReading(a, confidence=0.9, source="usb", seq=i + 1),
+                  now=0.25 * i)
+    check("359deg and 1deg smooth to 0deg, not to 180deg",
+          angular_diff(tr.angle, 0.0) < 1.0, f"track {tr.angle:.1f}deg")
+    check("and they are never treated as an outlier pair",
+          angular_diff(359.0, 1.0) == 2.0)
+
+    # ── K. One calibration point may not claim a measured handedness ──
+    # Both hypotheses fit a single point with residual 0.0, so a strict '<'
+    # silently kept whichever was tried first (CLOCKWISE) and then marked
+    # the source CALIBRATED, which switched OFF the UNCAL warnings.
+    def fit(points):
+        fits = {}
+        for hand in (bf.Handedness.CLOCKWISE, bf.Handedness.COUNTER_CLOCKWISE):
+            zeros = [(t - (-m if hand is bf.Handedness.COUNTER_CLOCKWISE
+                           else m)) % 360.0 for t, m in points]
+            conv = bf.SourceConvention(bf.circular_mean_deg(zeros), hand, "usb")
+            res = sum(bf.angular_distance(conv.to_canonical(m), t)
+                      for t, m in points) / len(points)
+            fits[hand] = (conv, res)
+        spread = abs(fits[bf.Handedness.CLOCKWISE][1]
+                     - fits[bf.Handedness.COUNTER_CLOCKWISE][1])
+        return min(fits.values(), key=lambda f: f[1]), spread > 1.0
+
+    for label, pts in (("one point", [(90.0, 30.0)]),
+                       ("two points 180deg apart",
+                        [(0.0, 0.0), (180.0, 180.0)])):
+        (_conv, _res), resolved = fit(pts)
+        check(f"{label} does NOT resolve the handedness", not resolved)
+
+    (conv, res), resolved = fit([(0.0, 353.7), (90.0, 263.7)])
+    check("two points 90deg apart DO resolve it — and find CCW here",
+          resolved and conv.handedness is bf.Handedness.COUNTER_CLOCKWISE
+          and res < 1.0, f"{conv.describe()}, residual {res:.1f}deg")
+
+    check("a config with a zero but no handedness is still UNCALIBRATED",
+          not bf.source_convention(
+              "usb", {"doa_offset_deg": 60.0,
+                      "doa_handedness": None}).calibrated)
+
+    # ── L. The banner must not contradict the runtime ──
+    # doa_invert is dead in the DOA path: flipping it changes no bearing.
+    a = bf.source_convention("usb", {"doa_offset_deg": 180.0,
+                                     "doa_invert": False})
+    b = bf.source_convention("usb", {"doa_offset_deg": 180.0,
+                                     "doa_invert": True})
+    check("doa_invert provably does not steer the bearing",
+          all(abs(a.to_canonical(r) - b.to_canonical(r)) < 1e-9
+              for r in range(0, 360, 15)))
+    banner = _calib.describe(dict(_calib.DEFAULTS,
+                                  doa_offset_deg=180.0, doa_invert=True))
+    check("so the banner no longer prints 'дзеркально' from that dead key",
+          "дзеркально" not in banner and "UNKNOWN" in banner, banner)
+
+
 def main() -> int:
     logging.getLogger("station").setLevel(logging.CRITICAL)
 
@@ -2288,7 +2547,7 @@ def main() -> int:
                test_11_acoustic_latency_and_coasting, test_12_led_ring,
                test_13_coordinate_chain, test_14_srp_geometry,
                test_15_camera_search_region, test_16_audit_fixes,
-               test_17_web_server,
+               test_17_web_server, test_18_doa_fix_regressions,
                test_regressions, test_final_audit_regressions,
                test_honesty, test_thread_safety):
         try:

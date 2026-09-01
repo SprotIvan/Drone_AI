@@ -95,6 +95,21 @@ class DOAReading:
     calibrated: bool = False
     #: Людський опис конвенції — показується, коли вона неповна.
     convention: str = ""
+    #: ІДЕНТИЧНІСТЬ ФІЗИЧНОГО ВИМІРУ, а не момент читання.
+    #:
+    #: ⚠️ Кешоване значення читається БАГАТО РАЗІВ. HardwareDOA опитує DSP
+    #: раз на ~0.35 с (плюс 200-500 мс на запуск субпроцесу), а аудіоцикл
+    #: читає кеш кожні 0.25 с — тобто ОДИН вимір потрапляє у трекер 2-4
+    #: рази, а поки кеш живий (max_age=2.0 с) — до 8 разів. Без цього поля
+    #: трекер рахував ВИКЛИКИ, а не виміри: три «незалежні підтвердження»
+    #: стрибка складались з одного-єдиного зчитування, і восьмимісна
+    #: історія заповнювалась однією й тією ж цифрою, після чого зважене
+    #: циркулярне середнє більше нічого не усереднювало.
+    #:
+    #: 0 = вимір НЕ МАЄ ідентичності і завжди свіжий. Саме такий SRP-PHAT:
+    #: він рахується наново з кожного аудіоблоку, тому дедуплікувати його
+    #: не можна і не треба.
+    seq: int = 0
 
     @property
     def ok(self) -> bool:
@@ -147,7 +162,8 @@ def azimuths_to_degrees(values: list[float]) -> list[float]:
 
 
 def select_azimuth(degrees: list[float], beam_index: int = -1,
-                   cluster_deg: float = 25.0
+                   cluster_deg: float = 25.0,
+                   prefer_deg: float | None = None
                    ) -> tuple[float | None, float, bool]:
     """
     Обирає напрямок з чотирьох променів.
@@ -205,9 +221,40 @@ def select_azimuth(degrees: list[float], beam_index: int = -1,
 
     ambiguous = len(distinct) > 1
     if ambiguous:
-        # Детермінований вибір: група з найменшим внутрішнім розкидом.
-        # Порядок променів більше ні на що не впливає.
-        distinct.sort(key=lambda g: (_spread_deg(g), circular_mean(g)))
+        # ═══════════════════════════════════════════════════════════
+        # ⚠️ НІЧИЯ 2-ПРОТИ-2 СИСТЕМАТИЧНО ВИГРАВАЛАСЬ МЕНШИМ АЗИМУТОМ
+        # ═══════════════════════════════════════════════════════════
+        #
+        # Ключ сортування був `(_spread_deg, circular_mean)`. При розкладі
+        # 2-проти-2 обидві групи мають практично однаковий розкид (0..2°),
+        # тому рішення щоразу падало на другий елемент ключа — тобто на
+        # ВЕЛИЧИНУ КУТА. Виміряно виконанням: [300,302,60,62] → 61°,
+        # [350,352,170,172] → 171°, [10,12,190,192] → 11°; у всіх шести
+        # відтворених нічиїх перемагав кластер із меншим кутом, а там, де
+        # кластери рознесені на ~180°, це РІВНО дзеркальна помилка.
+        #
+        # Жодного акустичного сенсу «менший азимут» не має: у
+        # AEC_AZIMUTH_VALUES немає ані рівнів, ані ширини променя — самі
+        # кути. Тобто ІНФОРМАЦІЇ, щоб обрати між двома рівними кластерами,
+        # у цьому вимірі просто НЕМАЄ, і вигадувати її не можна.
+        #
+        # Тому вибір спирається на єдиний доказ, який існує поза цим
+        # виміром: напрямок, у якому масив уже стабільно чув ціль
+        # (`prefer_deg` — останній ОДНОЗНАЧНИЙ вимір, у тому самому сирому
+        # кадрі). Нічия більше не тягне систему в бік менших кутів — вона
+        # утримує вже підтверджений бік, а прапорець `ambiguous` і надалі
+        # каже решті системи, що цей вимір ненадійний.
+        #
+        # Без `prefer_deg` (холодний старт) обґрунтованого вибору не існує
+        # взагалі. Тоді лишається детермінований порядок — але сам по собі
+        # він нічого не доводить, і саме тому DOATracker не дозволяє
+        # неоднозначному виміру захопити ціль поодинці.
+        if prefer_deg is None:
+            distinct.sort(key=lambda g: (_spread_deg(g), circular_mean(g)))
+        else:
+            distinct.sort(key=lambda g: (angular_diff(circular_mean(g),
+                                                      prefer_deg),
+                                         _spread_deg(g), circular_mean(g)))
     best_members = distinct[0]
 
     angle = circular_mean(best_members)
@@ -399,6 +446,21 @@ class HardwareDOA:
         self._stop = threading.Event()
         self._reported_error: str | None = None
         self.fail_count = 0
+        #: Лічильник УСПІШНИХ вимірів. Зростає рівно раз на кожен азимут,
+        #: реально отриманий від DSP, і проставляється у DOAReading.seq,
+        #: щоб трекер міг відрізнити новий вимір від повторного читання
+        #: того самого кешу. Див. DOAReading.seq.
+        self._seq = 0
+        #: Останній ОДНОЗНАЧНИЙ сирий азимут і його час — єдина підстава,
+        #: за якою можна розв'язати нічию 2-проти-2 (див. select_azimuth).
+        #: Кадр той самий, сирий, тому конвенція тут не потрібна.
+        self._stable_raw: float | None = None
+        self._stable_stamp = 0.0
+
+    #: Скільки живе «стабільний бік» для розв'язання нічиї. Збігається з
+    #: DOATracker.RELEASE_SEC: якщо трек уже відпущено, спиратись на нього
+    #: більше немає підстав.
+    STABLE_RAW_SEC = 6.0
 
     # ── Життєвий цикл ──────────────────────────────────────────
 
@@ -468,10 +530,28 @@ class HardwareDOA:
                 None, error=f"не вдалось розібрати вивід: «{snippet}»")
 
         degrees = azimuths_to_degrees(values)
-        angle, conf, ambiguous = select_azimuth(degrees, self.beam_index)
+
+        # Нічия розв'язується на користь боку, який масив уже стабільно
+        # чув, а не на користь меншого кута. Підказка протухає разом із
+        # треком, щоб не тягнути за собою давно неактуальний напрямок.
+        now = time.monotonic()
+        prefer = (self._stable_raw
+                  if (self._stable_raw is not None
+                      and now - self._stable_stamp <= self.STABLE_RAW_SEC)
+                  else None)
+        angle, conf, ambiguous = select_azimuth(degrees, self.beam_index,
+                                                prefer_deg=prefer)
+        if angle is not None and not ambiguous:
+            # Тільки ОДНОЗНАЧНИЙ вимір має право ставати опорою для
+            # наступної нічиї. Інакше одна нічия закріплювала б сама себе.
+            self._stable_raw, self._stable_stamp = float(angle), now
+
         self.fail_count = 0
+        # Новий фізичний вимір — новий номер. Кеш може бути прочитаний
+        # скільки завгодно разів, але номер у нього залишиться цей.
+        self._seq += 1
         return DOAReading(angle, confidence=conf, source="usb", raw=degrees,
-                          ambiguous=ambiguous)
+                          ambiguous=ambiguous, seq=self._seq)
 
     # ── Читання кешу ───────────────────────────────────────────
 
@@ -707,15 +787,25 @@ class DOATracker:
         #: so these describe the frame the smoothed angle is already in.
         self.calibrated = False
         self.convention = ""
+        #: (seq, source) останнього ЗАРАХОВАНОГО фізичного виміру — щоб
+        #: повторне читання того самого кешу не рахувалось ще раз.
+        self._last_measurement: tuple[int, str] | None = None
 
     def reset(self) -> None:
         self._history.clear()
         self._pending.clear()
         self.angle = None
         self.confidence = 0.0
+        # ⚠️ ПРАПОРЕЦЬ НЕОДНОЗНАЧНОСТІ ТЕЖ СКИДАЄТЬСЯ. Раніше він тут не
+        # скидався, тому наступна — зовсім інша — ціль успадковувала
+        # «неоднозначність» від попередньої, яку відпустили шість секунд
+        # тому. Неоднозначність є властивістю ВИМІРУ, а не трекера, тому
+        # вона не може пережити той трек, у якому виникла.
+        self.ambiguous = False
         self.source = "none"
         self.calibrated = False
         self.convention = ""
+        self._last_measurement = None
 
     def update(self, reading: DOAReading, now: float | None = None) -> None:
         # ⚠️ BUG-003: monotonic by default. This value is only ever used as
@@ -732,19 +822,66 @@ class DOATracker:
                 self.reset()
             return
 
+        # ── ОДИН ФІЗИЧНИЙ ВИМІР — НЕ БІЛЬШЕ ОДНОГО ОНОВЛЕННЯ ──
+        #
+        # ⚠️ Аудіоцикл читає КЕШ HardwareDOA частіше, ніж DSP встигає його
+        # оновити (0.25 с проти 0.35 с + 200-500 мс на субпроцес), тому те
+        # саме зчитування поверталось 2-4 рази, а при пригальмованому
+        # опитуванні — до 8 разів (max_age = 2.0 с). `_pending` рахував
+        # ВИКЛИКИ, отже JUMP_CONFIRMATIONS = 3 «незалежні підтвердження»
+        # стрибка могли надійти з ОДНОГО зчитування, і трек перекидався на
+        # протилежний бік від одного хибного виміру. Історія страждала так
+        # само: вісім слотів заповнювались однією цифрою.
+        #
+        # Тепер повторне читання того самого виміру не є ані підтвердженням,
+        # ані новою точкою історії, ані приводом омолодити трек: воно просто
+        # ігнорується, а трек продовжує старіти від СПРАВЖНЬОГО останнього
+        # виміру. seq = 0 означає «ідентичності немає» (SRP-PHAT рахується
+        # заново з кожного блоку) — такі виміри проходять завжди.
+        if reading.seq:
+            fingerprint = (reading.seq, reading.source)
+            if fingerprint == self._last_measurement:
+                return
+            self._last_measurement = fingerprint
+
         angle = float(reading.angle_deg)
-        self.ambiguous = reading.ambiguous
         self.source = reading.source
         self.calibrated = reading.calibrated
         self.convention = reading.convention
 
         if self.angle is None:
-            self._accept(angle, reading.confidence, now)
+            # ── ЗАХОПЛЕННЯ ЦІЛІ ──
+            #
+            # ⚠️ НЕОДНОЗНАЧНИЙ ВИМІР НЕ ЗАХОПЛЮЄ ЦІЛЬ САМОТУЖКИ. Правило
+            # «нічия не рухає трек» було реалізоване лише для викидів, і
+            # порожній трек приймав будь-що. Через це ПЕРШИЙ же вимір після
+            # тиші — навіть нічия 2-проти-2, у якій select_azimuth обрав
+            # кластер лише за тим, що його кут менший, — задавав напрямок
+            # треку. Далі неоднозначні виміри на тому самому (хибному) боці
+            # проходили як «у межах ±35°» і підживлювали його, а такі ж
+            # виміри на правильному боці відкидались як викиди. Трек
+            # залипав на хибному боці.
+            #
+            # Тепер неоднозначне захоплення вимагає такої самої серії
+            # узгоджених ПІДТВЕРДЖЕНЬ, як і стрибок. Однозначний вимір
+            # захоплює ціль одразу, як і раніше. Це зберігає роботу на
+            # 2-мікрофонному SRP-PHAT, де `ambiguous` істинний ЗАВЖДИ
+            # (ambiguous = n_ch < 3): там трек просто з'явиться після трьох
+            # узгоджених вимірів замість одного.
+            if reading.ambiguous:
+                centre = self._confirm(angle)
+                if centre is None:
+                    return
+                self._accept(centre, reading.confidence, now, ambiguous=True)
+                return
+            self._pending.clear()
+            self._accept(angle, reading.confidence, now, ambiguous=False)
             return
 
         if angular_diff(angle, self.angle) <= self.OUTLIER_DEG:
             self._pending.clear()
-            self._accept(angle, reading.confidence, now)
+            self._accept(angle, reading.confidence, now,
+                         ambiguous=reading.ambiguous)
             return
 
         # ── Викид: чекаємо підтвердження, перш ніж перескакувати ──
@@ -757,19 +894,38 @@ class DOATracker:
         # на сході. Нічия не рухає трек: вона лише не оновлює його.
         if reading.ambiguous:
             return
-        self._pending.append(angle)
-        if len(self._pending) >= self.JUMP_CONFIRMATIONS:
-            recent = self._pending[-self.JUMP_CONFIRMATIONS:]
-            centre = circular_mean(recent)
-            if all(angular_diff(a, centre) <= self.OUTLIER_DEG for a in recent):
-                # Новий напрямок стабільний — переходимо на нього
-                self._history.clear()
-                self._pending.clear()
-                self._accept(centre, reading.confidence, now)
-            else:
-                self._pending.clear()
+        centre = self._confirm(angle)
+        if centre is not None:
+            # Новий напрямок стабільний — переходимо на нього
+            self._history.clear()
+            self._accept(centre, reading.confidence, now, ambiguous=False)
 
-    def _accept(self, angle: float, weight: float, now: float) -> None:
+    def _confirm(self, angle: float) -> float | None:
+        """
+        Накопичує виміри, що не збігаються з поточним треком.
+
+        Повертає центр серії, щойно надійшло JUMP_CONFIRMATIONS УЗГОДЖЕНИХ
+        між собою вимірів, інакше None. Кожен виклик — це окремий фізичний
+        вимір: дублікати кешу відсіяні вище за `seq`.
+        """
+        self._pending.append(angle)
+        if len(self._pending) < self.JUMP_CONFIRMATIONS:
+            return None
+        recent = self._pending[-self.JUMP_CONFIRMATIONS:]
+        centre = circular_mean(recent)
+        self._pending.clear()
+        if all(angular_diff(a, centre) <= self.OUTLIER_DEG for a in recent):
+            return centre
+        return None
+
+    def _accept(self, angle: float, weight: float, now: float,
+                ambiguous: bool = False) -> None:
+        # ⚠️ Прапорець неоднозначності належить ПРИЙНЯТОМУ виміру. Раніше
+        # він виставлявся на самому початку update(), ще до всіх перевірок,
+        # тому відкинутий викид усе одно вмикав «±mirror», а відкинутий
+        # ОДНОЗНАЧНИЙ викид — гасив його. Прапорець описував вимір, якого
+        # трек навіть не бачив.
+        self.ambiguous = bool(ambiguous)
         self._history.append((angle, max(weight, 0.05)))
         angles = [a for a, _ in self._history]
         weights = [w for _, w in self._history]
