@@ -184,7 +184,23 @@ class HUD:
         self.projector = projector
         self.radar: Optional[RadarOverlay] = None
         self._radar_size = 0
-        self._canvas: Optional[np.ndarray] = None
+        # ⚠️ TWO canvases, alternated — not one reused buffer.
+        #
+        # A single reused canvas is correct for cv2.imshow, which copies the
+        # pixels before returning. It is NOT correct for web_server.FrameBus,
+        # which stores the REFERENCE and copies it later, on a uvicorn worker
+        # thread, under a lock this renderer does not hold. So the next
+        # render() wrote into the exact buffer a client was mid-copy of, and
+        # the JPEG could contain part of frame N and part of frame N+1.
+        #
+        # Alternating two buffers gives the consumer a whole frame period
+        # (>= 1/max_ui_fps = 50 ms) to take its copy, against a copy that
+        # costs well under a millisecond. The alternative — publishing
+        # frame.copy() — would add a full-frame memcpy on the UI thread at
+        # every render, i.e. ~21 MB/s of pure memory traffic on a Pi 5, for
+        # the same guarantee. Two buffers cost one extra allocation, once.
+        self._canvases: list = [None, None]
+        self._canvas_index = 0
         self.show_help = False
 
     # ── Radar sizing ───────────────────────────────────────────
@@ -250,16 +266,21 @@ class HUD:
 
     def _get_canvas(self, w: int, h: int) -> np.ndarray:
         """
-        Reused output buffer.
+        Next output buffer, alternating between two.
 
         Allocated once per size instead of once per frame. The camera strip
         is fully overwritten by _blit_camera every frame; only the two bars
         need clearing, and they are painted opaque anyway.
+
+        See __init__ for why there are two of them rather than one.
         """
         need = (h + STATUS_H + SENSOR_H, w, 3)
-        if self._canvas is None or self._canvas.shape != need:
-            self._canvas = np.zeros(need, dtype=np.uint8)
-        return self._canvas
+        self._canvas_index ^= 1
+        canvas = self._canvases[self._canvas_index]
+        if canvas is None or canvas.shape != need:
+            canvas = np.zeros(need, dtype=np.uint8)
+            self._canvases[self._canvas_index] = canvas
+        return canvas
 
     def _blit_camera(self, canvas: np.ndarray, target: FusedTarget,
                      w: int, h: int) -> None:

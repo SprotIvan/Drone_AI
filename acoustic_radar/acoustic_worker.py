@@ -372,7 +372,16 @@ class AcousticWorker:
                 if self.health.get().state is not SubsystemState.ONLINE:
                     self._set_health(SubsystemState.ONLINE, "recovered")
 
+                # ⚠️ MEASURED, not assumed. The side channels (UART write,
+                # WAV capture, Telegram) all run ON THIS THREAD, inside the
+                # per-block budget. The WAV write itself has been moved to a
+                # writer thread (see AudioLogger), but the dispatch is still
+                # here and is still capable of costing time, so it is timed
+                # rather than trusted.
+                _t_side = time.monotonic()
                 self._dispatch_side_channels(status, block_np)
+                BUDGET.record("side_channels",
+                              (time.monotonic() - _t_side) * 1000.0)
                 self._log_events(obs)
 
                 elapsed = time.monotonic() - t0
@@ -500,6 +509,10 @@ class AcousticWorker:
     def _teardown(self) -> None:
         for name, closer in (
                 ("uart", lambda: self._uart and self._uart.close()),
+                # Flushes any recording still queued for disk, so a capture
+                # in progress at shutdown is not silently lost.
+                ("audio logger",
+                 lambda: self._audio_logger and self._audio_logger.close()),
                 ("engine", lambda: self._engine and self._engine.close())):
             try:
                 closer()

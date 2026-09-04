@@ -8,7 +8,9 @@ audio_logger.py — Автозапис аудіо при детекції дро
 
 from __future__ import annotations
 
+import queue
 import sys
+import threading
 import time
 import wave
 from collections import deque
@@ -27,7 +29,35 @@ SAMPLE_RATE = 16000
 
 
 class AudioLogger:
-    """Кільцевий буфер аудіо з автозбереженням при ALARM."""
+    """
+    Кільцевий буфер аудіо з автозбереженням при ALARM.
+
+    ═══════════════════════════════════════════════════════════════
+    ⚠️ ЗАПИС НА ДИСК НЕ ВІДБУВАЄТЬСЯ В АУДІО-ПОТОЦІ
+    ═══════════════════════════════════════════════════════════════
+
+    `feed()` викликається з real-time аудіо-потоку (acoustic_worker._loop),
+    і цей потік має жорсткий бюджет: `stream.read()` віддає блок кожні
+    block_seconds (за замовчуванням 0.25 с), і якщо цикл не повернувся до
+    наступного блоку, кільцевий буфер PortAudio переповнюється і звук
+    ВТРАЧАЄТЬСЯ назавжди.
+
+    Раніше `_save_recording()` викликався прямо з `feed()`, тобто
+    `wave.open(...).writeframes(...)` — синхронний запис ~320 КБ на
+    SD-карту — виконувався всередині цього бюджету, і саме в момент
+    тривоги, тобто рівно тоді, коли втрачати аудіо найгірше.
+
+    Тепер `feed()` лише складає готовий масив у чергу, а пише окремий
+    потік-письменник. Поведінка запису (що саме зберігається, коли
+    починається і коли завершується) не змінена; змінилось тільки те, ЯКИЙ
+    потік торкається диска.
+
+    Черга обмежена: якщо диск настільки повільний, що записи не встигають,
+    краще втратити ЗАПИС, ніж втратити ДЕТЕКЦІЮ.
+    """
+
+    #: Скільки готових записів може чекати на диск. Кожен ~320 КБ.
+    MAX_PENDING_WRITES = 4
 
     def __init__(self, save_dir: Path = DETECTIONS_DIR,
                  sr: int = SAMPLE_RATE,
@@ -55,6 +85,18 @@ class AudioLogger:
         self._alarm_handled = False   # щоб не зберігати двічі на одну тривогу
 
         self.last_saved: str | None = None
+
+        # ── Потік-письменник ──
+        self._writes: "queue.Queue[tuple | None]" = queue.Queue(
+            maxsize=self.MAX_PENDING_WRITES)
+        self.dropped_writes = 0
+        #: Час ОСТАННЬОГО фактичного запису на диск, мілісекунди. Вимірюється
+        #: у потоці-письменнику, тому це реальна вартість дискового I/O на
+        #: цій машині — не оцінка. Аудіо-потік її більше не платить.
+        self.last_write_ms: float | None = None
+        self._writer = threading.Thread(target=self._writer_loop,
+                                        name="audio-logger", daemon=True)
+        self._writer.start()
 
     def feed(self, audio_block: np.ndarray) -> None:
         """Додає блок аудіо у кільцевий буфер."""
@@ -100,7 +142,14 @@ class AudioLogger:
         self._dist = dist
 
     def _save_recording(self) -> None:
-        """Зберігає зібране аудіо у WAV."""
+        """
+        Завершує запис і ПЕРЕДАЄ його потоку-письменнику.
+
+        ⚠️ Викликається з real-time аудіо-потоку, тому тут не має права
+        траплятись жодного дискового I/O. Усе, що робиться тут — це
+        конкатенація вже наявних масивів у пам'яті (дешево і детерміновано)
+        і неблокуюче складання в чергу.
+        """
         self._recording = False
 
         if not self._record_chunks:
@@ -113,6 +162,35 @@ class AudioLogger:
         ts = time.strftime("%Y%m%d_%H%M%S")
         angle_s = f"_{self._angle:.0f}deg" if self._angle is not None else ""
         filename = f"drone_{ts}{angle_s}.wav"
+
+        try:
+            # put_nowait, НЕ put: блокування тут повернуло б рівно ту
+            # проблему, заради якої існує цей потік.
+            self._writes.put_nowait((filename, audio))
+        except queue.Full:
+            self.dropped_writes += 1
+            print(f"   [REC] DROPPED {filename}: {self.MAX_PENDING_WRITES} "
+                  f"recordings already waiting on disk (total dropped: "
+                  f"{self.dropped_writes}). Detection is unaffected.")
+
+    # ── Потік-письменник ───────────────────────────────────────
+
+    def _writer_loop(self) -> None:
+        while True:
+            item = self._writes.get()
+            if item is None:
+                return
+            filename, audio = item
+            try:
+                self._write_wav(filename, audio)
+            except Exception as exc:
+                # Провал запису не має права зупинити письменника, і тим
+                # більше — торкнутись детекції.
+                print(f"   [REC] write failed for {filename}: {exc}")
+
+    def _write_wav(self, filename: str, audio: np.ndarray) -> None:
+        """Фактичний дисковий I/O. Виконується ЛИШЕ у потоці-письменнику."""
+        t0 = time.monotonic()
         filepath = self.save_dir / filename
 
         # Нормалізація до int16
@@ -128,9 +206,19 @@ class AudioLogger:
             wf.setframerate(self.sr)
             wf.writeframes(audio_int16.tobytes())
 
+        self.last_write_ms = (time.monotonic() - t0) * 1000.0
         duration = len(audio) / self.sr
         self.last_saved = filename
-        print(f"   [REC] Saved {filename} ({duration:.1f}s)")
+        print(f"   [REC] Saved {filename} ({duration:.1f}s, "
+              f"disk write {self.last_write_ms:.0f} ms, writer thread)")
+
+    def close(self, timeout: float = 5.0) -> None:
+        """Дописати те, що вже в черзі, і зупинити письменника."""
+        try:
+            self._writes.put_nowait(None)
+        except queue.Full:
+            pass
+        self._writer.join(timeout)
 
     @property
     def detection_count(self) -> int:

@@ -90,6 +90,25 @@ class CameraManager:
         # AdvancedADASTracker._compute_dt, "AUDIT BUG #5"), and this class
         # was simply missed.
 
+        # ⚠️ CAN THE DRIVER TELL US WHEN THE SENSOR ACTUALLY EXPOSED A FRAME?
+        #
+        # `capture_array()` returns pixels and nothing else, so a caller
+        # cannot distinguish "the sensor just produced this" from "this had
+        # been sitting in the request queue for three frame periods". Those
+        # two are the difference between a real frame rate and a processing
+        # rate, and between fresh video and stale video.
+        #
+        # `capture_request()` returns the same pixels PLUS the metadata, which
+        # carries SensorTimestamp. It costs nothing extra — capture_array is
+        # implemented on top of the same mechanism — but it does hand us a
+        # buffer we are responsible for releasing, so every path below is
+        # wrapped in try/finally.
+        #
+        # If that path ever raises we fall back to capture_array PERMANENTLY:
+        # a metric is never worth losing frames over.
+        self._request_capture_ok = True
+        self._sensor_ts_supported = None      # None = not yet known
+
         # Capture health (see get_frame / _handle_capture_failure).
         self.consecutive_capture_failures = 0
         self.total_capture_failures = 0
@@ -205,24 +224,89 @@ class CameraManager:
         # Both now return None, which every existing caller already handles
         # (`if frame_rgb is None: continue`), and a persistent failure fails
         # over to the other camera if one is open.
+        frame, _sensor_ns = self.get_frame_and_sensor_ns()
+        return frame
+
+    def get_frame_and_sensor_ns(self):
+        """
+        (frame, sensor_timestamp_ns) — the timestamp is None when unavailable.
+
+        ⚠️ WHY THE TIMESTAMP EXISTS. Without it, "the loop ran 70 times this
+        second" and "the sensor produced 70 frames this second" are the same
+        measurement, and they are NOT the same thing. picamera2 holds
+        `buffer_count` completed requests; a loop that speeds up (because, say,
+        the detector started running on every second frame instead of every
+        frame) drains that backlog and briefly completes iterations faster than
+        the sensor can possibly produce frames.
+
+        SensorTimestamp is the instant the sensor exposed the frame, so:
+
+            new-frame rate   = 1 / diff(SensorTimestamp)      <- physical
+            loop rate        = 1 / diff(loop wall clock)      <- processing
+            frame age        = now - SensorTimestamp          <- staleness
+
+        It is CLOCK_BOOTTIME nanoseconds on the Pi, which is why callers must
+        compare it against time.clock_gettime(CLOCK_BOOTTIME) and not against
+        time.monotonic(). See camera_worker._sensor_now_ns().
+        """
         picam = self.picams.get(self.active_camera)
         if picam is None:
             self._handle_capture_failure(
                 f"active camera {self.active_camera} is not open")
-            return None
-        try:
-            frame = picam.capture_array()
-        except Exception as exc:
-            self._handle_capture_failure(
-                f"capture failed on camera {self.active_camera}: {exc}")
-            return None
+            return None, None
+
+        frame = None
+        sensor_ns = None
+
+        # getattr, for the same reason release() uses it: this method's
+        # contract is that it NEVER raises, and it can be reached on a
+        # partially-constructed object (an __init__ that failed part way, or
+        # a test that builds one with __new__). An AttributeError here would
+        # break that contract for a diagnostic flag.
+        if getattr(self, "_request_capture_ok", True):
+            request = None
+            try:
+                request = picam.capture_request()
+                try:
+                    frame = request.make_array("main")
+                    metadata = request.get_metadata() or {}
+                finally:
+                    # Releasing is not optional: a leaked request permanently
+                    # removes one buffer from a pool of `buffer_count`, and
+                    # leaking `buffer_count` of them stalls capture for good.
+                    request.release()
+                ts = metadata.get("SensorTimestamp")
+                sensor_ns = int(ts) if ts is not None else None
+                if getattr(self, "_sensor_ts_supported", False) is None:
+                    self._sensor_ts_supported = sensor_ns is not None
+                    if not self._sensor_ts_supported:
+                        print("[CameraManager] the driver does not report "
+                              "SensorTimestamp — real capture rate and frame "
+                              "age cannot be measured on this system.")
+            except Exception as exc:
+                # One failure disables the path for the whole session. The
+                # metric is a diagnostic; frames are the product.
+                self._request_capture_ok = False
+                frame = None
+                print(f"[CameraManager] capture_request() unavailable "
+                      f"({exc}) — falling back to capture_array(); the real "
+                      f"sensor frame rate will not be measurable.")
+
+        if frame is None:
+            try:
+                frame = picam.capture_array()
+            except Exception as exc:
+                self._handle_capture_failure(
+                    f"capture failed on camera {self.active_camera}: {exc}")
+                return None, None
+
         if frame is None:
             self._handle_capture_failure(
                 f"camera {self.active_camera} returned no frame")
-            return None
+            return None, None
         self.consecutive_capture_failures = 0
         self.total_frames += 1
-        return frame
+        return frame, sensor_ns
 
     def _handle_capture_failure(self, message):
         """Count a failed capture and fail over once the failure persists."""

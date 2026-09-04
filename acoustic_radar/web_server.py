@@ -59,6 +59,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+from latency import BUDGET
+
 log = logging.getLogger("station.web")
 
 
@@ -126,6 +128,11 @@ class FrameBus:
         self.jpeg_quality = int(jpeg_quality)
         self._cond = threading.Condition()
         self._frame: Optional[np.ndarray] = None
+        #: Age of the camera frame this composed image was built from, at the
+        #: moment it was published. Carried per-frame into the MJPEG part
+        #: headers so the BROWSER can add its own leg and report a real
+        #: capture -> display latency instead of the server guessing one.
+        self._frame_age_ms: Optional[float] = None
         self._seq = 0
         #: (seq, bytes) of the most recently encoded frame. Shared by every
         #: client so N browsers cost ONE encode, not N.
@@ -144,19 +151,24 @@ class FrameBus:
 
     # ── Producer side ──────────────────────────────────────────
 
-    def publish(self, frame: np.ndarray) -> None:
+    def publish(self, frame: np.ndarray,
+                frame_age_ms: Optional[float] = None) -> None:
         """
         Hand over the frame the station just composed.
 
-        A reference is stored, not a copy: `hud.render()` reuses one canvas,
-        so the buffer WILL be overwritten by the next render. The copy is
-        taken in `encoded()` instead — under the lock, and only when a
-        client actually needs it, so an idle server copies nothing.
+        A reference is stored, not a copy, and that is safe because `hud`
+        alternates between TWO canvases: the buffer handed over here is not
+        the one the next render() writes into, so a consumer has a full frame
+        period to take its copy. (It was not safe when the HUD reused a single
+        canvas — see the note in hud.HUD.__init__.) The copy is still taken in
+        `encoded()`, only when a client actually needs it, so an idle server
+        copies nothing.
         """
         with self._cond:
             if self._closed:
                 return
             self._frame = frame
+            self._frame_age_ms = frame_age_ms
             self._seq += 1
             self._cond.notify_all()
         self.publish_meter.tick()
@@ -172,6 +184,10 @@ class FrameBus:
             return self._closed
 
     # ── Consumer side ──────────────────────────────────────────
+
+    def frame_age_ms(self) -> Optional[float]:
+        with self._cond:
+            return self._frame_age_ms
 
     def wait_for_frame(self, last_seq: int, timeout: float = 1.0) -> int:
         """
@@ -218,12 +234,18 @@ class FrameBus:
                 break
 
         data: Optional[bytes] = None
+        _t_enc = time.monotonic()
         try:
             ok, buf = cv2.imencode(
                 ".jpg", frame,
                 [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
             if ok:
                 data = buf.tobytes()
+                # Measured on the thread that actually encodes, so the cost of
+                # the single most expensive operation in this module is a
+                # number rather than an opinion.
+                BUDGET.record("jpeg_encode",
+                              (time.monotonic() - _t_enc) * 1000.0)
             else:
                 # Never silent: a failing encoder would otherwise look
                 # exactly like a slow one.
@@ -328,7 +350,9 @@ def local_ipv4_addresses() -> List[str]:
 #  The page
 # ═══════════════════════════════════════════════════════════════
 
-_PAGE = """<!doctype html>
+# Raw string: the JavaScript below contains regular expressions with \s and
+# \d, which Python would otherwise try to interpret as its own escapes.
+_PAGE = r"""<!doctype html>
 <title>Drone Detection Station</title>
 <style>
  *{box-sizing:border-box}
@@ -350,20 +374,40 @@ _PAGE = """<!doctype html>
  h2{font-size:12px;color:#8b857c;margin:18px 0 6px;letter-spacing:.1em;
     text-transform:uppercase;font-weight:400}
  .ok{color:#64dc82}.warn{color:#fabe3c}.bad{color:#ff5050}
+ .src{font-size:10px;color:#6d675e;letter-spacing:.04em}
+ #view canvas,#view img{display:block;max-width:100%;height:auto}
 </style>
 <header>
   <h1>DRONE DETECTION STATION</h1>
   <span class="muted" id="url"></span>
 </header>
 <main>
-  <div id="view"><img src="/video_feed" alt="live camera"></div>
+  <div id="view"><canvas id="cv" width="640" height="562"></canvas></div>
   <aside>
     <h2>Pipeline rate</h2>
     <table>
-      <tr><th>Camera</th><td id="camera_fps">-</td></tr>
-      <tr><th>Hailo / YOLO</th><td id="hailo_fps">-</td></tr>
-      <tr><th>JPEG encode</th><td id="jpeg_fps">-</td></tr>
-      <tr><th>MJPEG out</th><td id="mjpeg_fps">-</td></tr>
+      <tr><th>Camera <span class="src">sensor</span></th>
+          <td id="camera_fps">-</td></tr>
+      <tr><th>Processing loop <span class="src">worker</span></th>
+          <td id="process_fps">-</td></tr>
+      <tr><th>Hailo / YOLO <span class="src">around infer</span></th>
+          <td id="hailo_fps">-</td></tr>
+      <tr><th>JPEG encode <span class="src">encoder</span></th>
+          <td id="jpeg_fps">-</td></tr>
+      <tr><th>MJPEG out <span class="src">socket</span></th>
+          <td id="mjpeg_fps">-</td></tr>
+      <tr><th>Received <span class="src">browser</span></th>
+          <td id="recv_fps">-</td></tr>
+      <tr><th>Displayed <span class="src">browser</span></th>
+          <td id="disp_fps">-</td></tr>
+    </table>
+    <h2>Latency</h2>
+    <table>
+      <tr><th>Inference</th><td id="infer_ms">-</td></tr>
+      <tr><th>Capture wait</th><td id="cap_ms">-</td></tr>
+      <tr><th>Frame age at publish</th><td id="age_ms">-</td></tr>
+      <tr><th>Capture &rarr; display</th><td id="lat_ms">-</td></tr>
+      <tr><th>Frames dropped</th><td id="dropped">-</td></tr>
     </table>
     <h2>Status</h2>
     <table>
@@ -384,15 +428,189 @@ document.getElementById('url').textContent = location.origin;
 function cls(v){return v==='ONLINE'?'ok':(v==='DEGRADED'||v==='STARTING')
   ?'warn':(v==='DISABLED'?'':'bad');}
 function put(id,text,klass){var e=document.getElementById(id);
-  e.textContent=text; e.className=klass||'';}
+  if(!e) return; e.textContent=text; e.className=klass||'';}
+function fps(v){return (v===null||v===undefined)?'-':v.toFixed(1)+' fps';}
+function ms(v){return (v===null||v===undefined)?'-':v.toFixed(0)+' ms';}
+
+/* ══════════════════════════════════════════════════════════════════
+   REAL DISPLAY FPS — measured HERE, because only here can it be.
+   ══════════════════════════════════════════════════════════════════
+   The server knows when it wrote bytes to a socket. It cannot know when
+   this browser decoded them or when the compositor painted them, and for a
+   slow client those differ without bound. So:
+
+     RECEIVED  = multipart parts fully read off the ONE existing MJPEG
+                 connection. No second stream, no second encode: this reads
+                 exactly the response an <img> would have consumed.
+     DISPLAYED = frames actually drawn, counted inside requestAnimationFrame,
+                 which fires only when the browser really composites.
+     DROPPED   = gaps in the server's X-Frame-Seq, so frames the pipeline
+                 produced but this client never got are visible instead of
+                 silently improving the received rate.
+
+   If streaming fetch is unavailable (or fails), we fall straight back to a
+   plain <img src="/video_feed"> and report the two browser numbers as
+   UNAVAILABLE rather than substituting a server-side number under a
+   browser-side name.
+================================================================== */
+var recvTimes = [], paintTimes = [], latSamples = [];
+var lastSeq = null, dropped = 0, pending = null, streaming = false;
+var canvas = document.getElementById('cv'), ctx = canvas.getContext('2d');
+
+function rate(times){
+  var now = performance.now(), cut = now - 2000, i = 0;
+  while(i < times.length && times[i] < cut) i++;
+  times.splice(0, i);
+  if(times.length < 2) return 0;
+  var span = times[times.length-1] - times[0];
+  return span > 0 ? (times.length - 1) * 1000 / span : 0;
+}
+
+function paint(){
+  if(pending){
+    var bmp = pending; pending = null;
+    if(canvas.width !== bmp.width || canvas.height !== bmp.height){
+      canvas.width = bmp.width; canvas.height = bmp.height;
+    }
+    ctx.drawImage(bmp, 0, 0);
+    if(bmp.close) bmp.close();
+    paintTimes.push(performance.now());
+  }
+  requestAnimationFrame(paint);
+}
+
+function fallbackToImg(why){
+  streaming = false;
+  var view = document.getElementById('view');
+  view.innerHTML = '<img src="/video_feed" alt="live camera">';
+  put('recv_fps','UNAVAILABLE'); put('disp_fps','UNAVAILABLE');
+  put('lat_ms','UNAVAILABLE'); put('dropped','UNAVAILABLE');
+  console.warn('display metrics unavailable, using <img>:', why);
+}
+
+/* Part headers are always well under 256 bytes, so the search for their
+   terminator is bounded. Scanning the whole buffer instead would re-scan the
+   entire JPEG body on every arriving chunk — O(n^2) in the frame size, paid
+   on the viewer's CPU for no benefit. */
+var HDR_SCAN_MAX = 512;
+function indexOfSeq(buf, pat, from){
+  var end = Math.min(buf.length, from + HDR_SCAN_MAX) - pat.length;
+  outer: for(var i = from; i <= end; i++){
+    for(var j = 0; j < pat.length; j++) if(buf[i+j] !== pat[j]) continue outer;
+    return i;
+  }
+  return -1;
+}
+
+async function stream(){
+  if(!window.ReadableStream || !window.fetch || !window.createImageBitmap){
+    fallbackToImg('browser lacks streaming fetch or createImageBitmap');
+    return;
+  }
+  streaming = true;
+  requestAnimationFrame(paint);
+  try{
+    const resp = await fetch('/video_feed', {cache:'no-store'});
+    if(!resp.body) throw new Error('no response body');
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    const CRLF2 = [13,10,13,10];
+    let buf = new Uint8Array(0);
+    for(;;){
+      const {done, value} = await reader.read();
+      if(done) break;
+      const merged = new Uint8Array(buf.length + value.length);
+      merged.set(buf); merged.set(value, buf.length);
+      buf = merged;
+      for(;;){
+        const hdrEnd = indexOfSeq(buf, CRLF2, 0);
+        if(hdrEnd < 0){
+          /* No header terminator within the bounded scan window means this
+             is not the stream we expect. Fall back rather than buffer
+             without limit on the viewer's machine. */
+          if(buf.length > HDR_SCAN_MAX){
+            fallbackToImg('malformed multipart headers');
+            return;
+          }
+          break;
+        }
+        const head = dec.decode(buf.subarray(0, hdrEnd));
+        const mLen = /content-length:\s*(\d+)/i.exec(head);
+        if(!mLen) break;
+        const len = parseInt(mLen[1], 10);
+        const start = hdrEnd + 4;
+        if(buf.length < start + len) break;
+        const jpeg = buf.slice(start, start + len);
+        buf = buf.slice(start + len);
+
+        const mSeq = /x-frame-seq:\s*(\d+)/i.exec(head);
+        const mAge = /x-frame-age-ms:\s*(-?[\d.]+)/i.exec(head);
+        const mSrv = /x-server-ms:\s*([\d.]+)/i.exec(head);
+        if(mSeq){
+          const seq = parseInt(mSeq[1], 10);
+          if(lastSeq !== null && seq > lastSeq + 1) dropped += seq - lastSeq - 1;
+          lastSeq = seq;
+        }
+        recvTimes.push(performance.now());
+        /* capture -> display = how old the frame already was when the server
+           published it, PLUS how long it took to reach and decode here.
+           The second leg uses the server's own wall clock in the header
+           against ours; a client whose clock is offset from the Pi's would
+           bias it, so it is only reported when the result is sane. */
+        const arrivedWall = Date.now();
+        try{
+          const bmp = await createImageBitmap(new Blob([jpeg], {type:'image/jpeg'}));
+          pending = bmp;
+          if(mAge && mSrv){
+            const age = parseFloat(mAge[1]);
+            const net = arrivedWall - parseFloat(mSrv[1]);
+            if(age >= 0 && net >= 0 && net < 5000) latSamples.push(age + net);
+            if(latSamples.length > 60) latSamples.shift();
+          }
+        }catch(e){ /* one corrupt part must not kill the stream */ }
+      }
+    }
+    fallbackToImg('stream ended');
+  }catch(e){
+    fallbackToImg(e);
+  }
+}
+
 async function poll(){
   try{
     const r = await fetch('/status',{cache:'no-store'});
     const s = await r.json();
-    put('camera_fps', s.camera_fps.toFixed(1)+' fps');
-    put('hailo_fps',  s.hailo_fps.toFixed(1)+' fps');
-    put('jpeg_fps',   s.jpeg_fps.toFixed(1)+' fps');
-    put('mjpeg_fps',  s.mjpeg_fps.toFixed(1)+' fps');
+    /* Labelled by WHERE it was measured. camera_fps is the sensor's own rate
+       via SensorTimestamp; if the driver does not report it the server says
+       so and we say so too, rather than showing the loop rate as if it were
+       the camera. */
+    put('camera_fps', fps(s.camera_fps) +
+        (s.camera_fps_is_sensor ? '' : '  (loop, no SensorTimestamp)'),
+        s.camera_fps_is_sensor ? '' : 'warn');
+    put('process_fps', fps(s.process_fps));
+    put('hailo_fps',  fps(s.hailo_fps));
+    put('jpeg_fps',   fps(s.jpeg_fps));
+    put('mjpeg_fps',  fps(s.mjpeg_fps));
+    put('infer_ms',   ms(s.inference_ms));
+    put('cap_ms',     ms(s.capture_wait_ms));
+    put('age_ms',     ms(s.frame_age_ms),
+        (s.frame_age_ms !== null && s.frame_age_ms > 100) ? 'warn' : '');
+    if(streaming){
+      const rf = rate(recvTimes), df = rate(paintTimes);
+      put('recv_fps', fps(rf));
+      put('disp_fps', fps(df));
+      put('dropped', String(dropped));
+      let lat = null;
+      if(latSamples.length){
+        lat = latSamples.slice().sort((a,b)=>a-b)[Math.floor(latSamples.length/2)];
+      }
+      put('lat_ms', lat === null ? 'measuring...' : ms(lat));
+      fetch('/client_metrics', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({received_fps: rf, displayed_fps: df,
+                              display_latency_ms: lat === null ? 0 : lat,
+                              dropped: dropped})}).catch(()=>{});
+    }
     put('hailo', s.hailo, cls(s.hailo==='ONLINE'?'ONLINE':s.hailo));
     put('camera', s.camera_health, cls(s.camera_health));
     put('mic', s.acoustic_health, cls(s.acoustic_health));
@@ -404,6 +622,7 @@ async function poll(){
     put('clients', String(s.clients));
   }catch(e){ put('state','web server unreachable','bad'); }
 }
+stream();
 poll(); setInterval(poll, 700);
 </script>
 """
@@ -436,6 +655,23 @@ class WebServer:
         self.hailo_meter = FpsMeter()
 
         self._status_provider: Optional[Callable[[], dict]] = None
+
+        # ── Client-reported display metrics ──
+        #
+        # ⚠️ THE SERVER CANNOT MEASURE THESE, AND MUST NOT PRETEND TO.
+        #
+        # Everything this process can observe stops at the socket: it knows
+        # when it handed bytes to the kernel, not when a browser decoded them
+        # and not when a compositor put them on a screen. Those can differ by
+        # an unbounded amount for a slow client or a slow link.
+        #
+        # So the browser measures its own two numbers and posts them back
+        # here. They are stored verbatim, tagged as client-reported, and go
+        # stale on their own if the browser stops reporting — a number nobody
+        # is currently producing must not keep being displayed as current.
+        self._client_metrics: Dict[str, float] = {}
+        self._client_metrics_stamp = 0.0
+
         self._thread: Optional[threading.Thread] = None
         self._server = None            # uvicorn.Server
         self._started = threading.Event()
@@ -446,12 +682,37 @@ class WebServer:
     def set_status_provider(self, provider: Callable[[], dict]) -> None:
         self._status_provider = provider
 
-    def publish(self, frame: np.ndarray) -> None:
-        self.bus.publish(frame)
+    def publish(self, frame: np.ndarray,
+                frame_age_ms: Optional[float] = None) -> None:
+        self.bus.publish(frame, frame_age_ms)
 
     def note_inference(self) -> None:
-        """One Hailo/YOLO invocation actually happened."""
+        """
+        One Hailo/YOLO invocation actually happened.
+
+        ⚠️ NO LONGER CALLED BY main.py, and deliberately so — see the note in
+        Station.run(). The station's UI loop could only observe a subset of
+        camera frames, so counting there produced a rate capped by
+        ui.max_ui_fps rather than the detector's real rate. The real rate is
+        now measured inside camera_worker around the forward pass itself and
+        arrives through the status provider. This method is kept for the
+        module self-test and for any caller that genuinely is on the
+        inference path.
+        """
         self.hailo_meter.tick()
+
+    def note_client_metrics(self, metrics: Dict[str, float]) -> None:
+        """Store what a browser reported about its own display performance."""
+        self._client_metrics = dict(metrics)
+        self._client_metrics_stamp = time.monotonic()
+
+    def client_metrics(self, max_age_s: float = 5.0) -> Dict[str, float]:
+        """Client metrics, or {} if nothing recent was reported."""
+        if not self._client_metrics:
+            return {}
+        if time.monotonic() - self._client_metrics_stamp > max_age_s:
+            return {}
+        return dict(self._client_metrics)
 
     @property
     def running(self) -> bool:
@@ -545,7 +806,7 @@ class WebServer:
     # ── Application ────────────────────────────────────────────
 
     def _build_app(self):
-        from fastapi import FastAPI
+        from fastapi import FastAPI, Request
         from fastapi.responses import HTMLResponse, JSONResponse
         from fastapi.responses import StreamingResponse
 
@@ -565,7 +826,13 @@ class WebServer:
         @app.get("/status")
         def status() -> JSONResponse:
             payload = {
-                "camera_fps": 0.0, "hailo_fps": self.hailo_meter.fps,
+                # Defaults only. The station's provider overwrites camera_fps
+                # and hailo_fps with values measured at the camera worker; the
+                # hailo_meter fallback exists for the standalone self-test.
+                "camera_fps": 0.0, "camera_fps_is_sensor": False,
+                "process_fps": 0.0, "hailo_fps": self.hailo_meter.fps,
+                "frame_age_ms": None, "capture_wait_ms": None,
+                "inference_ms": None,
                 "jpeg_fps": bus.jpeg_meter.fps, "mjpeg_fps": bus.mjpeg_fps,
                 "publish_fps": bus.publish_meter.fps,
                 "resolution": bus.resolution, "clients": bus.client_count,
@@ -581,7 +848,44 @@ class WebServer:
                     # look like a healthy station with odd numbers.
                     log.exception("[WEB] status provider failed")
                     payload["state"] = f"status error: {exc}"
+            # Merged last and namespaced, so a client-reported number can
+            # never be mistaken for one this process measured.
+            payload["client"] = self.client_metrics()
             return JSONResponse(payload)
+
+        @app.post("/client_metrics")
+        async def client_metrics(request: Request) -> JSONResponse:
+            """
+            A browser reporting its OWN display performance.
+
+            `async def` on purpose: the only awaited call is reading a request
+            body of a few dozen bytes, and there is no blocking work here at
+            all, so a threadpool slot would be pure overhead. Every other
+            endpoint in this file is `def` precisely because it CAN block.
+
+            Untrusted input: only known keys are kept, only finite numbers are
+            accepted, and nothing here can influence the pipeline — these
+            values are displayed and nothing else reads them.
+            """
+            try:
+                raw = await request.json()
+            except Exception:
+                return JSONResponse({"ok": False, "error": "bad json"},
+                                    status_code=400)
+            if not isinstance(raw, dict):
+                return JSONResponse({"ok": False, "error": "expected object"},
+                                    status_code=400)
+            allowed = ("received_fps", "displayed_fps", "decoded_fps",
+                       "display_latency_ms", "dropped")
+            clean: Dict[str, float] = {}
+            for key in allowed:
+                value = raw.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    value = float(value)
+                    if value == value and abs(value) != float("inf"):
+                        clean[key] = value
+            self.note_client_metrics(clean)
+            return JSONResponse({"ok": True})
 
         @app.get("/video_feed")
         def video_feed() -> StreamingResponse:
@@ -619,8 +923,37 @@ class WebServer:
                     continue
                 last_seq = seq
                 self.bus.client_tick(cid)
+                # ── Per-part metadata ──
+                #
+                # X-Frame-Seq lets the browser count DROPPED frames (gaps in
+                # the sequence) rather than only the ones it received, and
+                # X-Frame-Age-Ms carries how old the camera frame already was
+                # when it was published. The browser adds its own leg — encode
+                # queue, network, decode, paint — and reports the total back,
+                # which is the only place a real capture-to-display latency
+                # can be assembled.
+                #
+                # These are ordinary multipart part headers: a browser
+                # rendering the stream in an <img> ignores them completely, so
+                # the plain fallback path is unaffected.
+                age = self.bus.frame_age_ms()
+                age_header = (b"X-Frame-Age-Ms: "
+                              + (b"%.1f" % age if age is not None else b"-1")
+                              + b"\r\n")
+                # ⚠️ time.time(), not time.monotonic() — the ONE place in this
+                # project where wall clock is correct. This value is compared
+                # against the BROWSER's Date.now(), on a different machine; a
+                # monotonic clock is meaningless across processes, let alone
+                # across hosts. The JS side discards the result when it comes
+                # out negative or absurd, which is what an unsynchronised
+                # client clock produces, so a skewed clock degrades the
+                # latency figure to "unavailable" instead of to a wrong number.
                 yield (b"--frame\r\n"
                        b"Content-Type: image/jpeg\r\n"
+                       b"X-Frame-Seq: " + str(seq).encode() + b"\r\n" +
+                       age_header +
+                       b"X-Server-Ms: " +
+                       ("%.1f" % (time.time() * 1000.0)).encode() + b"\r\n"
                        b"Content-Length: " + str(len(data)).encode() +
                        b"\r\n\r\n" + data + b"\r\n")
         except GeneratorExit:

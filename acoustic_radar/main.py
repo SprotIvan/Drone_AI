@@ -306,8 +306,20 @@ class Station:
                      self.acoustic.mean_block_ms,
                      self.config.acoustic.effective_block_seconds() * 1000.0)
         if self.camera is not None:
-            log.info("camera: %.1f fps, inference %.0f ms",
-                     self.camera.fps, self.camera.inference_ms)
+            log.info("camera: sensor %.1f fps | loop %.1f fps | "
+                     "detector %.1f fps | inference %.0f ms | "
+                     "frame age %.0f ms",
+                     self.camera.sensor_fps, self.camera.fps,
+                     self.camera.detector_fps, self.camera.inference_ms,
+                     self.camera.frame_age_ms)
+            if self.camera.sensor_fps and self.camera.fps > \
+                    self.camera.sensor_fps * 1.15:
+                log.warning(
+                    "the processing loop (%.1f fps) ran FASTER than the "
+                    "sensor produced frames (%.1f fps) — it was draining "
+                    "queued frames, not seeing new ones. Mean frame age was "
+                    "%.0f ms.", self.camera.fps, self.camera.sensor_fps,
+                    self.camera.frame_age_ms)
         log.info("LED ring: %s, %d hardware writes",
                  self.led.status.value, self.led.writes)
         for line in BUDGET.report():
@@ -386,8 +398,37 @@ class Station:
         visual = target.visual if target is not None else None
         acoustic = target.acoustic if target is not None else None
         led_state = self._led_lamp_state()
+        # ⚠️ EACH RATE COMES FROM THE STAGE THAT PERFORMS THAT WORK.
+        #
+        #   camera_fps  = SENSOR rate (SensorTimestamp). Falls back to the
+        #                 loop rate ONLY when the driver reports no timestamp,
+        #                 and `camera_fps_is_sensor` says which one it is, so
+        #                 the dashboard never presents a processing rate as a
+        #                 capture rate.
+        #   process_fps = camera-worker loop rate (may exceed camera_fps while
+        #                 a queued backlog is drained — that is not a faster
+        #                 camera).
+        #   hailo_fps   = measured around the real Hailo forward pass.
+        #   frame_age_ms= capture-to-publish latency; the stale-frame test.
         return {
-            "camera_fps": float(visual.loop_fps) if visual else 0.0,
+            "camera_fps": float(
+                visual.sensor_fps if visual is not None
+                and visual.sensor_fps else
+                (visual.loop_fps if visual is not None else 0.0)),
+            "camera_fps_is_sensor": bool(
+                visual is not None and visual.sensor_fps),
+            "process_fps": float(visual.loop_fps) if visual else 0.0,
+            "hailo_fps": float(visual.detector_fps) if visual else 0.0,
+            "frame_age_ms": (float(visual.frame_age_ms)
+                             if visual is not None
+                             and visual.frame_age_ms is not None else None),
+            "capture_wait_ms": (float(visual.capture_wait_ms)
+                                if visual is not None
+                                and visual.capture_wait_ms is not None
+                                else None),
+            "inference_ms": (float(visual.inference_ms)
+                             if visual is not None
+                             and visual.inference_ms is not None else None),
             "hailo": ("ONLINE" if visual is not None
                       and visual.inference_ms is not None else
                       self._visual_health().state.value),
@@ -534,15 +575,21 @@ class Station:
                     self._announce(target, last_state)
                     last_state = target.state
 
-                # Count Hailo/YOLO invocations, not camera frames: the
-                # detector is duty-cycled (visual.frame_skip), so the two
-                # rates are genuinely different numbers and the dashboard
-                # reports them separately.
-                if (self.web is not None and visual_obs is not None
-                        and visual_obs.seq != self._last_web_visual_seq):
-                    self._last_web_visual_seq = visual_obs.seq
-                    if visual_obs.detector_ran:
-                        self.web.note_inference()
+                # ⚠️ THE HAILO RATE IS NO LONGER COUNTED HERE.
+                #
+                # This block used to call web.note_inference() once per new
+                # VisualObservation that the UI happened to see. That is a
+                # measurement of the UI, not of Hailo: this whole branch runs
+                # at most `ui.max_ui_fps` (20) times a second and skips every
+                # frame produced between two UI ticks, so the reported
+                # "Hailo / YOLO fps" was structurally incapable of exceeding
+                # 20 and under-counted whenever the camera ran faster than the
+                # UI — which is always.
+                #
+                # It is now measured inside camera_worker, around the actual
+                # `predict_with_scores()` call, and read out of the published
+                # observation in _web_status(). See VisualObservation's
+                # rate-field comment for why the four rates are distinct.
 
                 # The frame is composed ONCE and reused by both consumers.
                 # The web view is the station's own display, not a second
@@ -563,7 +610,19 @@ class Station:
                     if not self.headless:
                         cv2.imshow(window, frame)
                     if self.web is not None:
-                        self.web.publish(frame)
+                        # How old the CAMERA frame already was by the time
+                        # this composed image left the station: the sensor-to
+                        # -publish leg, carried to the browser so it can add
+                        # its own network+decode+paint leg and report a real
+                        # end-to-end latency instead of the server inventing
+                        # one it cannot see.
+                        age_ms = None
+                        if visual_obs is not None:
+                            if visual_obs.frame_age_ms is not None:
+                                age_ms = (visual_obs.frame_age_ms
+                                          + (now() - visual_obs.timestamp)
+                                          * 1000.0)
+                        self.web.publish(frame, age_ms)
 
                 inst = 1.0 / max(since_render, 1e-6)
                 self._ui_fps = (0.9 * self._ui_fps + 0.1 * inst

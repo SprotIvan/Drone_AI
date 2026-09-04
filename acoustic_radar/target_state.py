@@ -250,6 +250,30 @@ class VisualObservation:
     tracker_ms: Optional[float] = None
     loop_fps: float = 0.0
 
+    # ── Rates, each measured AT THE PLACE THE WORK HAPPENS ──
+    #
+    # ⚠️ THESE ARE FOUR DIFFERENT NUMBERS AND MUST NOT BE INTERCHANGED.
+    #
+    #   sensor_fps    how fast the SENSOR produces new frames, derived from
+    #                 libcamera's SensorTimestamp. This is the only physical
+    #                 frame rate. None when the driver does not report it.
+    #   loop_fps      how fast this worker completes an iteration. It can
+    #                 legitimately EXCEED sensor_fps while it drains frames
+    #                 that picamera2 already had queued — that is processing
+    #                 throughput, not capture rate.
+    #   detector_fps  how often the Hailo forward pass actually runs. The
+    #                 detector is duty-cycled, so this is neither of the above.
+    #   frame_age_ms  now - SensorTimestamp at the moment this observation was
+    #                 published: the real capture-to-published latency, and the
+    #                 direct test for stale/queued frames.
+    sensor_fps: Optional[float] = None
+    detector_fps: float = 0.0
+    frame_age_ms: Optional[float] = None
+    #: Wall time the worker spent blocked inside capture_array/capture_request.
+    #: Near zero means frames were already waiting (a backlog); near one frame
+    #: period means the loop is genuinely waiting on the sensor.
+    capture_wait_ms: Optional[float] = None
+
     timestamp: float = field(default_factory=now)
     seq: int = 0
 

@@ -600,10 +600,30 @@ def test_regressions():
                            tracks=(), active_camera=0, camera_name="FAR",
                            timestamp=now(), seq=1)
     _s = _f.update(acoustic("LISTEN", p=0.0), _v, HEALTHY, HEALTHY)
-    _a = _hud.render(_s, 0.05, camera_fps=37.0)
-    _b = _hud.render(_s, 0.05, camera_fps=37.0)
-    check("P2: HUD reuses one canvas instead of allocating per frame",
-          _a is _b, "same buffer returned")
+    # ⚠️ THE INVARIANT CHANGED, AND DELIBERATELY SO.
+    #
+    # This used to assert `_a is _b` — ONE reused canvas. That is right for
+    # cv2.imshow, which copies before returning, and WRONG for
+    # web_server.FrameBus, which keeps the reference and copies it later on a
+    # uvicorn worker thread. With a single canvas the next render() wrote into
+    # the exact buffer a client was mid-copy of, so a JPEG could contain half
+    # of frame N and half of frame N+1.
+    #
+    # The requirement it was really protecting — "do not allocate a full
+    # frame buffer on every render" — is unchanged and is still asserted
+    # here. What is added is that consecutive renders must not hand out the
+    # SAME buffer, so a consumer holding frame N has a whole frame period to
+    # copy it before that memory is touched again.
+    _renders = [_hud.render(_s, 0.05, camera_fps=37.0) for _ in range(6)]
+    _distinct = {id(r) for r in _renders}
+    check("P2: HUD allocates no per-frame canvas (bounded buffer pool)",
+          len(_distinct) == 2, f"{len(_distinct)} distinct buffers over 6 renders")
+    check("P2: consecutive renders return DIFFERENT buffers "
+          "(web client can copy frame N while frame N+1 is drawn)",
+          all(_renders[i] is not _renders[i + 1]
+              for i in range(len(_renders) - 1))
+          and _renders[0] is _renders[2],
+          "buffers must alternate")
 
     # BUG C1: CameraManager.get_frame() must never raise
     import camera_manager
@@ -2095,11 +2115,53 @@ def test_17_web_server():
     import main as _main
 
     run_src = _insp.getsource(_main.Station.run)
+    # `publish(frame` rather than `publish(frame)`: the call now also carries
+    # the frame's measured age for the browser-side latency figure. What this
+    # check exists to protect is that there is exactly ONE render and that the
+    # SAME `frame` object reaches both consumers — not the argument count.
     check("the station renders ONCE and feeds both window and web",
           run_src.count("self.hud.render(") == 1
-          and "self.web.publish(frame)" in run_src)
+          and "self.web.publish(frame" in run_src)
     check("the web view renders even when the local window is disabled",
           "if not self.headless or self.web is not None:" in run_src)
+
+    # ── EVERY RATE MUST BE COUNTED WHERE ITS WORK HAPPENS ──
+    #
+    # The Hailo rate used to be counted in Station.run(), inside the block
+    # guarded by `if due:`. That block runs at most ui.max_ui_fps (20) times a
+    # second and only sees whichever VisualObservation is current when it
+    # ticks, so the reported "Hailo / YOLO fps" was mathematically incapable
+    # of exceeding 20 and skipped every frame produced between UI ticks. It
+    # measured the UI and displayed the result under Hailo's name.
+    check("the Hailo rate is NOT counted in the rate-limited UI loop",
+          "note_inference" not in run_src,
+          "Station.run still calls note_inference; the UI loop is capped at "
+          "ui.max_ui_fps and cannot count the detector's real rate")
+
+    import camera_worker as _cw
+    _loop_src = _insp.getsource(_cw.CameraWorker._loop)
+    check("the Hailo rate IS counted around the real forward pass",
+          "_det_fps_ema" in _loop_src
+          and _loop_src.index("_det_fps_ema") <
+              _loop_src.index("predict_with_scores"),
+          "the detector rate must be measured immediately before the "
+          "inference call, in the camera thread")
+
+    # sensor rate vs loop rate must be SEPARATE fields, or a loop draining
+    # picamera2's queued backlog is indistinguishable from a faster camera.
+    import dataclasses as _dc
+    _obs_fields = {f.name for f in _dc.fields(VisualObservation)}
+    check("VisualObservation reports sensor rate and loop rate separately",
+          {"sensor_fps", "loop_fps", "detector_fps",
+           "frame_age_ms"} <= _obs_fields,
+          f"missing: {{'sensor_fps','loop_fps','detector_fps','frame_age_ms'}} "
+          f"- {_obs_fields}")
+
+    _status_src = _insp.getsource(_main.Station._web_status)
+    check("the dashboard's camera FPS prefers the SENSOR rate",
+          "sensor_fps" in _status_src and "camera_fps_is_sensor" in _status_src,
+          "camera_fps must come from SensorTimestamp, and the payload must "
+          "say when it had to fall back to the loop rate instead")
 
 
 def _rl_pack(colour) -> int:

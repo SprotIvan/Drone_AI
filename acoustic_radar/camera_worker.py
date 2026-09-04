@@ -182,6 +182,23 @@ class CameraWorker:
         self._infer_ema = 0.0
         self._frame_count = 0
         self._detector_available = False
+
+        # ── Rate meters, each fed AT the place its work happens ──
+        #
+        # ⚠️ These used to be one number (`_fps_ema`) plus a counter driven
+        # from the UI thread. That could not answer the question that actually
+        # matters — "is the loop running fast because the SENSOR is fast, or
+        # because it is draining a backlog?" — and the UI-thread counter was
+        # structurally incapable of exceeding ui.max_ui_fps.
+        self._sensor_fps_ema = 0.0        # from SensorTimestamp deltas
+        self._det_fps_ema = 0.0           # actual Hailo invocation rate
+        self._frame_age_ms_ema = 0.0      # now - SensorTimestamp
+        self._capture_wait_ms_ema = 0.0   # time blocked inside capture
+        self._last_sensor_ns: Optional[int] = None
+        self._last_detect_t: Optional[float] = None
+        self._last_frame_camera: Optional[int] = None
+        self._boottime_ok = hasattr(time, "clock_gettime") and hasattr(
+            time, "CLOCK_BOOTTIME")
         # Requested from the UI thread, serviced on the camera thread.
         self._calibrate_request = threading.Event()
 
@@ -312,6 +329,36 @@ class CameraWorker:
             SubsystemState.ONLINE if self._detector_available
             else SubsystemState.DEGRADED, detail)
 
+    # ── Measurement helpers ────────────────────────────────────
+
+    @staticmethod
+    def _ema(previous: float, sample: float, alpha: float = 0.1) -> float:
+        """
+        Exponential average that SEEDS on the first sample.
+
+        ⚠️ The previous form was `0.9*prev + 0.1*x if prev else x`, which seeds
+        correctly but was fed a first interval of a few microseconds (the loop
+        set `last_time` immediately before entering the loop and read the clock
+        again immediately after). That seeded the camera FPS at ~10^5 and it
+        took ~77 frames — about 2.5 s — of 0.9 decay to come back to reality.
+        The first interval is now discarded by the callers instead.
+        """
+        return (1.0 - alpha) * previous + alpha * sample if previous else sample
+
+    def _sensor_now_ns(self) -> Optional[int]:
+        """
+        'Now' on the SAME clock libcamera stamps frames with.
+
+        libcamera's SensorTimestamp is CLOCK_BOOTTIME. time.monotonic() is
+        CLOCK_MONOTONIC. On Linux the two differ by however long the machine
+        has been suspended — zero on a Pi that never suspends, but comparing
+        them is still wrong on principle and would silently produce a constant
+        offset in every frame-age figure if the Pi ever did suspend.
+        """
+        if not self._boottime_ok:
+            return None
+        return int(time.clock_gettime(time.CLOCK_BOOTTIME) * 1e9)
+
     # ── Main loop ──────────────────────────────────────────────
 
     def _loop(self) -> None:
@@ -320,14 +367,18 @@ class CameraWorker:
 
         v = self.config.visual
         consecutive_failures = 0
-        last_time = time.monotonic()
+        # None, not now(): the first iteration must not produce an interval.
+        # See _ema() — a microsecond-long first interval used to seed the FPS
+        # average at ~100000 and poison it for the first seconds of the run.
+        last_time: Optional[float] = None
 
         log.info("camera loop running")
 
         while not self._stop.is_set():
             frame_start = time.monotonic()
 
-            frame_raw = self._manager.get_frame()
+            frame_raw, sensor_ns = self._manager.get_frame_and_sensor_ns()
+            capture_done = time.monotonic()
             if frame_raw is None:
                 consecutive_failures += 1
                 self.events.rate("camera-noframe", logging.WARNING,
@@ -372,6 +423,32 @@ class CameraWorker:
 
             self._frame_count += 1
 
+            # ── A. SENSOR rate and frame age — the physical measurements ──
+            #
+            # Recorded here, before any processing, from the driver's own
+            # timestamp. `sensor_fps` is the ONLY number in this file that
+            # describes the camera; everything else describes this software.
+            self._capture_wait_ms_ema = self._ema(
+                self._capture_wait_ms_ema, (capture_done - frame_start) * 1000.0)
+            if frame_camera != self._last_frame_camera:
+                # A switch restarts capture on the other sensor, so the
+                # interval spanning it is a switch cost, not a frame period.
+                # Counting it would drag the reported sensor rate down once
+                # per switch for no reason.
+                self._last_sensor_ns = None
+                self._last_frame_camera = frame_camera
+            if sensor_ns is not None:
+                if self._last_sensor_ns is not None:
+                    d_ns = sensor_ns - self._last_sensor_ns
+                    if d_ns > 0:
+                        self._sensor_fps_ema = self._ema(
+                            self._sensor_fps_ema, 1e9 / d_ns)
+                self._last_sensor_ns = sensor_ns
+                now_ns = self._sensor_now_ns()
+                if now_ns is not None:
+                    self._frame_age_ms_ema = self._ema(
+                        self._frame_age_ms_ema, (now_ns - sensor_ns) / 1e6)
+
             # ⚠️ Preserved exactly from the original main(): the detector is
             # fed the RAW camera array and the display gets a colour-swapped
             # copy. See VisualConfig.swap_detector_channels for why this is
@@ -391,6 +468,22 @@ class CameraWorker:
             infer_ms: Optional[float] = None
             if run_detector:
                 t0 = time.monotonic()
+                # ── B. HAILO INVOCATION RATE, counted where it happens ──
+                #
+                # ⚠️ This used to be counted in main.py's UI loop, inside the
+                # `if due:` block. That block runs at most `ui.max_ui_fps`
+                # times a second (20), and only looks at whichever
+                # VisualObservation happens to be current — so the reported
+                # "Hailo / YOLO fps" could never exceed 20 and silently
+                # skipped every frame that arrived between UI ticks. It was
+                # not a Hailo measurement at all; it was a UI measurement
+                # wearing Hailo's name.
+                if self._last_detect_t is not None:
+                    gap = t0 - self._last_detect_t
+                    if gap > 0:
+                        self._det_fps_ema = self._ema(self._det_fps_ema,
+                                                      1.0 / gap)
+                self._last_detect_t = t0
                 try:
                     detections, scores = self._detector.predict_with_scores(
                         detector_input)
@@ -437,12 +530,12 @@ class CameraWorker:
                 self._print_calibration(frame_camera, max_box_w)
 
             # ── Publish ──
-            dt = frame_start - last_time
+            # ── C. LOOP rate — PROCESSING throughput, not the frame rate ──
+            if last_time is not None:
+                dt = frame_start - last_time
+                if dt > 0:
+                    self._fps_ema = self._ema(self._fps_ema, 1.0 / dt)
             last_time = frame_start
-            if dt > 0:
-                inst = 1.0 / dt
-                self._fps_ema = (0.9 * self._fps_ema + 0.1 * inst
-                                 if self._fps_ema else inst)
 
             self._seq += 1
             self.latest.publish(VisualObservation(
@@ -458,13 +551,23 @@ class CameraWorker:
                 inference_ms=(self._infer_ema if self._infer_ema else None),
                 tracker_ms=None,
                 loop_fps=self._fps_ema,
+                sensor_fps=(self._sensor_fps_ema
+                            if self._sensor_fps_ema else None),
+                detector_fps=self._det_fps_ema,
+                frame_age_ms=(self._frame_age_ms_ema
+                              if self._last_sensor_ns is not None else None),
+                capture_wait_ms=self._capture_wait_ms_ema,
                 timestamp=now(),
                 seq=self._seq))
 
             self.events.rate(
                 "camera-heartbeat", logging.DEBUG,
-                "camera: %.1f fps, %d track(s), infer %.0f ms, cam %d",
-                self._fps_ema, len(tracks), self._infer_ema, frame_camera,
+                "camera: sensor %.1f fps | loop %.1f fps | detector %.1f fps | "
+                "infer %.0f ms | frame age %.0f ms | capture wait %.1f ms | "
+                "%d track(s) | cam %d",
+                self._sensor_fps_ema, self._fps_ema, self._det_fps_ema,
+                self._infer_ema, self._frame_age_ms_ema,
+                self._capture_wait_ms_ema, len(tracks), frame_camera,
                 interval=5.0)
 
     # ── Track extraction ───────────────────────────────────────
@@ -579,7 +682,23 @@ class CameraWorker:
 
     @property
     def fps(self) -> float:
+        """PROCESSING rate of this loop. See `sensor_fps` for the camera."""
         return self._fps_ema
+
+    @property
+    def sensor_fps(self) -> float:
+        """Physical new-frame rate from SensorTimestamp. 0.0 = not measurable."""
+        return self._sensor_fps_ema
+
+    @property
+    def detector_fps(self) -> float:
+        """Rate at which the Hailo forward pass actually runs."""
+        return self._det_fps_ema
+
+    @property
+    def frame_age_ms(self) -> float:
+        """Capture-to-publish latency. Large = frames were queued (stale)."""
+        return self._frame_age_ms_ema
 
     @property
     def inference_ms(self) -> float:

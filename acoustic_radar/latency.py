@@ -114,8 +114,9 @@ class LatencyBudget:
     problem is that it has no CPU to spare.
     """
 
-    ORDER = ("audio_wait", "features", "inference", "block_total",
-             "publish_to_fuse", "hud_render", "led_write")
+    ORDER = ("audio_wait", "features", "inference", "side_channels",
+             "block_total", "publish_to_fuse", "hud_render", "jpeg_encode",
+             "led_write")
 
     def __init__(self, enabled: bool = True):
         self.enabled = enabled
