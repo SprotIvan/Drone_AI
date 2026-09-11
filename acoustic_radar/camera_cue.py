@@ -282,6 +282,109 @@ class BearingProjector:
             return None
         return abs(wrap_signed_deg(visual_bearing - float(bearing_deg)))
 
+    def max_agreement_deg(self, camera_id: int,
+                          width_px: Optional[int] = None
+                          ) -> Optional[float]:
+        """
+        The LARGEST disagreement this camera can physically produce for a
+        bearing that is itself inside the frame. None when uncalibrated.
+
+        ⚠️ THIS IS THE FULL FIELD OF VIEW, NOT HALF OF IT (finding N1).
+        A box sits at some angle θ from the boresight and the bearing at
+        some angle b, and both are bounded by the half-field h:
+
+            |θ| <= h,  |b| <= h   =>   max |b - θ| = 2h = the FULL fov
+
+        The extreme is reached when the bearing is at one edge of the frame
+        and the box at the other. Using h here instead of 2h — as an earlier
+        version of this analysis did — understates the gate's reach by a
+        factor of two and wrongly declares it dead on the wide camera.
+        """
+        focal = self.geometry.camera_focal_px.get(camera_id)
+        if not focal:
+            return None
+        width = int(width_px) if width_px else self.width_px
+        focal = float(focal)
+        if width != self.width_px and self.width_px > 0:
+            focal *= width / float(self.width_px)
+        return horizontal_fov_deg(focal, width)
+
+    def agreement_span_covers_tolerance(self, camera_id: int,
+                                        tolerance_deg: float,
+                                        width_px: Optional[int] = None
+                                        ) -> Optional[bool]:
+        """
+        CAMERA CAPABILITY: can the agreement test ever reject a box on this
+        camera, for a bearing that is itself IN VIEW?
+
+        False means the tolerance exceeds the whole field, so every
+        in-frame box paired with an in-frame bearing passes. That is not a
+        defect in the tolerance — it is what happens when the direction
+        sensor's uncertainty is larger than the camera's field of view.
+
+        ⚠️ THIS IS A PROPERTY OF THE LENS, NOT OF ANY ONE OBSERVATION. It
+        says nothing about a bearing that falls OUTSIDE the frame, which
+        can disagree by far more than the field of view. For "did THIS
+        check have any power?", use agreement_discriminating().
+
+        None when the optics are uncalibrated and the question is moot.
+        """
+        span = self.max_agreement_deg(camera_id, width_px)
+        if span is None:
+            return None
+        return bool(span > float(tolerance_deg))
+
+    def agreement_discriminating(self, camera_id: int,
+                                 bearing_deg: Optional[float],
+                                 agreement_deg: Optional[float],
+                                 tolerance_deg: float,
+                                 width_px: Optional[int] = None
+                                 ) -> Optional[bool]:
+        """
+        PER OBSERVATION: could THIS agreement check have gone the other way?
+
+        ═══════════════════════════════════════════════════════════
+        ⚠️ FORENSIC REVIEW DEFECT D2 — WHY THIS IS SEPARATE
+        ═══════════════════════════════════════════════════════════
+
+        The previous single flag reported the CAMERA's capability as though
+        it described the individual check. On the telephoto camera that
+        capability is False (9.4 deg field vs a 20 deg tolerance), so a box
+        that was ACTUALLY REJECTED — which happens whenever the acoustic
+        bearing falls outside the frame — was still reported as
+        "non-discriminating". Measured: bearing 190 deg against a centred
+        box gives 40 deg of disagreement, comfortably over tolerance, the
+        gate rejects, and the old flag said the check had no power.
+
+        The rule now has two branches, in this order:
+
+          1. If the check REJECTED, it discriminated. Full stop. A concrete
+             outcome outranks any statement about what was possible.
+          2. Otherwise it passed, and the question is whether a rejection
+             was reachable AT ALL for this bearing. The box can sit
+             anywhere within +/-h of the boresight, so the largest
+             disagreement obtainable for a bearing at relative angle b is
+             |b| + h. The pass is informative only if that exceeds the
+             tolerance.
+
+        None when the optics are uncalibrated, or there is no bearing.
+        """
+        span = self.max_agreement_deg(camera_id, width_px)
+        boresight = self.geometry.camera_boresight_deg.get(camera_id)
+        if span is None or boresight is None:
+            return None
+
+        # 1. An actual rejection is proof the check had power.
+        if agreement_deg is not None and float(agreement_deg) > float(
+                tolerance_deg):
+            return True
+
+        # 2. A pass: was any rejection reachable for this bearing?
+        if bearing_deg is None:
+            return None
+        rel = abs(wrap_signed_deg(float(bearing_deg) - float(boresight)))
+        return bool(rel + (span / 2.0) > float(tolerance_deg))
+
 
 if __name__ == "__main__":
     from fusion_config import load
@@ -291,6 +394,14 @@ if __name__ == "__main__":
     print("=" * 66)
 
     cfg = load()
+    # ⚠️ A station binds role -> device index at start-up (finding C1);
+    # until it does, the index-keyed optics maps are empty by design. This
+    # demo has no cameras, so it binds the same way CameraWorker._setup()
+    # would. TELE is the long lens, WIDE the short one — which physical
+    # device each is cannot be known here, and does not matter for a demo.
+    from camera_identity import TELE, WIDE
+    cfg.geometry.bind_roles({TELE: 0, WIDE: 1})
+
     proj = BearingProjector(cfg.geometry, width_px=640)
 
     print("\n1. Default state — mount offset was never measured:")
@@ -323,7 +434,8 @@ if __name__ == "__main__":
         back = proj.project(0, b, 1.0)
         print(f"   x={x:6.1f} -> bearing {b:6.2f}° -> x={back.x_px:6.1f}")
 
-    print("\n4. Wide lens (camera 1, focal 501.7) sees much more:")
+    print(f"\n4. Wide lens (camera 1, focal "
+          f"{cfg.geometry.camera_focal_px[1]:.0f} px) sees much more:")
     cfg.geometry.camera_boresight_deg[1] = 130.0
     proj1 = BearingProjector(cfg.geometry, width_px=640)
     print(f"   {proj1.status_text(1)}")

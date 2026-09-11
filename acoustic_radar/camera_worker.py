@@ -41,6 +41,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from fusion_config import StationConfig
+from latency import BUDGET
 from station_logging import EventLogger
 from target_state import (LatestValue, SubsystemHealth, SubsystemState,
                           VisualObservation, VisualTrack, now)
@@ -100,21 +101,27 @@ class CameraSwitchPolicy:
         if self.frozen:
             return None
 
-        from camera_manager import CameraManager
         cfg = self.config
 
-        want_near = want_far = False
+        # ⚠️ Was `CameraManager.FAR_CAMERA_ID` / `NEAR_CAMERA_ID`, i.e. the
+        # constants 0 and 1 (audit finding C1). The comparison is now
+        # against the indices the roles actually resolved to on this
+        # machine, read from the manager that resolved them.
+        wide_id = manager.wide_id
+        tele_id = manager.tele_id
+
+        want_wide = want_tele = False
         basis = ""
 
         if distance_m is not None:
             # PRIMARY PATH — metric distance with hysteresis.
-            want_near = distance_m < cfg.switch_to_near_below_m
-            want_far = distance_m > cfg.switch_to_far_above_m
+            want_wide = distance_m < cfg.switch_to_near_below_m
+            want_tele = distance_m > cfg.switch_to_far_above_m
             basis = f"{distance_m:.2f} m"
         elif max_box_height_px > 0:
             # FALLBACK — uncalibrated optics, pixel height only.
-            want_near = max_box_height_px > cfg.fallback_near_height_px
-            want_far = max_box_height_px < cfg.fallback_far_height_px
+            want_wide = max_box_height_px > cfg.fallback_near_height_px
+            want_tele = max_box_height_px < cfg.fallback_far_height_px
             basis = f"{max_box_height_px:.0f} px"
         else:
             # No target at all: decay both streaks so a stale streak cannot
@@ -122,24 +129,22 @@ class CameraSwitchPolicy:
             self._near_streak = self._far_streak = 0
             return None
 
-        self._near_streak = self._near_streak + 1 if want_near else 0
-        self._far_streak = self._far_streak + 1 if want_far else 0
+        self._near_streak = self._near_streak + 1 if want_wide else 0
+        self._far_streak = self._far_streak + 1 if want_tele else 0
 
         need = cfg.confirm_frames
 
-        if (current_camera == CameraManager.FAR_CAMERA_ID
-                and self._near_streak >= need):
-            if manager.switch_to_near():
+        if current_camera == tele_id and self._near_streak >= need:
+            if manager.switch_to_wide():
                 self._near_streak = 0
-                self.last_reason = f"FAR -> NEAR ({basis})"
+                self.last_reason = f"TELE -> WIDE ({basis})"
                 return self.last_reason
             # Suppressed by the debounce or the camera is not open. Keep the
             # streak so the switch fires as soon as it is permitted.
-        elif (current_camera == CameraManager.NEAR_CAMERA_ID
-                and self._far_streak >= need):
-            if manager.switch_to_far():
+        elif current_camera == wide_id and self._far_streak >= need:
+            if manager.switch_to_tele():
                 self._far_streak = 0
-                self.last_reason = f"NEAR -> FAR ({basis})"
+                self.last_reason = f"WIDE -> TELE ({basis})"
                 return self.last_reason
 
         return None
@@ -273,14 +278,20 @@ class CameraWorker:
         range gate updates, and every distance label on screen silently
         keeps using the old value.
 
-        Pushing config -> module at startup means the JSON override governs
-        both. Values absent from the config leave the module's own constants
-        untouched.
+        ⚠️ ORDER MATTERS (audit findings C1/M3). This runs AFTER the
+        cameras are open, because until the roles are resolved to device
+        indices there is no correct index to key the module's dict by.
+        `geo.camera_focal_px` is empty before bind_roles(), so calling this
+        earlier would have pushed nothing and silently left the module's
+        own stale constants in charge.
         """
         geo = self.config.geometry
-        for camera_id, focal in geo.camera_focal_px.items():
-            if focal is not None:
-                tc.CAMERA_FOCAL_PX[camera_id] = float(focal)
+        # Replace, do not merge: a leftover entry for an index that no
+        # longer holds that role is exactly the stale copy this exists to
+        # prevent.
+        tc.CAMERA_FOCAL_PX = {
+            camera_id: (None if focal is None else float(focal))
+            for camera_id, focal in geo.camera_focal_px.items()}
         if geo.drone_real_width_m is not None:
             tc.DRONE_REAL_WIDTH_M = float(geo.drone_real_width_m)
         log.debug("optics synced from config: focal=%s width=%s",
@@ -290,18 +301,48 @@ class CameraWorker:
         import TWO_CAMERAS_FIXED as tc
         from camera_manager import CameraManager
 
-        self._sync_optics(tc)
+        geo = self.config.geometry
         v = self.config.visual
         log.info("opening cameras (%dx%d @ %d fps)...",
                  v.frame_width, v.frame_height, v.fps)
+
+        # ⚠️ Fail-closed on identity (audit finding C1). CameraManager
+        # resolves each role from the camera's stable device-tree Id and
+        # RAISES if that is ambiguous, missing or unconfigured. The raise
+        # propagates to _run(), which reports the camera subsystem OFFLINE
+        # with the operator-ready message and leaves the acoustic
+        # subsystem running. A wrong role is worse than no video: it is
+        # video with every distance, cue and lens choice silently
+        # transposed.
         self._manager = CameraManager(
             width=v.frame_width, height=v.frame_height, fps=v.fps,
             max_fps=v.max_fps, buffer_count=v.buffer_count,
             debounce_interval=self.config.switching.debounce_interval_s,
-            warmup_frames=v.warmup_frames)
+            warmup_frames=v.warmup_frames,
+            role_hints=geo.camera_role_id_hint,
+            expected_sensor_model=geo.expected_sensor_model,
+            lens_mm=geo.lens_mm)
+
+        # ── Adopt the focal lengths derived from the REAL sensor mode ──
+        # Still theoretical, but no longer dependent on an assumption
+        # about which mode libcamera picked. See _derive_focal_px.
+        for role, focal in self._manager.focal_px_by_role.items():
+            geo.camera_focal_px_by_role[role] = focal
+            geo.camera_focal_source[role] = \
+                self._manager.focal_source_by_role.get(
+                    role, "THEORETICAL(runtime-mode)")
+
+        # Role -> device index, once, now that the mapping is known.
+        geo.bind_roles(self._manager.roles)
+        self._sync_optics(tc)
+
+        for line in geo.focal_status_lines():
+            log.warning("OPTICS NOT CALIBRATED: %s", line)
+
         opened = self._manager.available_cameras()
-        log.info("cameras opened: %s (active %d)", opened,
-                 self._manager.get_active_camera())
+        log.info("cameras opened: %s (active %s)",
+                 {i: self._manager.role_for(i) for i in opened},
+                 self._manager.role_for(self._manager.get_active_camera()))
         if len(opened) < 2:
             log.warning("only %d of 2 cameras available — switching will be "
                         "limited to what is open", len(opened))
@@ -436,7 +477,10 @@ class CameraWorker:
                 # Counting it would drag the reported sensor rate down once
                 # per switch for no reason.
                 self._last_sensor_ns = None
+                first_frame = self._last_frame_camera is None
                 self._last_frame_camera = frame_camera
+                if not first_frame:
+                    self._reset_camera_state(frame_camera)
             if sensor_ns is not None:
                 if self._last_sensor_ns is not None:
                     d_ns = sensor_ns - self._last_sensor_ns
@@ -496,6 +540,22 @@ class CameraWorker:
                 infer_ms = (time.monotonic() - t0) * 1000.0
                 self._infer_ema = (0.9 * self._infer_ema + 0.1 * infer_ms
                                    if self._infer_ema else infer_ms)
+
+                # ── WHERE THE 29 ms ACTUALLY GOES ──
+                #
+                # The detector reports its own four internal stages (see
+                # HailoInference.stage_ms). Recording them here, in the
+                # thread that made the call, is what distinguishes "the NPU
+                # is saturated" from "the NPU is idle while numpy does
+                # post-processing on the CPU" — two problems with opposite
+                # fixes, which a single aggregate timing cannot tell apart.
+                stages = getattr(self._detector, "stage_ms", None)
+                if stages:
+                    for stage, value in stages.items():
+                        # None = the stage was skipped on this frame (NMS is,
+                        # whenever nothing was detected). Skipped is not zero.
+                        if value is not None:
+                            BUDGET.record("hailo_" + stage, float(value))
 
             # ── Tracking ──
             try:
@@ -570,6 +630,75 @@ class CameraWorker:
                 self._capture_wait_ms_ema, len(tracks), frame_camera,
                 interval=5.0)
 
+    # ── Camera switch: discard the other camera's state ────────
+
+    def _reset_camera_state(self, new_camera: int) -> None:
+        """
+        Drop every piece of state that belonged to the PREVIOUS camera.
+
+        ═══════════════════════════════════════════════════════════
+        ⚠️ AUDIT FINDING C4 — WHY THIS MUST HAPPEN
+        ═══════════════════════════════════════════════════════════
+
+        `AdvancedADASTracker` is constructed once in _setup() and was never
+        told that the camera changed. Two things then went wrong on the
+        first frame after every switch, and neither raised an error:
+
+        1. OPTICAL FLOW ACROSS TWO DIFFERENT LENSES.
+           `EgoMotionEstimator.prev_gray` still held the LAST FRAME OF THE
+           OTHER CAMERA, so `estimate_motion()` ran Lucas-Kanade between a
+           WIDE frame and a TELE frame. Those are different fields of view
+           pointing along slightly different axes; the flow field between
+           them is not camera motion and the affine warp fitted to it is
+           meaningless. That warp was then applied to every live track via
+           `warp_all_models()`.
+
+        2. TRACK COORDINATES IN THE WRONG PIXEL SCALE.
+           An IMM track holds a position, velocity and box size in PIXELS.
+           With the lenses on this station the angular scale changes by
+           25/6 = 4.17x in one frame, so a track carried across the switch
+           describes a target that appears to jump and resize violently.
+           The filter's response to that is to either diverge or to spend
+           several frames dragging the estimate across the frame, and
+           `estimate_distance_m()` is reading the box width the whole time.
+
+        Clearing both is the correct behaviour rather than a workaround:
+        after a switch there genuinely is no prior observation of the
+        target through THIS lens, so the honest state is no state. The
+        detector re-acquires on the next frame; a Tentative track needs a
+        few frames to confirm, which is the real, unavoidable cost of a
+        switch and is why switching is debounced and confirmed rather than
+        done per frame.
+        """
+        # ── Ego motion: prev_gray, prev_pts and the frame counter ──
+        estimator = getattr(self._tracker, "ego_estimator", None)
+        if estimator is not None:
+            try:
+                estimator.reset()
+            except Exception as exc:
+                self.events.rate("switch-reset-error", logging.ERROR,
+                                 "ego-motion reset failed on camera "
+                                 "switch: %s", exc)
+
+        # ── Tracks: pixel state from the other lens ──
+        dropped = 0
+        try:
+            dropped = len(self._tracker.tracks)
+            self._tracker.tracks.clear()
+        except Exception as exc:
+            self.events.rate("switch-reset-error", logging.ERROR,
+                             "track reset failed on camera switch: %s", exc)
+
+        # The switch also invalidates the detector-rate interval, for the
+        # same reason the sensor interval is dropped above: the gap spans a
+        # pipeline restart, not a frame period.
+        self._last_detect_t = None
+
+        log.info("camera switch -> %s: cleared %d track(s) and the "
+                 "ego-motion reference (optical flow must never cross two "
+                 "different lenses)",
+                 self._camera_name(new_camera), dropped)
+
     # ── Track extraction ───────────────────────────────────────
 
     def _collect_tracks(self, active_camera: int
@@ -625,11 +754,19 @@ class CameraWorker:
         return out, max_h, max_w
 
     def _camera_name(self, camera_id: int) -> str:
-        from camera_manager import CameraManager
-        if camera_id == CameraManager.FAR_CAMERA_ID:
-            return "FAR/IMX477"
-        if camera_id == CameraManager.NEAR_CAMERA_ID:
-            return "NEAR/IMX708"
+        """
+        Label for the HUD and the logs: the camera's ROLE plus its sensor.
+
+        ⚠️ This used to return "FAR/IMX477" for index 0 and "NEAR/IMX708"
+        for index 1 (audit findings C1 and C3). Both parts were wrong.
+        There is no IMX708 on this station — both cameras are IMX477P — so
+        the operator was shown a sensor that is not installed. And the
+        label was chosen by INDEX, so if libcamera ever reordered the
+        cameras the HUD would confidently mislabel which lens the picture
+        came from. The name now comes from the resolved role binding.
+        """
+        if self._manager is not None:
+            return f"{self._manager.role_for(camera_id)}/IMX477P"
         return f"CAM{camera_id}"
 
     def _print_calibration(self, camera_id: int, box_width_px: float) -> None:
@@ -718,18 +855,29 @@ if __name__ == "__main__":
     events = EventLogger(_logging.getLogger("station.test"), cfg.logging)
 
     class StubManager:
-        """Mimics CameraManager's switching surface, including the debounce."""
-        FAR_CAMERA_ID = 0
-        NEAR_CAMERA_ID = 1
+        """
+        Mimics CameraManager's switching surface, including the debounce.
+
+        ⚠️ Exposes `wide_id` / `tele_id`, the RESOLVED role indices, not the
+        old FAR_CAMERA_ID / NEAR_CAMERA_ID class constants (finding C1). The
+        indices below are an arbitrary but consistent stand-in for a
+        resolved mapping; on real hardware they come from the device Ids.
+        """
+        tele_id = 0          # the long lens
+        wide_id = 1          # the wide lens
 
         def __init__(self, debounce=0.5):
-            self.active = 0
+            self.active = self.tele_id
             self.debounce = debounce
             self.last = 0.0
             self.switches = 0
 
         def get_active_camera(self):
             return self.active
+
+        def role_for(self, camera_id):
+            return {self.tele_id: "TELE", self.wide_id: "WIDE"}.get(
+                camera_id, f"CAM{camera_id}")
 
         def _switch(self, target):
             if self.active == target:
@@ -741,11 +889,14 @@ if __name__ == "__main__":
             self.switches += 1
             return True
 
-        def switch_to_near(self):
-            return self._switch(self.NEAR_CAMERA_ID)
+        def switch_to_wide(self):
+            return self._switch(self.wide_id)
 
-        def switch_to_far(self):
-            return self._switch(self.FAR_CAMERA_ID)
+        def switch_to_tele(self):
+            return self._switch(self.tele_id)
+
+        switch_to_near = switch_to_wide
+        switch_to_far = switch_to_tele
 
     import sys
     sys.modules.setdefault("camera_manager", type(sys)("camera_manager"))

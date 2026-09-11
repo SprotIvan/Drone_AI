@@ -5,9 +5,13 @@
     "led_zero_offset_deg": 0.0
   },
   "geometry": {
-    "camera_boresight_deg": {
-      "0": 0.0,
-      "1": 0.0
+    "camera_role_id_hint": {
+      "WIDE": null,
+      "TELE": null
+    },
+    "camera_boresight_deg_by_role": {
+      "WIDE": null,
+      "TELE": null
     },
     "drone_real_width_m": 0.25
   }

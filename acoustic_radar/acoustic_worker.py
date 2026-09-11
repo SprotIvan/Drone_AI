@@ -195,6 +195,14 @@ class AcousticWorker:
                      "the device buffer overruns",
                      self._block_seconds * 1000.0, BLOCK_SEC * 1000.0,
                      self._block_seconds * 1000.0)
+        # ⚠️ The classifier's sliding window, NOT the hop (finding M1). The
+        # engine keeps features.WINDOW_SAMPLES of audio and advances it by
+        # one block each time, so every decision describes the last 2.0 s —
+        # not the last `block_seconds`. Attributing a decision to the
+        # window's centre needs this length, so it travels with the
+        # observation rather than being re-guessed by each consumer.
+        self._analysis_window_s = float(features.WINDOW_SEC)
+
         self._stream = open_stream(inp, self._block_samples)
 
         # ── Optional side channels ──
@@ -366,7 +374,13 @@ class AcousticWorker:
                     continue
 
                 self._seq += 1
-                obs = self._to_observation(status)
+                # ⚠️ `t0` is the monotonic instant stream.read() RETURNED,
+                # i.e. the moment the newest sample of this block existed
+                # (audit finding M1). Passing it through is what lets the
+                # observation distinguish when the SOUND happened from when
+                # the DECISION was published — roughly a second apart,
+                # because the classifier analyses a 2 s window.
+                obs = self._to_observation(status, capture_end_ts=t0)
                 self.latest.publish(obs)
 
                 if self.health.get().state is not SubsystemState.ONLINE:
@@ -402,7 +416,9 @@ class AcousticWorker:
 
     # ── Translation ────────────────────────────────────────────
 
-    def _to_observation(self, status) -> AcousticObservation:
+    def _to_observation(self, status,
+                        capture_end_ts: Optional[float] = None
+                        ) -> AcousticObservation:
         """
         RadarStatus (mutable, reused in place by the engine) → immutable
         snapshot.
@@ -440,6 +456,12 @@ class AcousticWorker:
             noise_dbfs=float(r.noise_dbfs),
             excess_db=float(r.excess_db),
             timestamp=now(),
+            # See AcousticObservation's bookkeeping note (finding M1):
+            # `timestamp` is when this DECISION was published;
+            # capture_end_ts + analysis_window_s say which audio it
+            # describes, so the sound's own age is recoverable.
+            capture_end_ts=capture_end_ts,
+            analysis_window_s=self._analysis_window_s,
             seq=self._seq,
             overflow=bool(status.overflow))
 

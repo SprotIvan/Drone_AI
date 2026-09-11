@@ -115,8 +115,13 @@ class LatencyBudget:
     """
 
     ORDER = ("audio_wait", "features", "inference", "side_channels",
-             "block_total", "publish_to_fuse", "hud_render", "jpeg_encode",
-             "led_write")
+             "block_total", "publish_to_fuse",
+             # The camera path's biggest cost, split into the four stages that
+             # call for different fixes: the first is CPU memory traffic, the
+             # second is the Hailo NPU itself, the last two are numpy/OpenCV
+             # post-processing back on the CPU.
+             "hailo_letterbox", "hailo_infer", "hailo_decode", "hailo_nms",
+             "hud_render", "jpeg_encode", "led_write")
 
     def __init__(self, enabled: bool = True):
         self.enabled = enabled

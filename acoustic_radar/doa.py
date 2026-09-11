@@ -30,10 +30,25 @@ doa.py — Визначення напрямку на ціль (Direction of Arr
       конкретний індекс, якщо його задано у radar_calibration.json.
 
 БАГ №4 — субпроцес запускався у головному аудіоциклі.
-    Запуск python-інтерпретатора займає 200–500 мс. Це блокувало читання
-    аудіо кожні 2 с → переповнення буфера → пропущені шматки звуку →
-    гірша детекція.
+    Один виклик xvf_host.py блокує потік надовго. Це блокувало читання
+    аудіо → переповнення буфера → пропущені шматки звуку → гірша детекція.
     → Тепер опитування йде у власному потоці, аудіоцикл лише читає кеш.
+
+    ⚠️ ЦИФРА ТУТ БУЛА ВЗЯТА ЗІ СТЕЛІ. Раніше цей коментар стверджував
+    «200–500 мс», і на цю цифру потім спирались оцінки навантаження на
+    Pi. ВИМІРЯНО на цільовому залізі (Raspberry Pi 5, Python у venv,
+    `python diagnose.py xvf`, n=20):
+
+        порожній запуск інтерпретатора   mean  18.3 мс   (p95  20.8)
+        xvf_host.py AEC_AZIMUTH_VALUES   mean 128.6 мс   (p95 137.2)
+
+    Тобто реальна вартість — 129 мс, а не 200–500, і майже вся вона
+    належить самому xvf_host.py, а не старту Python (18 мс). При
+    interval = 0.35 с це 27% зайнятості одного потоку і ~7% усього CPU
+    чотириядерного Pi 5, ПОСТІЙНО — включно з часом, коли цілі немає.
+
+    Це помітна, але НЕ головна стаття витрат: інференс Hailo займає 29 мс
+    із 33.3 мс кадрового бюджету (87%), і саме він обмежує камеру.
 
 БАГ №5 — не було жодної прив'язки до фізичної орієнтації масиву.
     Нуль градусів мікрофона майже ніколи не збігається з нулем на екрані.
@@ -975,8 +990,94 @@ class DOAProvider:
         self.hardware_ok = self.hardware.start()
 
         self.array = ArrayDOA(cfg.get("mic_positions_m"), sample_rate)
-        self.array_ok = n_channels >= 2
+
+        # ═══════════════════════════════════════════════════════
+        # ⚠️ SRP-PHAT IS NOW GATED ON PHYSICAL VALIDITY (finding H5)
+        # ═══════════════════════════════════════════════════════
+        #
+        # This used to be `self.array_ok = n_channels >= 2`, which armed
+        # SRP-PHAT on any stereo device. On this station that is exactly
+        # the wrong condition, because the XVF3800 delivers TWO PROCESSED
+        # channels — its own beamformer output, not microphones.
+        #
+        # SRP-PHAT is a geometric method. It computes, for each candidate
+        # direction, the inter-microphone delays that direction would
+        # produce, and scores them against the measured cross-correlation.
+        # Every term in that requires the channels to be microphones AT
+        # KNOWN POSITIONS. Feed it two beamformed channels and the delays
+        # it solves for do not correspond to any physical baseline: the
+        # output is a smooth, plausible-looking angle with no relationship
+        # to where the sound came from.
+        #
+        # Nothing downstream could catch this. The degeneracy check only
+        # rejects channels that are nearly IDENTICAL, and the measured
+        # correlation between the two processed channels was 0.8632 —
+        # comfortably below the 0.999 threshold — so `usable_pairs()`
+        # accepted the pair and the result was flagged merely `ambiguous`.
+        #
+        # Two independent conditions must BOTH hold, and BOTH require an
+        # explicit attestation that only a hardware test can justify:
+        #
+        #   1. THE CHANNELS MUST BE VERIFIED RAW MICROPHONES —
+        #      `mic_channels_verified: true` PLUS a non-empty
+        #      `mic_channels`.
+        #   2. THE GEOMETRY MUST BE VERIFIED —
+        #      `mic_geometry_verified: true` PLUS `mic_positions_m`
+        #      different from the unmeasured default.
+        #
+        # ⚠️ NEITHER A CHANNEL COUNT NOR A CHANNEL LIST IS EVIDENCE
+        # (forensic review defect D5). An earlier version of this gate
+        # accepted `n_channels >= 4 or mic_channels`. Both disjuncts were
+        # wrong:
+        #
+        #   * a device can expose four PROCESSED channels — the XVF3800's
+        #     own 6-channel mode is documented in audio_io as 4 mics plus
+        #     2 references, which is itself an assumption, and a 4-channel
+        #     mode could be 2 beams plus 2 references. Counting channels
+        #     does not reveal their semantics;
+        #   * `mic_channels: [0, 1]` is an operator typing a tuple into
+        #     JSON. It is an assertion, not a measurement, and the whole
+        #     point of finding H5 was that the two processed XVF3800
+        #     channels are NOT microphones at known positions.
+        #
+        # Requiring a separate, explicit verified-flag means arming
+        # SRP-PHAT is a deliberate act that records "a human ran the tap
+        # test", rather than a side effect of filling in a config field.
+        #
+        # Refusing is safe. The USB DSP azimuth is the primary source and
+        # is unaffected; losing the fallback means the station reports
+        # "н/д" when the USB path fails, which is the honest answer, rather
+        # than a number derived from a geometry it does not have.
+        from calibration import DEFAULTS as _CAL_DEFAULTS
+
+        channels_listed = bool(cfg.get("mic_channels"))
+        channels_attested = bool(cfg.get("mic_channels_verified"))
+        geometry_differs = (cfg.get("mic_positions_m")
+                            != _CAL_DEFAULTS.get("mic_positions_m"))
+        geometry_attested = bool(cfg.get("mic_geometry_verified"))
+
+        raw_channels_verified = channels_listed and channels_attested
+        geometry_verified = geometry_differs and geometry_attested
+
         self._array_disabled_reason: str | None = None
+        if not raw_channels_verified:
+            self._array_disabled_reason = (
+                f"сирі мікрофонні канали НЕ ПІДТВЕРДЖЕНО "
+                f"({n_channels} кан., mic_channels"
+                f"{'' if channels_listed else ' не'} задано, "
+                f"mic_channels_verified="
+                f"{str(channels_attested).lower()}) — ні кількість каналів, "
+                f"ні перелік каналів не доводять, що це фізичні мікрофони, "
+                f"а не оброблені промені XVF3800; потрібен тест HW-5")
+        elif not geometry_verified:
+            self._array_disabled_reason = (
+                f"геометрію масиву НЕ ПІДТВЕРДЖЕНО (mic_positions_m "
+                f"{'відрізняється від типової' if geometry_differs else '— ЗНАЧЕННЯ ЗА ЗАМОВЧУВАННЯМ, квадрат 43 мм'}, "
+                f"mic_geometry_verified={str(geometry_attested).lower()}) — "
+                f"SRP-PHAT без виміряної бази дає стабільно неправильний "
+                f"кут; потрібен тест HW-6")
+
+        self.array_ok = self._array_disabled_reason is None
         self._degenerate_streak = 0
 
         self.tracker = DOATracker()
@@ -988,7 +1089,13 @@ class DOAProvider:
         parts = []
         parts.append(f"USB DOA: {'✅ ' + str(self.hardware.script_path)}"
                      if self.hardware_ok else "USB DOA: ❌ недоступний")
-        parts.append(f"SRP-PHAT: {'доступний' if self.array_ok else 'вимкнено'}")
+        # ⚠️ The reason is printed, not just the state. "вимкнено" alone
+        # invites an operator to go looking for a switch to turn back on;
+        # the reason says what physical fact would have to change first.
+        if self.array_ok:
+            parts.append("SRP-PHAT: доступний")
+        else:
+            parts.append(f"SRP-PHAT: вимкнено — {self._array_disabled_reason}")
         for conv in self.conventions.values():
             parts.append(conv.describe())
         return " | ".join(parts)

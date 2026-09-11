@@ -1165,12 +1165,19 @@ def _bearing_test(argv: List[str]) -> int:
 
     n = int(led_cfg.led_count)
     offset = float(calib.get("doa_offset_deg", 0.0))
-    invert = bool(calib.get("doa_invert", False))
+    # ⚠️ Was `bool(calib.get("doa_invert", False))` (audit finding H3).
+    # This diagnostic was the ONLY runtime reader of that key anywhere in
+    # the project, which is exactly what made it look alive. It reports the
+    # handedness the station actually applies instead — and reports it as
+    # UNCAL when it has not been measured, rather than printing False and
+    # letting that read as "measured, not mirrored".
+    handedness = calib.get("doa_handedness")
+    handedness_s = str(handedness) if handedness else "UNCAL (assumed CW)"
 
     print("=" * 66)
     print("respeaker_led.py — bearing check")
     print("=" * 66)
-    print(f"\ndoa_offset_deg = {offset:+.0f}   doa_invert = {invert}")
+    print(f"\ndoa_offset_deg = {offset:+.0f}   doa_handedness = {handedness_s}")
     print(f"led_zero_offset_deg = {led_cfg.led_zero_offset_deg:+.0f}   "
           f"led_index_clockwise = {led_cfg.led_index_clockwise}")
     print(f"ring = {n} LEDs, sector = {led_cfg.sector_leds}\n")

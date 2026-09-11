@@ -30,7 +30,39 @@ from typing import List
 import numpy as np
 
 from camera_cue import BearingProjector
-from fusion_config import load as load_config
+from fusion_config import load as _load_config_raw
+
+# ═══════════════════════════════════════════════════════════════
+#  Role binding in the test fixture
+# ═══════════════════════════════════════════════════════════════
+#
+# ⚠️ Since audit finding C1, the index-keyed optics maps
+# (`camera_focal_px`, `camera_boresight_deg`) start EMPTY and are filled
+# in by `GeometryConfig.bind_roles()` once camera_identity has resolved
+# which physical camera holds which lens. A real station always does this
+# during CameraWorker._setup(); a test that skipped it would be exercising
+# a state the station is never in — every camera would read as "focal not
+# calibrated" and every range gate would be disabled.
+#
+# So the fixture binds roles the way a running station does. The indices
+# match the semantics the rest of this suite was written against and that
+# the code carried before the rename:
+#
+#     index 0 = the LONG lens  (was FAR_CAMERA_ID)  -> TELE
+#     index 1 = the WIDE lens  (was NEAR_CAMERA_ID) -> WIDE
+#
+# ⚠️ This is a TEST FIXTURE, not a claim about the hardware. Which
+# physical socket actually holds which lens is unresolved and needs a
+# hardware check — see HARDWARE_TEST_REQUIRED.md test HW-1. Nothing here
+# depends on the answer: the tests only need SOME consistent binding.
+TEST_ROLES = {"TELE": 0, "WIDE": 1}
+
+
+def load_config(*args, **kwargs):
+    """load() plus the role binding that CameraWorker._setup() performs."""
+    cfg = _load_config_raw(*args, **kwargs)
+    cfg.geometry.bind_roles(TEST_ROLES)
+    return cfg
 from sensor_fusion import Priority, SensorFusion, SystemState
 from station_logging import EventLogger, setup
 from target_state import (AcousticObservation, Approach, Freshness,
@@ -346,7 +378,10 @@ def test_7_switch_oscillation():
     events = EventLogger(logging.getLogger("station.test"), cfg.logging)
 
     class StubManager:
-        FAR_CAMERA_ID, NEAR_CAMERA_ID = 0, 1
+        # Role -> device index, as CameraManager now resolves them from the
+        # stable device Id (finding C1). The policy compares against these
+        # instead of the old FAR_CAMERA_ID / NEAR_CAMERA_ID class constants.
+        tele_id, wide_id = TEST_ROLES["TELE"], TEST_ROLES["WIDE"]
 
         def __init__(self):
             self.active, self.switches = 0, 0
@@ -354,17 +389,21 @@ def test_7_switch_oscillation():
         def get_active_camera(self):
             return self.active
 
-        def switch_to_near(self):
-            if self.active == 1:
+        def switch_to_wide(self):
+            if self.active == self.wide_id:
                 return False
-            self.active, self.switches = 1, self.switches + 1
+            self.active, self.switches = self.wide_id, self.switches + 1
             return True
 
-        def switch_to_far(self):
-            if self.active == 0:
+        def switch_to_tele(self):
+            if self.active == self.tele_id:
                 return False
-            self.active, self.switches = 0, self.switches + 1
+            self.active, self.switches = self.tele_id, self.switches + 1
             return True
+
+        # The legacy aliases CameraManager still exposes.
+        switch_to_near = switch_to_wide
+        switch_to_far = switch_to_tele
 
     import camera_manager
     real = camera_manager.CameraManager
@@ -713,15 +752,930 @@ def test_regressions():
           cue_far.available and not cue_far.in_view
           and cue_far.x_px is None, cue_far.reason)
 
-    # Derived camera range must come from the optics, not a guess
+    # Derived camera range must come from the optics, not a guess.
+    #
+    # ⚠️ The expected value is now computed FROM THE CONFIGURED FOCAL
+    # LENGTH rather than from a hard-coded 1274.0 (audit finding C2). The
+    # literal made this test assert the old, optically impossible constant
+    # instead of the relationship it is meant to check, so a corrected
+    # calibration would have shown up here as a failure. What matters is
+    # that the derivation is focal * width / min_box — not which focal.
+    focal0 = cfg.geometry.camera_focal_px[0]
     rng = cfg.derive_visual_range_m(0)
-    expected = 1274.0 * 0.25 / 16.0
+    expected = focal0 * 0.25 / 16.0
     check("R1: camera range is derived from the optics",
           rng is not None and abs(rng - expected) < 0.1,
-          f"{rng:.1f} m from focal 1274 px, 0.25 m drone, 16 px min box")
+          f"{rng:.1f} m from focal {focal0:.0f} px, 0.25 m drone, "
+          f"16 px min box")
     cfg.geometry.camera_focal_px[0] = None
     check("R1: no focal calibration -> no derived range (not a guess)",
           cfg.derive_visual_range_m(0) is None)
+
+
+def test_19_camera_identity():
+    """
+    Audit finding C1 — a role must be bound to a STABLE identity, and the
+    station must refuse rather than guess when it cannot be.
+    """
+    header("TEST 19 — stable camera identity (finding C1)")
+    import camera_identity as ci
+
+    # Two IMX477s on different I2C sockets — the real topology of this
+    # station. Ids modelled on libcamera's device-tree paths.
+    CAMS = [
+        {"Num": 0, "Model": "imx477",
+         "Id": "/base/axi/pcie@120000/rp1/i2c@88000/imx477@1a"},
+        {"Num": 1, "Model": "imx477",
+         "Id": "/base/axi/pcie@120000/rp1/i2c@80000/imx477@1a"},
+    ]
+
+    roles = ci.resolve_roles(
+        CAMS, {"WIDE": "i2c@88000", "TELE": "i2c@80000"})
+    check("C1: a configured hint binds each role to one device",
+          roles == {"WIDE": 0, "TELE": 1}, str(roles))
+
+    # ⚠️ THE POINT OF THE WHOLE FIX. libcamera reorders the cameras — the
+    # `Num` fields swap — and the roles must follow the SOCKET, not the
+    # index. Under the old `camera_num=0 is FAR` scheme this reordering
+    # silently transposed the two lenses.
+    swapped = [dict(CAMS[1], Num=0), dict(CAMS[0], Num=1)]
+    roles_after = ci.resolve_roles(
+        swapped, {"WIDE": "i2c@88000", "TELE": "i2c@80000"})
+    check("C1: enumeration order changes -> the role follows the socket",
+          roles_after == {"WIDE": 1, "TELE": 0}, str(roles_after))
+
+    def _refuses(label, cams, hints, model=ci.EXPECTED_SENSOR_MODEL):
+        try:
+            ci.resolve_roles(cams, hints, model)
+        except ci.CameraIdentityError as exc:
+            check(f"C1: refuses — {label}", True, str(exc).splitlines()[0][:64])
+            return
+        check(f"C1: refuses — {label}", False, "it returned a mapping")
+
+    # No hints at all: the old behaviour would have used index order.
+    _refuses("no hint configured", CAMS, {"WIDE": None, "TELE": None})
+    _refuses("only one role configured", CAMS, {"WIDE": "i2c@88000"})
+    # A hint matching nothing: a camera was unplugged, or a cable moved.
+    _refuses("hint matches no camera", CAMS,
+             {"WIDE": "i2c@99999", "TELE": "i2c@80000"})
+    # A hint so short it matches both.
+    _refuses("hint is ambiguous", CAMS,
+             {"WIDE": "imx477", "TELE": "i2c@80000"})
+    # Both roles selecting the same physical device.
+    _refuses("both roles resolve to one camera", CAMS,
+             {"WIDE": "i2c@88000", "TELE": "i2c@88000"})
+    # Fewer than two cameras.
+    _refuses("only one camera present", CAMS[:1],
+             {"WIDE": "i2c@88000", "TELE": "i2c@80000"})
+    # A different sensor: its pixel pitch would invalidate the optics.
+    _refuses("an unexpected sensor model",
+             [CAMS[0], dict(CAMS[1], Model="imx708")],
+             {"WIDE": "i2c@88000", "TELE": "i2c@80000"})
+
+    # ── The theoretical focal maths (finding C2) ──
+    #
+    # ⚠️ MATH VERIFIED ONLY. This checks the formula, not the lens.
+    f_wide = ci.theoretical_focal_px(6.0, 2664, 640)
+    f_tele = ci.theoretical_focal_px(25.0, 2664, 640)
+    check("C2: theoretical focal from IMX477 optics (WIDE 6 mm)",
+          abs(f_wide - 930.0) < 1.0, f"{f_wide:.1f} px")
+    check("C2: theoretical focal from IMX477 optics (TELE 25 mm)",
+          abs(f_tele - 3875.0) < 1.0, f"{f_tele:.1f} px")
+
+    # THE defect that started C2: the pixel-focal ratio of two identical
+    # sensors in one mode MUST equal the lens ratio. The old pair failed
+    # this by 39%; the new pair satisfies it by construction.
+    check("C2: focal ratio now equals the lens ratio 25/6",
+          abs((f_tele / f_wide) - (25.0 / 6.0)) < 0.01,
+          f"{f_tele / f_wide:.3f} vs {25.0 / 6.0:.3f} "
+          f"(old 1274/501.7 = {1274.0 / 501.7:.2f})")
+
+    # The focal length depends on the MODE, not only the lens — which is
+    # why it is re-derived from the real ScalerCrop at runtime.
+    f_full = ci.theoretical_focal_px(6.0, 4056, 640)
+    check("C2: a full-FOV mode gives a different focal for the same lens",
+          abs(f_full - 610.8) < 1.0, f"{f_full:.1f} px vs 930 px binned")
+
+    # ═══════════════════════════════════════════════════════════
+    #  C1, SECOND HALF — WHICH LENS, MEASURED FROM THE IMAGES
+    # ═══════════════════════════════════════════════════════════
+    #
+    # Binding a role to a device Id makes the mapping stable but not known.
+    # The two lenses differ by 25/6 = 4.17x in magnification, and both
+    # cameras look the same way from the same mast, so the telephoto image
+    # IS the centre of the wide image blown up. That is measurable.
+    #
+    # The synthetic pair below models exactly that geometry: a textured
+    # scene, a "wide" view of all of it, and a "tele" view of its central
+    # 1/4.17 stretched back to full size.
+    rng = np.random.default_rng(7)
+    scene = rng.integers(0, 255, size=(480, 640), dtype=np.uint8)
+    scene = np.repeat(np.repeat(scene[::4, ::4], 4, axis=0), 4, axis=1)
+    RATIO = 25.0 / 6.0
+
+    import cv2 as _cv2
+    cw, ch = int(640 / RATIO), int(480 / RATIO)
+    x0, y0 = (640 - cw) // 2, (480 - ch) // 2
+    tele_view = _cv2.resize(scene[y0:y0 + ch, x0:x0 + cw], (640, 480),
+                            interpolation=_cv2.INTER_LINEAR)
+    wide_view = scene
+
+    role_a, role_b, detail = ci.classify_roles_by_optics(
+        wide_view, tele_view, RATIO)
+    check("C1: the optics identify which camera holds the long lens",
+          (role_a, role_b) == (ci.WIDE, ci.TELE), detail)
+
+    # The same pair presented the other way round must give the opposite
+    # answer — otherwise the test would pass on argument order alone.
+    role_a2, role_b2, detail2 = ci.classify_roles_by_optics(
+        tele_view, wide_view, RATIO)
+    check("C1: and the answer follows the images, not the argument order",
+          (role_a2, role_b2) == (ci.TELE, ci.WIDE), detail2)
+
+    # A correct assignment must score far above the swapped one.
+    good = ci.optical_assignment_score(wide_view, tele_view, RATIO)
+    bad = ci.optical_assignment_score(tele_view, wide_view, RATIO)
+    check("C1: the correct assignment correlates, the swapped one does not",
+          good > 0.5 and good > bad + 0.3,
+          f"correct NCC={good:+.3f} vs swapped NCC={bad:+.3f}")
+
+    # ⚠️ IT MUST REFUSE ON AN EMPTY SKY. That is what this station spends
+    # most of its time looking at, and a featureless frame correlates with
+    # nothing — a coin toss here would silently transpose the lenses.
+    blank = np.full((480, 640), 128, dtype=np.uint8)
+    r_a, r_b, d_blank = ci.classify_roles_by_optics(blank, blank, RATIO)
+    check("C1: a featureless scene is INCONCLUSIVE, never a guess",
+          r_a is None and r_b is None, d_blank)
+
+    # A scene that looks the same at both scales cannot separate them.
+    fine = np.tile(np.array([[0, 255], [255, 0]], dtype=np.uint8), (240, 320))
+    r_a2, r_b2, d_self = ci.classify_roles_by_optics(fine, fine, RATIO)
+    check("C1: a self-similar scene is INCONCLUSIVE too",
+          r_a2 is None and r_b2 is None, d_self)
+
+    # ── Provenance must never read as a measurement (finding C2) ──
+    cfg = load_config()
+    lines = cfg.geometry.focal_status_lines()
+    check("C2: the station says out loud that the focal is THEORETICAL",
+          len(lines) == 2 and all("THEORETICAL" in ln for ln in lines),
+          lines[0] if lines else "no warning emitted")
+    check("C2: and never calls a theoretical value calibrated",
+          not any("CALIBRATED" in ln.replace("NOT CALIBRATED", "")
+                  for ln in lines))
+
+
+def test_24_camera_manager_role_resolution():
+    """
+    C1 end-to-end: CameraManager must resolve roles from the optics, confirm
+    a configured hint against them, and refuse on a contradiction.
+    """
+    header("TEST 24 — CameraManager role resolution (C1)")
+    import camera_identity as ci
+    import camera_manager as cm
+    import cv2 as _cv2
+
+    RATIO = 25.0 / 6.0
+    rng = np.random.default_rng(11)
+    base = rng.integers(0, 255, size=(120, 160), dtype=np.uint8)
+    scene = np.repeat(np.repeat(base, 4, axis=0), 4, axis=1)   # 480x640
+    cw, ch = int(640 / RATIO), int(480 / RATIO)
+    x0, y0 = (640 - cw) // 2, (480 - ch) // 2
+    TELE_IMG = _cv2.cvtColor(
+        _cv2.resize(scene[y0:y0 + ch, x0:x0 + cw], (640, 480),
+                    interpolation=_cv2.INTER_LINEAR), _cv2.COLOR_GRAY2RGB)
+    WIDE_IMG = _cv2.cvtColor(scene, _cv2.COLOR_GRAY2RGB)
+    BLANK = np.full((480, 640, 3), 128, np.uint8)
+
+    INFO = [
+        {"Num": 0, "Model": "imx477",
+         "Id": "/base/axi/pcie@120000/rp1/i2c@88000/imx477@1a"},
+        {"Num": 1, "Model": "imx477",
+         "Id": "/base/axi/pcie@120000/rp1/i2c@80000/imx477@1a"},
+    ]
+
+    class FakeCam:
+        """Minimal Picamera2 stand-in. `images[num]` is what it returns."""
+        images = {}
+
+        def __init__(self, camera_num=0):
+            self.num = camera_num
+            self.camera_properties = {"PixelArraySize": (4056, 3040)}
+
+        def create_video_configuration(self, **kw):
+            return dict(kw)
+
+        def configure(self, cfg):
+            self._cfg = cfg
+
+        def camera_configuration(self):
+            return {"main": {"size": (640, 480)}}
+
+        def capture_metadata(self):
+            return {"ScalerCrop": (0, 0, 2664, 1980)}
+
+        def start(self):
+            pass
+
+        def capture_array(self):
+            return self.images[self.num]
+
+        def stop(self):
+            pass
+
+        def close(self):
+            pass
+
+    def build(images, hints):
+        FakeCam.images = images
+        cm.Picamera2 = FakeCam            # short-circuits _load_picamera2()
+        return cm.CameraManager(
+            width=640, height=480, fps=30, warmup_frames=0,
+            role_hints=hints, info_provider=lambda: list(INFO),
+            lens_mm={"WIDE": 6.0, "TELE": 25.0})
+
+    saved = cm.Picamera2
+    try:
+        # ── 1. NO HINT AT ALL: the optics alone must settle it ──
+        #
+        # This is the case that used to be fatal. Index 0 shows the wide
+        # view, index 1 the magnified one, so index 1 must come out TELE.
+        mgr = build({0: WIDE_IMG, 1: TELE_IMG}, {"WIDE": None, "TELE": None})
+        check("C1: with no hint, the roles are resolved from the images",
+              (mgr.wide_id, mgr.tele_id) == (0, 1),
+              f"WIDE={mgr.wide_id} TELE={mgr.tele_id} via {mgr.role_source}")
+        check("C1: and the station records that it MEASURED them",
+              "magnification" in mgr.role_source, mgr.role_source)
+
+        # The physically-swapped hardware must give the swapped answer.
+        mgr = build({0: TELE_IMG, 1: WIDE_IMG}, {"WIDE": None, "TELE": None})
+        check("C1: swapping the lenses swaps the resolved roles",
+              (mgr.wide_id, mgr.tele_id) == (1, 0),
+              f"WIDE={mgr.wide_id} TELE={mgr.tele_id}")
+
+        # ── 2. HINT AGREES WITH THE OPTICS: confirmed ──
+        mgr = build({0: WIDE_IMG, 1: TELE_IMG},
+                    {"WIDE": "i2c@88000", "TELE": "i2c@80000"})
+        check("C1: a hint that matches the optics is CONFIRMED by them",
+              (mgr.wide_id, mgr.tele_id) == (0, 1)
+              and "CONFIRMED" in mgr.role_source, mgr.role_source)
+
+        # ── 3. HINT CONTRADICTS THE OPTICS: hard refusal ──
+        #
+        # ⚠️ THE CASE THE WHOLE MECHANISM EXISTS FOR. The config says the
+        # 88000 socket is WIDE, but the camera on that socket is returning
+        # the magnified image. Under the old index-only scheme this was
+        # invisible; it must now be fatal rather than resolved either way.
+        try:
+            build({0: TELE_IMG, 1: WIDE_IMG},
+                  {"WIDE": "i2c@88000", "TELE": "i2c@80000"})
+            check("C1: a hint contradicting the optics is REFUSED",
+                  False, "it started anyway")
+        except ci.CameraIdentityError as exc:
+            check("C1: a hint contradicting the optics is REFUSED",
+                  "CONTRADICT" in str(exc).upper(),
+                  str(exc).splitlines()[0][:70])
+
+        # ── 4. NO HINT AND AN UNUSABLE SCENE: still fail-closed ──
+        #
+        # Pointed at blank sky with nothing configured, the station has no
+        # basis for either role and must refuse rather than pick one.
+        try:
+            build({0: BLANK, 1: BLANK}, {"WIDE": None, "TELE": None})
+            check("C1: blank scene + no hint is still fail-closed",
+                  False, "it started anyway")
+        except ci.CameraIdentityError as exc:
+            check("C1: blank scene + no hint is still fail-closed",
+                  "not configured" in str(exc),
+                  str(exc).splitlines()[0][:70])
+
+        # ── 5. A HINT RESCUES AN UNUSABLE SCENE ──
+        #
+        # Blank sky is the normal operating condition for this station, so
+        # a configured mapping must keep working when the optical check
+        # cannot run. It is used unconfirmed, and says so.
+        mgr = build({0: BLANK, 1: BLANK},
+                    {"WIDE": "i2c@88000", "TELE": "i2c@80000"})
+        check("C1: a configured hint still works when the scene is blank",
+              (mgr.wide_id, mgr.tele_id) == (0, 1), mgr.role_source)
+        check("C1: and it is reported as UNCONFIRMED, not as measured",
+              "unavailable" in mgr.role_source, mgr.role_source)
+
+        # ── 6. Focal length is derived per ROLE, after resolution ──
+        mgr = build({0: WIDE_IMG, 1: TELE_IMG}, {"WIDE": None, "TELE": None})
+        check("C1/C2: focal is derived per role once the roles are known",
+              abs(mgr.focal_px_by_role["WIDE"] - 930.0) < 2.0
+              and abs(mgr.focal_px_by_role["TELE"] - 3875.0) < 5.0,
+              str({k: round(v) for k, v in mgr.focal_px_by_role.items()}))
+        check("C1/C2: and it is still labelled THEORETICAL",
+              all(v.startswith("THEORETICAL")
+                  for v in mgr.focal_source_by_role.values()),
+              str(mgr.focal_source_by_role))
+    finally:
+        cm.Picamera2 = saved
+
+
+def test_20_camera_switch_resets_state():
+    """
+    Audit finding C4 — tracker and ego-motion state must not cross a
+    camera switch, in EITHER direction.
+    """
+    header("TEST 20 — camera switch resets camera-specific state (C4)")
+    import camera_worker as cw
+
+    class FakeEgo:
+        def __init__(self):
+            self.prev_gray = "frame-from-old-camera"
+            self.resets = 0
+
+        def reset(self):
+            self.resets += 1
+            self.prev_gray = None
+
+    class FakeTracker:
+        def __init__(self):
+            self.tracks = ["track-a", "track-b"]
+            self.ego_estimator = FakeEgo()
+
+    class FakeManager:
+        tele_id, wide_id = TEST_ROLES["TELE"], TEST_ROLES["WIDE"]
+
+        def role_for(self, cam):
+            return {self.tele_id: "TELE", self.wide_id: "WIDE"}.get(
+                cam, f"CAM{cam}")
+
+    cfg = load_config()
+    setup(cfg.logging)
+    events = EventLogger(logging.getLogger("station.test"), cfg.logging)
+
+    worker = cw.CameraWorker.__new__(cw.CameraWorker)
+    worker.config, worker.events = cfg, events
+    worker._manager = FakeManager()
+    worker._tracker = FakeTracker()
+    worker._last_detect_t = 123.0
+
+    # ── WIDE -> TELE ──
+    worker._reset_camera_state(TEST_ROLES["TELE"])
+    check("C4: tracks from the previous lens are dropped",
+          worker._tracker.tracks == [], str(worker._tracker.tracks))
+    check("C4: the optical-flow reference frame is cleared",
+          worker._tracker.ego_estimator.prev_gray is None
+          and worker._tracker.ego_estimator.resets == 1,
+          f"resets={worker._tracker.ego_estimator.resets}")
+    check("C4: the detector-rate interval is invalidated too",
+          worker._last_detect_t is None)
+
+    # ── ...and TELE -> WIDE, the other direction ──
+    worker._tracker = FakeTracker()
+    worker._reset_camera_state(TEST_ROLES["WIDE"])
+    check("C4: the reset is symmetric (TELE -> WIDE clears as well)",
+          worker._tracker.tracks == []
+          and worker._tracker.ego_estimator.prev_gray is None)
+
+    # ── A full WIDE -> TELE -> WIDE cycle must never carry a track ──
+    #
+    # ⚠️ This is the scenario the finding is about: with the real lenses
+    # the pixel scale changes by 25/6 = 4.17x in one frame, so a surviving
+    # IMM track describes a target that appears to jump and resize
+    # violently, and the affine warp fitted between two different lenses
+    # is applied to it.
+    seen_nonempty_after_switch = []
+    worker._tracker = FakeTracker()
+    for target in (TEST_ROLES["TELE"], TEST_ROLES["WIDE"],
+                   TEST_ROLES["TELE"]):
+        worker._reset_camera_state(target)
+        seen_nonempty_after_switch.append(bool(worker._tracker.tracks))
+        worker._tracker.tracks = ["re-acquired-on-new-lens"]
+    check("C4: WIDE -> TELE -> WIDE never carries a track across a switch",
+          not any(seen_nonempty_after_switch),
+          str(seen_nonempty_after_switch))
+
+    # ── The switch policy must use RESOLVED indices, not 0/1 ──
+    #
+    # Guards against a reintroduction of CameraManager.FAR_CAMERA_ID.
+    import inspect as _insp
+    src = _insp.getsource(cw.CameraSwitchPolicy.evaluate)
+    code = "\n".join(ln.split("#", 1)[0] for ln in src.splitlines())
+    check("C1: the switch policy no longer references the index constants",
+          "FAR_CAMERA_ID" not in code and "NEAR_CAMERA_ID" not in code,
+          "the policy must compare against manager.wide_id/tele_id")
+    check("C1: and it reads the resolved role indices instead",
+          "wide_id" in code and "tele_id" in code)
+
+    # ── The loop must actually CALL the reset on a change ──
+    loop_src = _insp.getsource(cw.CameraWorker._loop)
+    check("C4: the frame loop calls the reset when the camera changes",
+          "_reset_camera_state" in loop_src)
+
+    # ═══════════════════════════════════════════════════════════
+    #  ONE DRONE -> TWO TARGETS (the operator's report)
+    # ═══════════════════════════════════════════════════════════
+    #
+    # ⚠️ The duplicate could NOT have come from the radar tile: that draws
+    # a single FusedTarget with one un-looped _draw_target call, and the
+    # "mirror ghost" at (180 - bearing) was removed earlier (test 18). The
+    # HUD, by contrast, draws ONE BOX PER TRACKER TRACK, so two tracker
+    # tracks for one drone are two boxes on screen.
+    #
+    # C4 is a mechanism that produced exactly that. With max_age = 10 a
+    # track survives ten consecutive misses, so after a camera switch the
+    # OLD lens's tracks coasted for up to ten detector invocations at their
+    # old pixel coordinates, while the detector — seeing the same drone at
+    # a 4.17x different scale — failed to associate and opened NEW tracks
+    # beside them. Two boxes, one drone, for about a third of a second
+    # after every switch. Clearing the tracks removes the mechanism.
+    import TWO_CAMERAS_FIXED as _tc
+    check("N2: a track survives many misses, so stale ones linger visibly",
+          _tc.AdvancedADASTracker().max_age >= 5,
+          f"max_age={_tc.AdvancedADASTracker().max_age} detector frames")
+
+    import radar_overlay as _ro
+    ro_src = _insp.getsource(_ro)
+    ro_code = "\n".join(ln.split("#", 1)[0] for ln in ro_src.splitlines())
+    check("N2: the radar tile draws exactly one target (not a loop)",
+          ro_code.count("_draw_target(") == 2,   # one def, one call
+          f"{ro_code.count('_draw_target(')} occurrences (expect def+call)")
+
+    import hud as _hud
+    check("N2: the HUD draws one box per track, so duplicate tracks are "
+          "duplicate boxes",
+          "for track in draw_list" in _insp.getsource(_hud.HUD.render)
+          or "draw_list" in _insp.getsource(_hud))
+
+
+def test_21_hardware_claims():
+    """
+    Repository-wide guards against hardware claims the code cannot support.
+    """
+    header("TEST 21 — no unsupported hardware assumptions remain")
+    import pathlib
+    import re
+    import tokenize
+
+    root = pathlib.Path(__file__).parent
+    # This file itself is excluded from every scan below: it necessarily
+    # QUOTES the very literals it is forbidding, and matching those would
+    # make the guard permanently red for the wrong reason.
+    py = [p for p in sorted(root.glob("*.py"))
+          if p.name != "test_integration.py"]
+
+    def scan(pattern):
+        """
+        Files/lines where `pattern` appears in EXECUTABLE code.
+
+        ⚠️ Uses tokenize rather than a line-wise `split("#")`. Comments and
+        docstrings must not count: this repair deliberately documents the
+        wrong hardware assumptions it removed ("this used to say IMX708,
+        and here is why that was wrong"), and a naive scan flags exactly
+        those explanations. Only NAME/OP/NUMBER tokens are examined, so a
+        string literal or a comment can discuss anything it needs to.
+        """
+        found = []
+        for path in py:
+            try:
+                with tokenize.open(path) as fh:
+                    for tok in tokenize.generate_tokens(fh.readline):
+                        if tok.type in (tokenize.COMMENT, tokenize.STRING,
+                                        tokenize.NL, tokenize.NEWLINE):
+                            continue
+                        if pattern.search(tok.string):
+                            found.append(f"{path.name}:{tok.start[0]}")
+            except (SyntaxError, UnicodeDecodeError) as exc:
+                found.append(f"{path.name}: UNREADABLE ({exc})")
+        return found
+
+    # ── C3: no IMX708 anywhere in executable code ──
+    offenders = scan(re.compile(r"imx708", re.I))
+    check("C3: no IMX708 in executable code (both cameras are IMX477P)",
+          not offenders, ", ".join(offenders) or "clean")
+
+    # ── H1: no claim of a pointing/gimbal mechanism ──
+    #
+    # The cameras are FIXED. Acoustic bearing selects a camera and draws a
+    # cue band; it steers nothing. A servo/PWM/gimbal reference would mean
+    # either dead code or a false claim about the hardware.
+    hits = scan(re.compile(
+        r"^(servo|gimbal|pan_tilt|GPIO|PWM|stepper|actuator)$", re.I))
+    check("H1: no servo/gimbal/PWM code — the cameras are fixed",
+          not hits, ", ".join(hits) or "clean")
+
+    # ── M2: dead config keys are gone, not merely undocumented ──
+    from fusion_config import GeometryConfig, LedConfig
+    import dataclasses as _dc
+    geo_fields = {f.name for f in _dc.fields(GeometryConfig)}
+    led_fields = {f.name for f in _dc.fields(LedConfig)}
+    check("M2: cue_is_azimuth_only removed (it had no readers)",
+          "cue_is_azimuth_only" not in geo_fields)
+    check("M2: bearing_quantum_deg removed (superseded by ring geometry)",
+          "bearing_quantum_deg" not in led_fields)
+
+    # ── H3: doa_invert is retired everywhere ──
+    from calibration import DEFAULTS as CAL_DEFAULTS, RETIRED_KEYS
+    check("H3: doa_invert is not a calibration default any more",
+          "doa_invert" not in CAL_DEFAULTS)
+    check("H3: and it is stripped from the file on the next save",
+          "doa_invert" in RETIRED_KEYS)
+    # Same tokenize-based scan: the remaining mentions of the key are in
+    # comments explaining WHY it was retired, which must stay readable.
+    # calibration.py legitimately names it in RETIRED_KEYS, as a string.
+    readers = scan(re.compile(r"^doa_invert$"))
+    check("H3: no runtime code reads or writes doa_invert",
+          not readers, ", ".join(readers) or "clean")
+
+    # ── M4/H6: placeholders must not masquerade as measurements ──
+    import json as _js
+    fusion_json = _js.loads(
+        (root / "fusion_config.json").read_text(encoding="utf-8"))
+    bores = fusion_json.get("geometry", {}).get(
+        "camera_boresight_deg_by_role", {})
+    check("M4: no camera boresight is a placeholder 0.0",
+          all(v is None for v in bores.values()), str(bores))
+    check("M4: the retired index-keyed boresight is gone from the config",
+          "camera_boresight_deg" not in fusion_json.get("geometry", {}))
+
+    radar_json = _js.loads(
+        (root / "radar_calibration.json").read_text(encoding="utf-8"))
+    check("H6: the un-measured acoustic range reference is null, not 3.0 m",
+          radar_json.get("range_ref_distance_m") is None
+          and radar_json.get("range_ref_level_dbfs") is None,
+          f"{radar_json.get('range_ref_distance_m')} m / "
+          f"{radar_json.get('range_ref_level_dbfs')} dBFS")
+    from calibration import is_range_calibrated
+    check("H6: so the station reports acoustic range as uncalibrated",
+          not is_range_calibrated(radar_json))
+    check("H3: doa_invert is gone from the shipped calibration file",
+          "doa_invert" not in radar_json)
+
+
+def test_23_acoustic_timestamp_semantics():
+    """Audit finding M1 — decision time is not capture time."""
+    header("TEST 23 — acoustic timestamp semantics (M1)")
+
+    t = 1000.0
+    # A 2.0 s window whose newest sample is at t; the decision is published
+    # 0.12 s later, after feature extraction and inference.
+    obs = AcousticObservation(engine_state="ALARM", p_smoothed=0.9,
+                              timestamp=t + 0.12,
+                              capture_end_ts=t, analysis_window_s=2.0)
+
+    check("M1: the analysed window's start is recoverable",
+          obs.capture_start_ts == t - 2.0, str(obs.capture_start_ts))
+    check("M1: and its centre, which is where the evidence sits",
+          obs.capture_centre_ts == t - 1.0, str(obs.capture_centre_ts))
+
+    # THE defect: at the instant of publication the DECISION is 0 s old,
+    # but the SOUND is already 1.12 s old. Fusion pairs this with a camera
+    # frame ~20 ms old.
+    check("M1: the sound is ~1.1 s old the moment the decision is published",
+          abs(obs.sound_age_s(at=t + 0.12) - 1.12) < 1e-9,
+          f"{obs.sound_age_s(at=t + 0.12):.2f} s")
+    check("M1: while the decision itself is 0 s old — they are not the same",
+          abs((t + 0.12) - obs.timestamp) < 1e-9)
+    check("M1: the structural lag is exposed, not left to be discovered",
+          abs(obs.decision_lag_s() - 1.12) < 1e-9,
+          f"{obs.decision_lag_s():.2f} s window-centre -> publish")
+
+    # An observation with no capture timing must report None, never 0.0 —
+    # the project's rule that a missing measurement is not a zero.
+    bare = AcousticObservation(engine_state="ALARM", timestamp=t)
+    check("M1: absent capture timing reports None, not a fabricated zero",
+          bare.capture_centre_ts is None and bare.sound_age_s() is None
+          and bare.decision_lag_s() is None)
+
+    # Freshness still keys off the DECISION, deliberately: it answers "is
+    # the acoustic subsystem still producing output?".
+    check("M1: freshness still classifies on decision age",
+          classify_age(0.5, 1.5, 3.0) is Freshness.FRESH)
+
+    # And the producer must actually populate the fields.
+    import inspect as _insp
+    import acoustic_worker as _aw
+    src = _insp.getsource(_aw.AcousticWorker._to_observation)
+    check("M1: the worker records capture_end_ts on every observation",
+          "capture_end_ts=capture_end_ts" in src
+          and "analysis_window_s=" in src)
+    loop = _insp.getsource(_aw.AcousticWorker._loop)
+    check("M1: and passes the moment the audio block was read, not now()",
+          "capture_end_ts=t0" in loop)
+
+    # The window length must be the CLASSIFIER's window, not the hop.
+    import features as _f
+    check("M1: the window carried is the classifier's 2.0 s, not the hop",
+          _f.WINDOW_SEC == 2.0, f"{_f.WINDOW_SEC} s")
+
+
+def test_25_forensic_review_fixes():
+    """
+    Regression cover for the defects the forensic review found:
+    D1 (fabricated error bound), D2 (agreement semantics), D3 (hint
+    suggestion), D6 (beam verdict), and the C1 robustness rework.
+    """
+    header("TEST 25 — forensic-review defect fixes (D1/D2/D3/D6/C1)")
+    import camera_identity as ci
+    import cv2 as _cv2
+    import inspect as _insp
+
+    # ═══════════════════════════════════════════════════════════
+    #  C1 — robust bounded shift search
+    # ═══════════════════════════════════════════════════════════
+    #
+    # ⚠️ SYNTHETIC. These model pointing offset, exposure, noise and
+    # distortion. They do NOT establish real-hardware behaviour (HW-1).
+    RATIO = 25.0 / 6.0
+    WIDE_FOV_DEG = 37.97          # the 6 mm lens's real field, from C2
+    rng = np.random.default_rng(3)
+    _b = rng.integers(0, 255, size=(120, 160), dtype=np.uint8)
+    SCENE = np.repeat(np.repeat(_b, 4, 0), 4, 1).astype(np.float32)
+
+    def tele_view(scene, dx_deg=0.0, dy_deg=0.0, gain=1.0, bias=0.0,
+                  noise=0.0):
+        """The telephoto view of `scene`, optionally mis-pointed."""
+        h, w = scene.shape
+        cw, chh = int(w / RATIO), int(h / RATIO)
+        px = int(round(dx_deg / WIDE_FOV_DEG * w))
+        py = int(round(dy_deg / WIDE_FOV_DEG * w))
+        x0 = max(0, min(w - cw, (w - cw) // 2 + px))
+        y0 = max(0, min(h - chh, (h - chh) // 2 + py))
+        out = _cv2.resize(scene[y0:y0 + chh, x0:x0 + cw], (w, h),
+                          interpolation=_cv2.INTER_LINEAR)
+        out = out * gain + bias
+        if noise:
+            out = out + rng.normal(0, noise, out.shape)
+        return out
+
+    # THE regression: the old fixed-centre implementation scored +0.022 at
+    # 1 deg and returned INCONCLUSIVE. Every one of these must now resolve.
+    for offset in (1.0, 4.0, 8.0):
+        ra, rb, detail = ci.classify_roles_by_optics(
+            SCENE, tele_view(SCENE, dx_deg=offset), RATIO)
+        check(f"C1: resolves with {offset:.0f} deg of pointing offset",
+              (ra, rb) == (ci.WIDE, ci.TELE), detail[:58])
+
+    ra, rb, detail = ci.classify_roles_by_optics(
+        SCENE, tele_view(SCENE, dx_deg=4.0, dy_deg=3.0), RATIO)
+    check("C1: resolves with offset in BOTH axes", (ra, rb) == (ci.WIDE, ci.TELE),
+          detail[:58])
+
+    ra, rb, detail = ci.classify_roles_by_optics(
+        SCENE, tele_view(SCENE, dx_deg=4.0, gain=1.6, bias=20, noise=12),
+        RATIO)
+    check("C1: survives offset + exposure difference + noise together",
+          (ra, rb) == (ci.WIDE, ci.TELE), detail[:58])
+
+    # Wrong assignment must be identified as wrong, not merely "not right".
+    ra, rb, _ = ci.classify_roles_by_optics(tele_view(SCENE), SCENE, RATIO)
+    check("C1: a swapped pair yields the swapped roles, not a failure",
+          (ra, rb) == (ci.TELE, ci.WIDE), f"{ra}/{rb}")
+
+    # Ambiguous scenes must still refuse — both kinds.
+    blank = np.full((480, 640), 128, np.float32)
+    ra, _, d_blank = ci.classify_roles_by_optics(blank, blank, RATIO)
+    check("C1: a featureless scene is still INCONCLUSIVE", ra is None,
+          d_blank[:58])
+
+    # ⚠️ A COARSE repeating pattern, which survives the 4.17x downscale and
+    # therefore reaches the correlation stage — this is what exercises the
+    # peak-uniqueness rejection rather than the flat-image guard.
+    tile = rng.integers(0, 255, size=(16, 16), dtype=np.uint8)
+    coarse = np.tile(tile, (30, 40)).astype(np.float32)[:480, :640]
+    ra, _, d_rep = ci.classify_roles_by_optics(
+        coarse, tele_view(coarse), RATIO)
+    check("C1: a self-similar scene is rejected as a non-unique alignment",
+          ra is None and "not unique" in d_rep, d_rep[:58])
+
+    src = _insp.getsource(ci._match_peaks)
+    check("C1: the shipped matcher searches for the alignment",
+          "matchTemplate" in src and "max_shift_frac" in src)
+    check("C1: and the search is BOUNDED, not over the whole frame",
+          ci.OPTICAL_MAX_SHIFT_FRAC < 0.5,
+          f"±{ci.OPTICAL_MAX_SHIFT_FRAC:.0%} of the wide frame")
+
+    # ═══════════════════════════════════════════════════════════
+    #  D1 — no fabricated error bound anywhere
+    # ═══════════════════════════════════════════════════════════
+    # ⚠️ THE TEST IS ON WHAT THE OPERATOR SEES, not on the source text.
+    # A source scan is the wrong instrument here: the code now CONTAINS the
+    # retired phrase, quoted inside comments that explain why it was
+    # withdrawn, and forbidding that would mean the better the fix is
+    # documented the more certainly the guard fails — the same trap that
+    # produced the F-13 false alarm. What D1 is about is the string the
+    # station prints, so that is what is asserted.
+    cfg = load_config()
+    lines = cfg.geometry.focal_status_lines()
+    check("D1: the station emits a focal-provenance warning at all",
+          bool(lines), str(lines))
+    check("D1: no runtime line claims a 'few percent' error bound",
+          not any("few percent" in ln.lower() for ln in lines),
+          " | ".join(lines)[:76])
+    check("D1: and each says the error is UNKNOWN",
+          all("UNKNOWN" in ln for ln in lines),
+          lines[0][:76] if lines else "no warning emitted")
+
+    # The whole calibration banner, which is what start-up actually prints.
+    banner = " | ".join(cfg.describe_calibration())
+    check("D1: the calibration banner carries no invented error bound",
+          "few percent" not in banner.lower(), banner[:76])
+
+    # ═══════════════════════════════════════════════════════════
+    #  D2 — agreement: capability vs. what THIS check did
+    # ═══════════════════════════════════════════════════════════
+    cfg2 = load_config()
+    cfg2.geometry.camera_boresight_deg = {0: 150.0, 1: 150.0}
+    proj = BearingProjector(cfg2.geometry, 640)
+    tol = cfg2.fusion.cue_agreement_deg
+    CENTRE = 320.0
+
+    # TELE, bearing in view -> passes, and could not have failed.
+    a_pass = proj.agreement_deg(0, CENTRE, 150.0)
+    check("D2: TELE pass with an in-view bearing is NON-discriminating",
+          proj.agreement_discriminating(0, 150.0, a_pass, tol) is False,
+          f"agreement {a_pass:.1f}deg")
+
+    # ⚠️ THE DEFECT. TELE, bearing OFF-SCREEN -> the gate really rejects,
+    # so it must NOT be reported as powerless just because TELE's span is
+    # below the tolerance.
+    a_rej = proj.agreement_deg(0, CENTRE, 190.0)
+    check("D2: TELE rejection IS reported as discriminating",
+          a_rej > tol
+          and proj.agreement_discriminating(0, 190.0, a_rej, tol) is True,
+          f"agreement {a_rej:.1f}deg > tolerance {tol:.0f}deg")
+    check("D2: ...while the camera CAPABILITY for TELE is still False",
+          proj.agreement_span_covers_tolerance(0, tol) is False,
+          "the two questions are answered separately")
+
+    # WIDE: a pass near the edge could have failed -> discriminating.
+    a_wide_pass = proj.agreement_deg(1, CENTRE, 155.0)
+    check("D2: WIDE pass is discriminating (a rejection was reachable)",
+          proj.agreement_discriminating(1, 155.0, a_wide_pass, tol) is True,
+          f"agreement {a_wide_pass:.1f}deg")
+    a_wide_rej = proj.agreement_deg(1, CENTRE, 185.0)
+    check("D2: WIDE rejection is discriminating",
+          a_wide_rej > tol
+          and proj.agreement_discriminating(1, 185.0, a_wide_rej, tol)
+          is True, f"agreement {a_wide_rej:.1f}deg")
+
+    check("D2: uncalibrated optics report None for both questions",
+          proj.agreement_discriminating(99, 150.0, 1.0, tol) is None
+          and proj.agreement_span_covers_tolerance(99, tol) is None)
+    check("D2: no bearing at all reports None, not False",
+          proj.agreement_discriminating(0, None, None, tol) is None)
+
+    # The fusion layer must carry BOTH fields.
+    import dataclasses as _dc
+    from sensor_fusion import FusedTarget as _FT
+    names = {f.name for f in _dc.fields(_FT)}
+    check("D2: FusedTarget carries the per-observation field",
+          "sensor_agreement_discriminating" in names)
+    check("D2: and the camera-capability field, separately",
+          "sensor_agreement_capable" in names)
+
+    # ═══════════════════════════════════════════════════════════
+    #  D3 — every suggested config must be accepted on next startup
+    # ═══════════════════════════════════════════════════════════
+    import json as _json
+
+    def roundtrip(cams, label):
+        block = ci.suggest_hint_config(cams)
+        parsed = _json.loads("{" + block + "}")
+        hints = parsed["geometry"]["camera_role_id_hint"]
+        try:
+            roles = ci.resolve_roles(cams, hints)
+        except ci.CameraIdentityError as exc:
+            check(f"D3: suggested config is accepted — {label}", False,
+                  str(exc).splitlines()[0][:60])
+            return
+        check(f"D3: suggested config is accepted — {label}",
+              set(roles) == set(ci.ROLES) and roles[ci.WIDE] != roles[ci.TELE],
+              str(roles))
+
+    # Normal Pi 5: two CSI sockets, two I2C controllers.
+    roundtrip([
+        {"Num": 0, "Model": "imx477",
+         "Id": "/base/axi/pcie@120000/rp1/i2c@88000/imx477@1a"},
+        {"Num": 1, "Model": "imx477",
+         "Id": "/base/axi/pcie@120000/rp1/i2c@80000/imx477@1a"},
+    ], "separate I2C controllers")
+
+    # ⚠️ THE DEFECT: one shared controller, two chip addresses. The old
+    # code suggested "i2c@88000" for BOTH roles, which the next startup
+    # then refused as ambiguous.
+    roundtrip([
+        {"Num": 0, "Model": "imx477", "Id": "/base/axi/i2c@88000/imx477@1a"},
+        {"Num": 1, "Model": "imx477", "Id": "/base/axi/i2c@88000/imx477@10"},
+    ], "SHARED I2C controller")
+
+    # A mux topology where the paths differ only deep in the tree.
+    roundtrip([
+        {"Num": 0, "Model": "imx477",
+         "Id": "/base/axi/i2c@88000/mux@70/i2c@0/imx477@1a"},
+        {"Num": 1, "Model": "imx477",
+         "Id": "/base/axi/i2c@88000/mux@70/i2c@1/imx477@1a"},
+    ], "I2C multiplexer")
+
+    # ═══════════════════════════════════════════════════════════
+    #  D6 — FROZEN requires a demonstrated source change
+    # ═══════════════════════════════════════════════════════════
+    import diagnose as _diag
+
+    v = _diag.beam_verdict(n_samples=200, changes=0, scene_changed=False)
+    check("D6: a static scene with no change is NOT PROVEN, not FROZEN",
+          v.startswith("NOT PROVEN") and "FROZEN" not in v.split("—")[0],
+          v[:60])
+
+    v = _diag.beam_verdict(n_samples=200, changes=0, scene_changed=True)
+    check("D6: no response ACROSS a source change is FROZEN",
+          v.startswith("FROZEN"), v[:60])
+
+    v = _diag.beam_verdict(n_samples=200, changes=37, scene_changed=True)
+    check("D6: a beam that followed the source change RESPONDED",
+          v.startswith("RESPONDED"), v[:60])
+
+    v = _diag.beam_verdict(n_samples=20, changes=0, scene_changed=True)
+    check("D6: fewer than 100 samples is INSUFFICIENT, whatever happened",
+          v.startswith("INSUFFICIENT"), v[:60])
+
+    v = _diag.beam_verdict(n_samples=200, changes=3, scene_changed=False)
+    check("D6: a beam that does update is never called frozen",
+          "FROZEN" not in v, v[:60])
+
+    _src = _insp.getsource(_diag.cmd_beams)
+    check("D6: cmd_beams delegates to the guarded verdict function",
+          "beam_verdict(" in _src)
+    check("D6: and the CLI exposes --scene-changed",
+          "scene_changed" in _insp.getsource(_diag.main))
+
+
+def test_22_srp_gating():
+    """Audit finding H5 — SRP-PHAT must refuse beamformed stereo."""
+    header("TEST 22 — SRP-PHAT physical-validity gate (H5)")
+    import doa as _doa
+    from calibration import DEFAULTS as CAL
+
+    # ⚠️ The gate is re-evaluated here rather than by constructing a real
+    # DOAProvider, because DOAProvider.__init__ starts the USB DSP polling
+    # thread and that needs the ReSpeaker. The check below pins the shipped
+    # source to this same expression, so the two cannot drift apart.
+    def gate(n_channels, cfg):
+        """Mirrors DOAProvider.__init__'s gate; pinned to the source below."""
+        channels_listed = bool(cfg.get("mic_channels"))
+        channels_attested = bool(cfg.get("mic_channels_verified"))
+        geometry_differs = (cfg.get("mic_positions_m")
+                            != CAL.get("mic_positions_m"))
+        geometry_attested = bool(cfg.get("mic_geometry_verified"))
+        return ((channels_listed and channels_attested)
+                and (geometry_differs and geometry_attested))
+
+    measured_geom = [[-0.03, 0.03], [0.03, 0.03],
+                     [0.03, -0.03], [-0.03, -0.03]]
+    verified_geom = dict(CAL, mic_positions_m=measured_geom,
+                         mic_geometry_verified=True)
+
+    # THE case on this station today: 2 processed channels, default 43 mm
+    # geometry, no attestations. This is what used to arm SRP-PHAT.
+    check("H5: 2 processed channels + default geometry -> DISABLED",
+          not gate(2, dict(CAL)))
+
+    # ⚠️ D5 — NEITHER A CHANNEL COUNT NOR A CHANNEL LIST IS EVIDENCE.
+    check("D5: channel count alone (4 ch) does NOT enable SRP-PHAT",
+          not gate(4, dict(verified_geom)),
+          "four channels can be four PROCESSED channels")
+    check("D5: a mic_channels tuple alone does NOT enable SRP-PHAT",
+          not gate(2, dict(verified_geom, mic_channels=[0, 1, 2, 3])),
+          "a tuple in JSON is an operator assertion, not a measurement")
+    check("D5: even 4 channels AND a mic_channels tuple, without the "
+          "verified flag, does NOT enable it",
+          not gate(4, dict(verified_geom, mic_channels=[0, 1, 2, 3])))
+
+    # Geometry needs its own attestation, not just a non-default value.
+    check("D5: non-default geometry without its verified flag -> DISABLED",
+          not gate(4, dict(CAL, mic_positions_m=measured_geom,
+                           mic_channels=[0, 1, 2, 3],
+                           mic_channels_verified=True)))
+    check("D5: the verified flag with DEFAULT geometry -> still DISABLED",
+          not gate(4, dict(CAL, mic_channels=[0, 1, 2, 3],
+                           mic_channels_verified=True,
+                           mic_geometry_verified=True)))
+
+    # Only a full set of verified facts arms it.
+    check("D5: VERIFIED raw channels + VERIFIED geometry -> ENABLED",
+          gate(4, dict(verified_geom, mic_channels=[0, 1, 2, 3],
+                       mic_channels_verified=True)))
+
+    # Defaults must be fail-safe.
+    check("D5: both attestations default to False",
+          CAL.get("mic_channels_verified") is False
+          and CAL.get("mic_geometry_verified") is False)
+
+    # And the gate that ships must be exactly this one.
+    import inspect as _insp
+    src = _insp.getsource(_doa.DOAProvider.__init__)
+    code = "\n".join(ln.split("#", 1)[0] for ln in src.splitlines())
+    check("H5: the shipped gate is no longer `n_channels >= 2`",
+          "self.array_ok = n_channels >= 2" not in code)
+    check("D5: and it no longer accepts a bare channel count or list",
+          "n_channels >= 4 or explicit_channels" not in code)
+    check("D5: it requires both explicit attestations",
+          "mic_channels_verified" in code
+          and "mic_geometry_verified" in code)
 
 
 def test_honesty():
@@ -1567,24 +2521,110 @@ def test_15_camera_search_region():
           snap.cue_role is CueRole.SEARCH, snap.cue_role.value)
 
     # ── A box that DISAGREES with the bearing is a different object ──
+    #
+    # ⚠️ REWRITTEN AFTER THE OPTICS WERE CORRECTED (audit finding C2, and
+    # the new finding N1 it exposed).
+    #
+    # The old version placed a box at the left edge of the WIDE frame and
+    # relied on that producing more than the 20 deg `cue_agreement_deg`
+    # tolerance. Under the OLD focal length of 501.7 px the wide camera was
+    # believed to span 65 deg, so an edge box sat 31.7 deg off-axis and the
+    # test passed. With the corrected 6 mm optics the wide camera really
+    # spans 37.9 deg — +/-18.9 deg — so the same edge box is only 17 deg
+    # off-axis and now counts as AGREEING.
+    #
+    # That is a property of the station, not of this test: with the real
+    # lenses, NO box anywhere in EITHER frame can disagree with a bearing
+    # that is itself in view, because both half-fields (18.9 deg WIDE,
+    # 4.7 deg TELE) are smaller than the 20 deg tolerance. The rejection
+    # can only fire when the acoustic BEARING points outside the camera's
+    # field of view, which is exactly how it is constructed below.
     _, f2 = new_fusion(cfg)
     for i in range(4):
-        # Boresight 150 deg, bearing 150 deg => the drone is dead centre.
-        # A box at the far edge is something else entirely.
-        #
-        # This uses the NEAR camera deliberately: the FAR lens is only
-        # 28 deg wide, so NOTHING inside its frame can disagree with the
-        # boresight by the 20 deg tolerance. On a narrow lens every visible
-        # box is "in agreement" by construction — worth knowing, because it
-        # means the disagreement test only has force on the wide camera.
-        snap = f2.update(ac(seq=i),
-                         visual(1, bbox=(10., 200., 40., 30.), cam=1),
+        # Boresight 150 deg, box dead centre => the box is at 0 deg
+        # relative. The acoustic bearing is 30 deg away, well outside the
+        # wide camera's +/-18.9 deg field, so the two genuinely disagree.
+        snap = f2.update(ac(bearing=180.0, seq=i),
+                         visual(1, bbox=(300., 200., 40., 30.), cam=1),
                          HEALTHY, HEALTHY)
     disagreement = snap.sensor_agreement_deg
     check("a YOLO box that disagrees with the bearing does not cancel "
           "the region", snap.cue_role is CueRole.SEARCH,
           f"role={snap.cue_role.value}, disagreement="
           f"{disagreement:.0f}deg" if disagreement is not None else "n/a")
+    check("the disagreement is real and exceeds the tolerance",
+          disagreement is not None
+          and disagreement > cfg.fusion.cue_agreement_deg,
+          f"{disagreement}deg vs tolerance "
+          f"{cfg.fusion.cue_agreement_deg:.0f}deg")
+
+    # ═══════════════════════════════════════════════════════════
+    #  N1 — the gate's reach, computed rather than asserted in prose
+    # ═══════════════════════════════════════════════════════════
+    #
+    # ⚠️ THIS GUARD REPLACES AN EARLIER, WRONG ONE. The previous version
+    # compared the tolerance against the HALF field and concluded the gate
+    # was dead on both cameras. That silently assumed the bearing always
+    # sits at the boresight. Both the box angle and the bearing range over
+    # +/-h, so the largest disagreement an in-view pair can produce is 2h —
+    # the FULL field. The two cameras therefore differ:
+    #
+    #     TELE  fov  9.4 deg < 20 deg tolerance -> can never reject
+    #     WIDE  fov 37.9 deg > 20 deg tolerance -> can reject
+    proj_n1 = BearingProjector(cfg.geometry, cfg.visual.frame_width)
+    tol = cfg.fusion.cue_agreement_deg
+    spans = {}
+    for _cam, _role in ((0, "TELE"), (1, "WIDE")):
+        spans[_role] = proj_n1.max_agreement_deg(_cam)
+    check("N1: TELE's whole field is inside the tolerance, so the gate "
+          "cannot reject an IN-VIEW pair",
+          proj_n1.agreement_span_covers_tolerance(0, tol) is False,
+          f"fov {spans['TELE']:.1f}deg vs tolerance {tol:.0f}deg")
+    check("N1: WIDE's field exceeds the tolerance, so the gate DOES work "
+          "there",
+          proj_n1.agreement_span_covers_tolerance(1, tol) is True,
+          f"fov {spans['WIDE']:.1f}deg vs tolerance {tol:.0f}deg")
+    check("N1: the span is the FULL field of view, not half of it",
+          abs(spans["WIDE"] - 2.0 * (spans["WIDE"] / 2.0)) < 1e-9
+          and spans["WIDE"] > 37.0,
+          f"{spans['WIDE']:.1f}deg")
+    check("N1: uncalibrated optics report None, not a fabricated span",
+          proj_n1.agreement_span_covers_tolerance(99, tol) is None)
+
+    # And the fusion layer must CARRY that fact, so a pass is never read as
+    # evidence when it was arithmetically guaranteed.
+    _, f_n1 = new_fusion(cfg)
+    for i in range(4):
+        sn_tele = f_n1.update(ac(seq=i),
+                              visual(1, bbox=(300., 200., 40., 30.), cam=0),
+                              HEALTHY, HEALTHY)
+    check("N1: a pass on TELE is reported as NON-discriminating",
+          sn_tele.sensor_agreement_discriminating is False,
+          str(sn_tele.sensor_agreement_discriminating))
+    check("N1: and TELE's camera capability is False too",
+          sn_tele.sensor_agreement_capable is False,
+          str(sn_tele.sensor_agreement_capable))
+
+    _, f_n1w = new_fusion(cfg)
+    for i in range(4):
+        sn_wide = f_n1w.update(ac(seq=i),
+                               visual(1, bbox=(300., 200., 40., 30.), cam=1),
+                               HEALTHY, HEALTHY)
+    # ⚠️ CORRECTED BY D2. This used to assert
+    # `sn_wide.sensor_agreement_discriminating is True`, which conflated
+    # the two questions the review separated. WIDE's LENS can span the
+    # tolerance (37.97 > 20), so its *capability* is True — but for THIS
+    # observation the bearing sits on the boresight and the box near the
+    # centre, so the largest disagreement reachable is 0 + 18.99 < 20 and
+    # the pass was in fact guaranteed. Both answers are now available, and
+    # each is asserted against the field that actually means it.
+    check("N1: WIDE's camera capability IS true (its field spans 20deg)",
+          sn_wide.sensor_agreement_capable is True,
+          str(sn_wide.sensor_agreement_capable))
+    check("D2: but THIS centred WIDE observation still could not have "
+          "failed, and says so",
+          sn_wide.sensor_agreement_discriminating is False,
+          str(sn_wide.sensor_agreement_discriminating))
 
     # ── An UNVERIFIED convention is MARKED, not suppressed ──
     # The radar plots this bearing, the LED ring aims with it and the
@@ -1690,31 +2730,48 @@ def test_15_camera_search_region():
           f"{widths[0]} px vs configured "
           f"{int(480 * cfg.ui.cue_marker_frac)} px")
 
+    # ⚠️ Offsets reduced from ±20° to ±15° (audit finding C2). This renders
+    # through camera 1 = WIDE, whose real horizontal field of view is
+    # 2*atan(320/930) = 37.9°, i.e. ±18.9° about the boresight. The old
+    # ±20° lay OUTSIDE that and the projection correctly returned
+    # x_px=None; it only used to "work" because the configured focal length
+    # of 501.7 px implied a 65° field of view that this 6 mm lens does not
+    # have. The check itself — that the marker is drawn ON the projected
+    # bearing — is unchanged and still spans the useful width of the frame.
     offsets = []
-    for bearing in (-20.0, -10.0, 0.0, 10.0, 20.0):
+    for bearing in (-15.0, -7.5, 0.0, 7.5, 15.0):
         (mx0, mx1), sn = _marker_box(0.9, bearing)
         offsets.append(abs((mx0 + mx1) // 2 - sn.bearing_cue.x_px))
     check("the marker sits ON the projected bearing at every angle",
           max(offsets) <= 2.0, f"worst offset {max(offsets):.0f} px")
 
     # ── SCENARIO G: a camera switch must use the NEW camera's optics ──
+    #
+    # ⚠️ Bearing moved from 160° to 153° (audit finding C2). TELE's real
+    # field of view is only ±4.7° about the 150° boresight, so a 10° offset
+    # is off-screen and projects to None on that camera. 3° is inside both
+    # fields, which is what this check needs: the SAME bearing must land on
+    # DIFFERENT pixel columns through the two lenses.
     proj = BearingProjector(cfg.geometry, cfg.visual.frame_width)
-    far = proj.project(0, 160.0, 0.8)
-    near = proj.project(1, 160.0, 0.8)
+    tele = proj.project(0, 153.0, 0.8)
+    wide = proj.project(1, 153.0, 0.8)
     check("G: the two cameras project the same bearing differently",
-          far.x_px != near.x_px,
-          f"FAR x={far.x_px:.0f} (hfov {far.hfov_deg:.0f}deg), "
-          f"NEAR x={near.x_px:.0f} (hfov {near.hfov_deg:.0f}deg)")
+          tele.x_px != wide.x_px,
+          f"TELE x={tele.x_px:.0f} (hfov {tele.hfov_deg:.0f}deg), "
+          f"WIDE x={wide.x_px:.0f} (hfov {wide.hfov_deg:.0f}deg)")
 
+    # Same 160° -> 153° correction as above: the bearing must be inside
+    # TELE's ±4.7° field for both projections to produce a pixel column.
     _, f5 = new_fusion(cfg)
-    snap_far = f5.update(ac(bearing=160.0, seq=1),
-                         visual(0, cam=0), HEALTHY, HEALTHY)
-    snap_near = f5.update(ac(bearing=160.0, seq=2),
+    snap_tele = f5.update(ac(bearing=153.0, seq=1),
+                          visual(0, cam=0), HEALTHY, HEALTHY)
+    snap_wide = f5.update(ac(bearing=153.0, seq=2),
                           visual(0, cam=1), HEALTHY, HEALTHY)
     check("G: the cue follows the ACTIVE camera on the very next frame",
-          snap_far.bearing_cue.x_px != snap_near.bearing_cue.x_px,
-          f"cam0 x={snap_far.bearing_cue.x_px:.0f} -> "
-          f"cam1 x={snap_near.bearing_cue.x_px:.0f}")
+          snap_tele.bearing_cue.x_px != snap_wide.bearing_cue.x_px,
+          f"cam0 x={snap_tele.bearing_cue.x_px:.0f} -> "
+          f"cam1 x={snap_wide.bearing_cue.x_px:.0f}")
+    snap_near = snap_wide
     check("G: and the cue is computed from the SAME observation that "
           "carries the frame",
           snap_near.visual is not None
@@ -1883,9 +2940,16 @@ def test_16_audit_fixes():
           obs8.overflow)
 
     # ── BUG-013: the cue is projected in the REAL frame's pixel space ──
+    # ⚠️ Bearing moved from 160° to 153° (audit finding C2). Camera 0 is
+    # TELE, whose real field of view with the 25 mm lens is
+    # 2*atan(320/3875) = 9.4°, i.e. only ±4.7° about the 150° boresight.
+    # A 10° offset is outside the frame and correctly projects to None; it
+    # appeared to work only under the old focal length of 1274 px, which
+    # implied a 28° field of view this lens does not have. The property
+    # under test — that a wider frame scales the projection — is unchanged.
     proj = BearingProjector(cfg6.geometry, 640)
-    at640 = proj.project(0, 160.0, 0.8)
-    at1280 = proj.project(0, 160.0, 0.8, width_px=1280)
+    at640 = proj.project(0, 153.0, 0.8)
+    at1280 = proj.project(0, 153.0, 0.8, width_px=1280)
     check("BUG-013: a wider frame projects proportionally, not identically",
           abs(at1280.x_px - at640.x_px * 2.0) < 2.0,
           f"640 -> x={at640.x_px:.0f}, 1280 -> x={at1280.x_px:.0f}")
@@ -2083,7 +3147,10 @@ def test_17_web_server():
                 break
         r.close()
 
-    threads = [_th.Thread(target=watch, args=(2.5,), daemon=True)
+    # 8 s, not 2.5 s: the client-count assertion below polls until the
+    # PREVIOUS reader's server-side generator has unregistered, and these
+    # three must still be streaming while that settles.
+    threads = [_th.Thread(target=watch, args=(8.0,), daemon=True)
                for _ in range(3)]
     for t in threads:
         t.start()
@@ -2093,6 +3160,19 @@ def test_17_web_server():
           multi["jpeg_fps"] < solo * 2.0,
           f"{solo:.0f} fps solo -> {multi['jpeg_fps']:.0f} fps with "
           f"{multi['clients']} clients (a per-client encode would be ~3x)")
+    # ⚠️ The count is polled rather than sampled once. The previous
+    # /video_feed reader above was closed on the CLIENT side, but the
+    # server-side generator only runs its `finally` (and so only
+    # unregisters) when it next tries to write into the dead socket. Until
+    # then the closed reader is legitimately still counted, so a single
+    # sample could see 4 and fail on timing alone rather than on the
+    # accounting being wrong. This still asserts EXACTLY 3 — it just lets
+    # the asynchronous disconnect land first.
+    for _ in range(40):
+        multi = _json.loads(_url.urlopen(base + "/status", timeout=5).read())
+        if multi["clients"] == 3:
+            break
+        time.sleep(0.1)
     check("every client is counted", multi["clients"] == 3,
           str(multi["clients"]))
     for t in threads:
@@ -2133,8 +3213,17 @@ def test_17_web_server():
     # ticks, so the reported "Hailo / YOLO fps" was mathematically incapable
     # of exceeding 20 and skipped every frame produced between UI ticks. It
     # measured the UI and displayed the result under Hailo's name.
+    # ⚠️ Comments are stripped before the check. The substring test was
+    # matching main.py's own COMMENT explaining that the call was removed
+    # ("This block used to call web.note_inference() ..."), so the better
+    # the fix was documented, the more certainly this check failed. It was
+    # reporting a defect that had already been fixed — the exact opposite
+    # of what a regression guard is for. Only executable code is examined
+    # now; the explanation is allowed to mention the thing it explains.
+    _run_code = "\n".join(
+        line.split("#", 1)[0] for line in run_src.splitlines())
     check("the Hailo rate is NOT counted in the rate-limited UI loop",
-          "note_inference" not in run_src,
+          "note_inference" not in _run_code,
           "Station.run still calls note_inference; the UI loop is capped at "
           "ui.max_ui_fps and cannot count the detector's real rate")
 
@@ -2610,6 +3699,11 @@ def main() -> int:
                test_13_coordinate_chain, test_14_srp_geometry,
                test_15_camera_search_region, test_16_audit_fixes,
                test_17_web_server, test_18_doa_fix_regressions,
+               test_19_camera_identity, test_20_camera_switch_resets_state,
+               test_21_hardware_claims, test_22_srp_gating,
+               test_23_acoustic_timestamp_semantics,
+               test_24_camera_manager_role_resolution,
+               test_25_forensic_review_fixes,
                test_regressions, test_final_audit_regressions,
                test_honesty, test_thread_safety):
         try:

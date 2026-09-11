@@ -1,5 +1,7 @@
 import time
 
+import camera_identity
+
 # INTEGRATION CHANGE (unified system): picamera2 is imported lazily rather
 # than at module import time.
 #
@@ -42,10 +44,28 @@ def picamera2_available() -> bool:
         return False
 
 
-class CameraManager:
+def global_camera_info():
+    """
+    libcamera's view of every attached camera. Raises if unavailable.
 
-    FAR_CAMERA_ID = 0
-    NEAR_CAMERA_ID = 1
+    Separated from CameraManager so the role-resolution path can be driven
+    with recorded hardware output in tests.
+    """
+    return _load_picamera2().global_camera_info()
+
+
+class CameraManager:
+    """
+    Owns both cameras and the role -> device binding.
+
+    ⚠️ `FAR_CAMERA_ID` / `NEAR_CAMERA_ID` USED TO BE CLASS CONSTANTS equal
+    to 0 and 1, and they were the station's ONLY notion of camera identity
+    (audit finding C1). They are gone. A device index is assigned by
+    libcamera's enumeration order and says nothing about which lens is
+    fitted, so the role is now resolved from each camera's stable
+    device-tree Id at construction time and exposed per INSTANCE as
+    `wide_id` / `tele_id`.
+    """
 
     def __init__(
         self,
@@ -57,7 +77,37 @@ class CameraManager:
         warmup_frames=8,
         max_fps=None,
         failover_after_failures=15,
+        role_hints=None,
+        expected_sensor_model=camera_identity.EXPECTED_SENSOR_MODEL,
+        info_provider=None,
+        lens_mm=None,
     ):
+        #: role -> nominal lens focal length in mm, from GeometryConfig.
+        #: Empty disables the runtime focal derivation below (the
+        #: configured THEORETICAL default then stands unchanged).
+        self.lens_mm = dict(lens_mm or {})
+        self._role_hints = dict(role_hints or {})
+        self._expected_sensor_model = expected_sensor_model
+
+        # ── Enumerate and validate BEFORE opening anything ──
+        #
+        # Count and sensor model can be checked from libcamera's metadata
+        # alone, so a missing or unexpected camera fails here rather than
+        # after two pipelines have been started.
+        provider = info_provider or global_camera_info
+        self.cameras_info = camera_identity.validate_cameras(
+            list(provider()), expected_sensor_model)
+
+        # Roles are NOT known yet — see _resolve_roles(), called once both
+        # cameras are running, because the decisive evidence is in the
+        # images themselves.
+        self.roles = {}
+        self.role_of = {}
+        self.wide_id = None
+        self.tele_id = None
+        self.role_source = "unresolved"
+        self.role_detail = ""
+
         self.width = width
         self.height = height
         self.fps = fps
@@ -72,9 +122,18 @@ class CameraManager:
         self.debounce_interval = debounce_interval
         self.warmup_frames = warmup_frames
 
-        self.active_camera = self.FAR_CAMERA_ID
+        # Set once the roles are known (see _resolve_roles). TELE is the
+        # default: it is the long lens, and the switch to WIDE only happens
+        # once the drone is close enough to overflow it.
+        self.active_camera = None
         self.last_switch_time = 0.0
         self.picams = {}
+
+        #: role -> horizontal focal length in pixels of the delivered frame,
+        #: recomputed from each sensor's ACTUAL crop once it is running.
+        #: Empty until _open_camera succeeds. See _derive_focal_px.
+        self.focal_px_by_role = {}
+        self.focal_source_by_role = {}
 
         # ⚠️ ALL timing in this class uses time.monotonic(), never
         # time.time(). A Raspberry Pi has no battery-backed RTC: it boots
@@ -117,23 +176,41 @@ class CameraManager:
         self.failure_log_interval = 2.0     # seconds between repeated warnings
         self._last_failure_log = 0.0
 
+        # ── Open by INDEX; roles are decided afterwards ──
+        indices = [int(c.get("Num", i))
+                   for i, c in enumerate(self.cameras_info)]
         opened = []
-        for camera_id in (self.FAR_CAMERA_ID, self.NEAR_CAMERA_ID):
+        for camera_id in indices:
             try:
                 self._open_camera(camera_id)
                 opened.append(camera_id)
             except Exception as exc:
-                print(f"[CameraManager] failed to open camera {camera_id} "
-                      f"at startup: {exc}")
+                print(f"[CameraManager] failed to open camera index "
+                      f"{camera_id} at startup: {exc}")
 
         if not opened:
             raise RuntimeError(
                 "CameraManager: no cameras could be opened at startup.")
 
+        # ⚠️ Fail-closed. _resolve_roles() raises rather than guessing, and
+        # it runs before any frame is served, so a station whose cameras
+        # cannot be told apart produces an error and no video — never video
+        # with the roles silently transposed. The acoustic subsystem is a
+        # separate thread and is unaffected; camera_worker catches this and
+        # reports the camera subsystem OFFLINE.
+        self._resolve_roles(opened)
+
+        # Focal length is per-ROLE, so it can only be derived now.
+        for camera_id in opened:
+            self._derive_focal_px(camera_id, self.picams[camera_id])
+
+        self.active_camera = self.tele_id
         if self.active_camera not in self.picams:
             self.active_camera = opened[0]
-            print(f"[CameraManager] camera {self.FAR_CAMERA_ID} did not "
-                  f"open — defaulting active camera to {opened[0]}.")
+            print(f"[CameraManager] the TELE camera (index {self.tele_id}) "
+                  f"did not open — defaulting active camera to "
+                  f"{self.role_of.get(opened[0], opened[0])} "
+                  f"(index {opened[0]}).")
 
     def _open_camera(self, camera_id):
 
@@ -191,7 +268,198 @@ class CameraManager:
         # Only registered as available once fully opened, configured,
         # started, and warmed up — if any step above raised, this line
         # never runs and the camera is correctly treated as unavailable.
+        # ⚠️ The focal length is NOT derived here any more. It is per-ROLE,
+        # and the role is not known until every camera is running and the
+        # optical check has run — see _resolve_roles(). __init__ calls
+        # _derive_focal_px() for each open camera immediately afterwards.
         self.picams[camera_id] = picam
+
+    def _probe_frame(self, camera_id):
+        """One frame for the optical role check, or None."""
+        picam = self.picams.get(camera_id)
+        if picam is None:
+            return None
+        try:
+            return picam.capture_array()
+        except Exception as exc:
+            print(f"[CameraManager] could not grab a probe frame from "
+                  f"index {camera_id} ({exc}) — the optical role check "
+                  f"cannot run on it.")
+            return None
+
+    def _optical_roles(self, opened):
+        """
+        Work out which camera holds the long lens BY LOOKING (finding C1).
+
+        Returns {role: index} or None. Never raises: an inconclusive scene
+        is an expected outcome, not an error.
+        """
+        if len(opened) < 2:
+            return None
+        lens_wide = self.lens_mm.get(camera_identity.WIDE)
+        lens_tele = self.lens_mm.get(camera_identity.TELE)
+        if not lens_wide or not lens_tele or lens_tele <= lens_wide:
+            return None
+        ratio = float(lens_tele) / float(lens_wide)
+
+        a, b = opened[0], opened[1]
+        frame_a, frame_b = self._probe_frame(a), self._probe_frame(b)
+        if frame_a is None or frame_b is None:
+            return None
+
+        try:
+            role_a, role_b, detail = camera_identity.classify_roles_by_optics(
+                frame_a, frame_b, ratio)
+        except Exception as exc:
+            print(f"[CameraManager] optical role check failed to run "
+                  f"({exc}) — falling back to the configured hint.")
+            return None
+
+        self.role_detail = detail
+        if role_a is None:
+            print(f"[CameraManager] optical role check INCONCLUSIVE: {detail}")
+            return None
+        print(f"[CameraManager] optical role check: index {a} = {role_a}, "
+              f"index {b} = {role_b}  [{detail}]")
+        return {role_a: a, role_b: b}
+
+    def _resolve_roles(self, opened):
+        """
+        Decide the role -> index mapping, or refuse.
+
+        ═══════════════════════════════════════════════════════════
+        TWO INDEPENDENT SOURCES, AND THEY CHECK EACH OTHER
+        ═══════════════════════════════════════════════════════════
+
+        1. THE OPTICAL MEASUREMENT (`_optical_roles`) reads the answer out
+           of the images. The 25 mm lens magnifies 4.17x more than the
+           6 mm one, so the telephoto view is the centre of the wide view
+           blown up — a difference far too large to mistake. This is the
+           primary source because it is a MEASUREMENT of the actual
+           hardware rather than a statement about it.
+
+        2. THE CONFIGURED HINT (`camera_role_id_hint`) binds a role to a
+           device-tree Id, i.e. to a physical CSI socket. This is what
+           makes the mapping STABLE across reboots and reordering.
+
+        Used together they answer both halves of finding C1: the optics say
+        WHICH lens, the Id says WHICH SOCKET, and each catches the other
+        being wrong. A disagreement is a hard error — it means the recorded
+        socket assignment no longer matches the hardware, which is exactly
+        the silent lens swap this whole mechanism exists to prevent.
+        """
+        optical = self._optical_roles(opened)
+
+        hinted = None
+        if all(self._role_hints.get(r) for r in camera_identity.ROLES):
+            hinted = camera_identity.resolve_roles(
+                self.cameras_info, self._role_hints,
+                self._expected_sensor_model)
+
+        if optical and hinted:
+            if optical != hinted:
+                raise camera_identity.CameraIdentityError(
+                    f"THE CONFIGURED CAMERA ROLES CONTRADICT THE OPTICS.\n"
+                    f"  configured (by device Id): {hinted}\n"
+                    f"  measured   (by lens magnification): {optical}\n"
+                    f"  {self.role_detail}\n"
+                    f"  One of these is wrong, and the station will not "
+                    f"guess which. Either a camera was moved to the other "
+                    f"CSI socket without updating "
+                    f"geometry.camera_role_id_hint, or the lenses were "
+                    f"swapped between the two bodies.\n"
+                    f"  The measurement describes the hardware as it is "
+                    f"NOW; if the cameras were re-cabled, update the hint "
+                    f"to match. See HARDWARE_TEST_REQUIRED.md, test HW-1.")
+            self.roles = hinted
+            self.role_source = "device Id, CONFIRMED by lens magnification"
+        elif hinted:
+            self.roles = hinted
+            self.role_source = ("device Id (optical confirmation "
+                                "unavailable this run)")
+        elif optical:
+            self.roles = optical
+            self.role_source = "lens magnification (measured from the images)"
+        else:
+            # Neither source could answer. resolve_roles() raises with the
+            # full operator message, including the exact JSON to paste.
+            camera_identity.resolve_roles(
+                self.cameras_info, self._role_hints,
+                self._expected_sensor_model)
+            raise AssertionError("unreachable")   # pragma: no cover
+
+        missing = [r for r in camera_identity.ROLES if r not in self.roles]
+        if missing:
+            raise camera_identity.CameraIdentityError(
+                f"camera role(s) {', '.join(missing)} were not resolved")
+
+        self.wide_id = self.roles[camera_identity.WIDE]
+        self.tele_id = self.roles[camera_identity.TELE]
+        self.role_of = {index: role for role, index in self.roles.items()}
+        print(f"[CameraManager] camera roles resolved by {self.role_source}: "
+              f"WIDE=index {self.wide_id}, TELE=index {self.tele_id}")
+
+    def _derive_focal_px(self, camera_id, picam):
+        """
+        Recompute this camera's THEORETICAL focal length from the mode it
+        actually ended up in.
+
+        ⚠️ WHY THIS IS NOT A CONSTANT (audit finding C2). A focal length in
+        PIXELS is not a property of the lens; it is a property of the lens
+        AND the sensor mode. Binning, cropping and ISP downscaling all
+        change how much of the sensor one output pixel covers, so the same
+        6 mm lens is ~930 px in the 1332x990 mode and ~611 px in a
+        full-field-of-view mode — a 1.5x difference that lands directly in
+        every distance in metres.
+
+        The configured defaults assume the 1332x990 mode. This asks the
+        driver what actually happened instead, so a libcamera version that
+        picks a different mode cannot silently invalidate the optics.
+
+        ⚠️ THE RESULT IS STILL THEORETICAL. Reading the real crop removes
+        the mode assumption; it does not measure the lens. A nominal 25 mm
+        lens is only approximately 25 mm, the projection is assumed
+        distortion-free, and none of that is checked here. This value must
+        never be reported as CALIBRATED — see HARDWARE_TEST_REQUIRED.md
+        HW-2 for the measurement that would earn that label.
+
+        Failure is not fatal: the configured THEORETICAL default stands and
+        we say so. A camera that delivers frames is worth more than a
+        derived constant.
+        """
+        role = self.role_of.get(camera_id)
+        lens_mm = (self.lens_mm or {}).get(role) if role else None
+        if not role or not lens_mm:
+            return
+        try:
+            props = picam.camera_properties or {}
+            array_w = int(props["PixelArraySize"][0])
+            metadata = picam.capture_metadata() or {}
+            # ScalerCrop is (x, y, w, h) in full-pixel-array coordinates:
+            # exactly the sensor region the ISP sampled for this stream.
+            crop_w = int(metadata["ScalerCrop"][2])
+            out_w = int(picam.camera_configuration()["main"]["size"][0])
+        except Exception as exc:
+            print(f"[CameraManager] could not read the sensor crop for "
+                  f"{role} ({exc}) — keeping the configured THEORETICAL "
+                  f"focal length, which assumes the 1332x990 mode.")
+            return
+
+        if not (0 < crop_w <= array_w) or out_w <= 0:
+            print(f"[CameraManager] implausible crop for {role} "
+                  f"(crop {crop_w} of array {array_w}, output {out_w}) — "
+                  f"keeping the configured THEORETICAL focal length.")
+            return
+
+        focal = camera_identity.theoretical_focal_px(
+            lens_mm=float(lens_mm),
+            sensor_crop_width_px=crop_w,
+            output_width_px=out_w)
+        self.focal_px_by_role[role] = focal
+        self.focal_source_by_role[role] = "THEORETICAL(runtime-mode)"
+        print(f"[CameraManager] {role}: {lens_mm:.0f} mm lens, sensor crop "
+              f"{crop_w}/{array_w} px -> output {out_w} px gives a "
+              f"THEORETICAL focal of {focal:.0f} px (NOT a calibration)")
 
     def _close_camera(self, camera_id):
         picam = self.picams.pop(camera_id, None)
@@ -345,11 +613,25 @@ class CameraManager:
     def get_active_camera(self):
         return self.active_camera
 
-    def switch_to_far(self):
-        return self._switch(self.FAR_CAMERA_ID)
+    def role_for(self, camera_id):
+        """Role of a device index, or CAM<n> if it is not one of ours."""
+        return self.role_of.get(camera_id, f"CAM{camera_id}")
 
-    def switch_to_near(self):
-        return self._switch(self.NEAR_CAMERA_ID)
+    def switch_to_tele(self):
+        """Select the long lens. Was `switch_to_far`."""
+        return self._switch(self.tele_id)
+
+    def switch_to_wide(self):
+        """Select the wide lens. Was `switch_to_near`."""
+        return self._switch(self.wide_id)
+
+    # ⚠️ FAR/NEAR are retained ONLY as names, mapped to the resolved role
+    # indices, so the legacy standalone loop in TWO_CAMERAS_FIXED.main()
+    # keeps working. They no longer imply an index: "FAR" is the long lens
+    # (TELE) and "NEAR" is the wide one (WIDE), whichever device each
+    # turned out to be. Prefer the role names in new code.
+    switch_to_far = switch_to_tele
+    switch_to_near = switch_to_wide
 
     def _switch(self, target_id):
         if self.active_camera == target_id:

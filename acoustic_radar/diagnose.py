@@ -174,6 +174,65 @@ def cmd_xvf(args) -> int:
 #  2. What the DSP actually reports
 # ═══════════════════════════════════════════════════════════════
 
+#: Below this many parsed samples nothing can be concluded about a beam.
+BEAM_MIN_SAMPLES = 100
+
+
+def beam_verdict(n_samples: int, changes: int,
+                 scene_changed: bool,
+                 min_samples: int = BEAM_MIN_SAMPLES) -> str:
+    """
+    What a beam's behaviour over one run actually establishes.
+
+    ═══════════════════════════════════════════════════════════════
+    ⚠️ FORENSIC REVIEW DEFECT D6 — "STEADY" IS NOT "FROZEN"
+    ═══════════════════════════════════════════════════════════════
+
+    The previous version printed `FROZEN (no change in the whole run)`
+    whenever a beam never changed across >= 100 samples. But a beam that is
+    working perfectly and watching a source that never moved ALSO never
+    changes. A sample count cannot separate those two — no matter how long
+    the run is, a static scene produces a static reading.
+
+    Only ONE thing distinguishes them: deliberately changing the acoustic
+    scene and seeing whether the beam follows. The tool cannot observe
+    that, so the operator asserts it with `--scene-changed`, and without
+    that assertion a zero-change beam is reported as NOT PROVEN rather than
+    condemned.
+
+    This matters because the whole point of finding H4 was that the
+    original "beams 0 and 1 are frozen" conclusion outran its evidence.
+    Reproducing that error in the tool built to correct it would be
+    particularly poor.
+
+    Returns a human-readable verdict string beginning with one of:
+        INSUFFICIENT / NOT PROVEN / FROZEN / RESPONDED / NEARLY STATIC
+    """
+    if n_samples < 2:
+        return f"INSUFFICIENT — {n_samples} sample(s), nothing to compare"
+    if n_samples < min_samples:
+        return (f"INSUFFICIENT — only {n_samples} samples (need "
+                f"{min_samples}); {changes} change(s) seen")
+
+    if changes == 0:
+        if not scene_changed:
+            return (f"NOT PROVEN — STATIC SCENE. No change in {n_samples} "
+                    f"samples, but the source was not reported as moved, so "
+                    f"a healthy beam watching a still source looks exactly "
+                    f"like this. Re-run with --scene-changed after moving "
+                    f"or switching off the source.")
+        return (f"FROZEN — no change in {n_samples} samples ACROSS A "
+                f"DELIBERATE SOURCE CHANGE; the beam is not being updated")
+
+    if scene_changed:
+        return (f"RESPONDED — {changes} change(s) in {n_samples} samples, "
+                f"including across the source change; the beam is live")
+    if changes < n_samples * 0.05:
+        return (f"NEARLY STATIC — {changes} change(s) in {n_samples} "
+                f"samples; the beam does update, so it is not frozen")
+    return f"UPDATING — {changes} change(s) in {n_samples} samples"
+
+
 def cmd_beams(args) -> int:
     _hr("2. AEC_AZIMUTH_VALUES OVER TIME — is a duplicated beam meaningful?")
 
@@ -236,17 +295,93 @@ def cmd_beams(args) -> int:
           f"({dup_rows / len(rows):.0%})")
     print(f"   rows resolved as an AMBIGUOUS : {ties} "
           f"({ties / len(rows):.0%}) 2-vs-2 tie")
+    # ═══════════════════════════════════════════════════════════
+    #  PER-BEAM STATISTICS — "frozen" vs "merely steady"
+    # ═══════════════════════════════════════════════════════════
+    #
+    # ⚠️ THIS SECTION WAS EXPANDED BECAUSE THE PREVIOUS CONCLUSION WAS NOT
+    # SUPPORTED BY ITS OWN EVIDENCE (audit finding H4). An earlier run of
+    # 20 samples over ~7 s showed beams 0 and 1 with 1 and 2 distinct
+    # values, and that was written up as "two beams are frozen". Twenty
+    # samples cannot separate two very different situations:
+    #
+    #   FROZEN    the DSP is not updating that beam at all — its value is
+    #             a constant, and feeding it to the selector manufactures
+    #             agreement out of nothing (a constant always has spread
+    #             0.0, so it always looks like the tightest cluster).
+    #   STEADY    the beam IS updating and is correctly reporting a source
+    #             that genuinely did not move. That is the beam WORKING.
+    #
+    # The difference is not in the spread, it is in whether the value ever
+    # CHANGES over a long enough window, and whether it changes when the
+    # acoustic scene changes. So the run must be long, and it must include
+    # a period with the source moved or switched off. Mean and range alone
+    # cannot answer it, which is why they are no longer all that is shown.
+    def _stats(vals):
+        n = len(vals)
+        mean = sum(vals) / n
+        var = sum((v - mean) ** 2 for v in vals) / n
+        # Longest run of BIT-IDENTICAL consecutive readings. This, not the
+        # spread, is the signature of a beam that is not being updated.
+        longest = run = 1
+        changes = 0
+        for a, b in zip(vals, vals[1:]):
+            if a == b:
+                run += 1
+                longest = max(longest, run)
+            else:
+                run = 1
+                changes += 1
+        return mean, var, var ** 0.5, longest, changes
+
     print()
-    print("   Per-beam spread over the run (a beam that tracks a STEADY source")
-    print("   should be steady; a beam that is noise will not be):")
+    print("   PER-BEAM BEHAVIOUR OVER THE RUN")
+    print("   (spread says how far it moved; 'changes' and 'max run' say")
+    print("    whether it is being UPDATED at all — that is the real test)")
+    print()
+    print("      beam    n  uniq     mean      min      max   spread"
+          "    stdev      var  changes  max-run")
+    verdicts = {}
     for i, vals in enumerate(per_beam):
         if len(vals) < 2:
-            print(f"      beam {i}: not enough samples")
+            print(f"      {i:4d}  {len(vals):3d}   -- not enough samples --")
+            verdicts[i] = "NO DATA"
             continue
+        uniq = len(set(vals))
         lo, hi = min(vals), max(vals)
-        mean = sum(vals) / len(vals)
-        print(f"      beam {i}: mean {mean:6.1f}  range {lo:6.1f}..{hi:6.1f}  "
-              f"spread {hi - lo:6.1f} deg")
+        mean, var, sd, longest, changes = _stats(vals)
+        print(f"      {i:4d}  {len(vals):3d}  {uniq:4d}  {mean:7.1f}  "
+              f"{lo:7.1f}  {hi:7.1f}  {hi - lo:7.1f}  {sd:7.2f}  "
+              f"{var:7.2f}  {changes:7d}  {longest:7d}")
+
+        verdicts[i] = beam_verdict(len(vals), changes,
+                                   getattr(args, "scene_changed", False))
+
+    print()
+    print("   VERDICT PER BEAM")
+    for i, verdict in sorted(verdicts.items()):
+        print(f"      beam {i}: {verdict}")
+
+    # ⚠️ Printed on EVERY run, not only short ones (defect D6). The scene
+    # change is the only thing that separates "frozen" from "steady", so
+    # the instruction must not be hidden behind a sample-count condition.
+    if len(rows) < BEAM_MIN_SAMPLES:
+        print()
+        print(f"   ⚠️  ONLY {len(rows)} SAMPLES (need {BEAM_MIN_SAMPLES}).")
+        print( "      Re-run with at least:")
+        print( "          python diagnose.py beams --samples 200 --interval 0.5")
+    if not getattr(args, "scene_changed", False):
+        print()
+        print( "   ⚠️  --scene-changed WAS NOT GIVEN, so no beam can be")
+        print( "      reported FROZEN by this run, however long it was.")
+        print( "      A beam that is perfectly healthy but watching a source")
+        print( "      that never moved is indistinguishable from a frozen one;")
+        print( "      only changing the scene tells them apart. Re-run as:")
+        print( "          python diagnose.py beams --samples 200 "
+               "--interval 0.5 --scene-changed")
+        print( "      and, partway through, MOVE the source or switch it off.")
+        print( "      Record what you did and when.")
+        print( "      See HARDWARE_TEST_REQUIRED.md, test HW-7.")
 
     print()
     print("   HOW TO READ THIS")
@@ -408,7 +543,20 @@ def main(argv=None) -> int:
     p.set_defaults(func=cmd_xvf)
 
     p = sub.add_parser("beams", help="what AEC_AZIMUTH_VALUES really reports")
-    p.add_argument("--samples", type=int, default=40)
+    # ⚠️ Raised from 40 to 200 (audit finding H4). At 0.35 s per sample the
+    # old default covered ~14 s, which is far too short to distinguish a
+    # beam that is frozen from one correctly reporting a source that did
+    # not happen to move. 200 samples is ~70 s and leaves room to move the
+    # source partway through, which is what actually settles the question.
+    p.add_argument("--samples", type=int, default=200)
+    # ⚠️ The operator asserts that the acoustic scene was deliberately
+    # changed mid-run (source moved or switched off). Without it the tool
+    # will not call any beam FROZEN — see beam_verdict, defect D6.
+    p.add_argument("--scene-changed", dest="scene_changed",
+                   action="store_true",
+                   help="you MOVED or switched off the source partway "
+                        "through this run; required before any beam can be "
+                        "reported FROZEN")
     p.add_argument("--interval", type=float, default=0.35)
     p.add_argument("--timeout", type=float, default=10.0)
     p.add_argument("--show", type=int, default=20)

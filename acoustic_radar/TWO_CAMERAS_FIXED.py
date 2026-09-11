@@ -90,64 +90,84 @@ HEAD_CONFIG: List[Tuple[str, str, int]] = [
 ]
 
 DRONE_REAL_WIDTH_M: Optional[float] = 0.25
-CAMERA_FOCAL_PX = {
-   
-    # SUSPECT — must be re-calibrated. This was measured at 5 m with a
-    # 65.5 px box, i.e. by the same procedure that was just proven to
-    # inflate the NEAR value 2x (see the note below). There is no second
-    # data point for this camera and no datasheet to check against (the
-    # IMX477 takes interchangeable lenses), so the true value cannot be
-    # derived here — only measured. Re-run the 'c' calibration on this
-    # camera at CALIBRATION_DISTANCE_M and replace this number.
-    # MEASURED AND CONFIRMED — no longer suspect. Two independent
-    # calibrations at very different distances agree:
-    #     5.0 m ->  65.5 px -> focal 1310  (HFOV 27.5 deg)
-    #     1.5 m -> 212.3 px -> focal 1274  (HFOV 28.2 deg)
-    # For a pinhole camera (box x distance) must be constant: 327.5 vs
-    # 318.5, only 2.8% apart. So this camera obeys the model and was
-    # never wrong — the earlier suspicion that it was inflated like the
-    # NEAR value is REFUTED by measurement. Using the 1.5 m figure, since
-    # the larger box makes it the more precise of the two.
-    CameraManager.FAR_CAMERA_ID:  1274.0,  # IMX477 + fitted lens, ~28 deg HFOV
-  
-    # CORRECTED. The old 1003.4 came from a 5 m calibration and was
-    # proven wrong by two of your own measurements: at 5 m the box was
-    # 50.2 px, at 1.5 m it was 83.6 px. For a pinhole camera
-    # (box x distance) must be constant — those give 251 vs 125, exactly
-    # 2.00x apart, so the 5 m point cannot be trusted. The 1.5 m point
-    # implies 502 px = 65.1 deg HFOV, which matches the IMX708 Camera
-    # Module 3 datasheet figure of 66 deg. The 5 m point implied 35.4
-    # deg, narrower than the sensor physically is. Root cause: at 5 m a
-    # 0.25 m drone should span only ~25 px, and detection boxes on
-    # objects that small are systematically inflated.
-    # UNVERIFIED — measure this properly (freeze with 'f', drone at
-    # 1.5 m, press 'c') and replace the number.
-    #
-    # 501.7 was NOT measured. It was derived indirectly from a single
-    # report ("shows 3 m when actually at 1.5 m"), on the theory that
-    # detection boxes are inflated at long range. The FAR camera has
-    # since disproved that theory: its 5 m and 1.5 m calibrations agree
-    # to 2.8%, so the method is sound even with a small box. That leaves
-    # this camera's two candidates unresolved:
-    #     5 m calibration ->  50.2 px -> focal 1003 (HFOV 35.4 deg)
-    #     derived 1.5 m   ->  83.6 px -> focal  502 (HFOV 65.1 deg)
-    # The datasheet favours ~502 (IMX708 Camera Module 3 is ~66 deg),
-    # the direct measurement favours ~1003. Only a real 1.5 m
-    # calibration on this camera settles it — do not trust either until
-    # then. If the measurement comes out near 1000, put 1003 back.
-    CameraManager.NEAR_CAMERA_ID: 501.7,   # IMX708 — UNVERIFIED, re-measure
-}
+
+# ═══════════════════════════════════════════════════════════════
+#  ⚠️ NOT A CONFIGURATION. A RUNTIME CACHE. (audit findings C2/C3/M3)
+# ═══════════════════════════════════════════════════════════════
+#
+# This dict is keyed by DEVICE INDEX and is filled in at start-up by
+# camera_worker._sync_optics(), from the role-keyed values in
+# fusion_config.GeometryConfig, once camera_identity has resolved which
+# physical camera holds which lens. It starts EMPTY on purpose: an empty
+# dict makes estimate_distance_m() return None ("no focal calibration"),
+# which every caller already handles, whereas a pre-filled default would
+# hand out distances computed with whichever lens happened to be index 0.
+#
+# WHAT WAS HERE BEFORE, AND WHY IT WAS WRONG:
+#
+#   FAR_CAMERA_ID:  1274.0   # "IMX477 + fitted lens, ~28 deg HFOV"
+#   NEAR_CAMERA_ID:  501.7   # "IMX708 - UNVERIFIED, re-measure"
+#
+# Three separate defects, all load-bearing:
+#
+#   1. THE TWO VALUES CONTRADICT THE INSTALLED LENSES. Identical sensors
+#      in an identical mode must have a pixel-focal ratio equal to their
+#      lens ratio. 1274/501.7 = 2.54; the lenses are 25/6 = 4.17. Solving
+#      each value back to a lens gives 8.22 mm and 3.24 mm, and neither of
+#      those is fitted to this station.
+#   2. THE 501.7 WAS JUSTIFIED FROM THE WRONG SENSOR'S DATASHEET — the
+#      IMX708 Camera Module 3's 66 deg field of view. No IMX708 is
+#      installed here; both cameras are IMX477P. A number derived from a
+#      sensor that is not present is not a measurement of anything.
+#   3. THE KEYS WERE ENUMERATION INDICES, so even a correct pair of focal
+#      lengths would attach to the wrong camera the moment libcamera
+#      reordered them.
+#
+# The replacement values are THEORETICAL, derived from the IMX477 pixel
+# pitch and the sensor's actual crop at runtime, and are labelled as such
+# everywhere they surface. They are NOT a calibration; see
+# GeometryConfig.camera_focal_px_by_role and HARDWARE_TEST_REQUIRED.md HW-2.
+CAMERA_FOCAL_PX: dict = {}
+
+
+def estimate_distance_m(apparent_width_px: float,
+                        camera_id: int,
+                        focal_px: Optional[float] = None) -> Optional[float]:
+    """
+    Pinhole distance to a target of known real width.
+
+    ⚠️ `focal_px` may now be passed EXPLICITLY (audit finding M3). The
+    module global is a start-up cache of the role-keyed configuration, and
+    a caller that already knows which optics produced the pixels should say
+    so rather than trusting a global to still agree. Omitting it preserves
+    the original behaviour exactly.
+
+    Returns None — never a number — when the focal length is unknown, so an
+    uncalibrated camera reports "no range" instead of a fabricated one.
+    """
+    if DRONE_REAL_WIDTH_M is None:
+        return None
+    if focal_px is None:
+        focal_px = CAMERA_FOCAL_PX.get(camera_id)
+    if not focal_px or apparent_width_px <= 1.0:
+        return None
+    return (DRONE_REAL_WIDTH_M * float(focal_px)) / float(apparent_width_px)
 
 
 # Ground-truth distance for the 'c' calibration key.
 #
-# 1.5 m, NOT 5 m. This was corrected after 5 m was proven to produce a
-# 2x-wrong focal length: the accuracy of this whole method depends on the
-# detection box being TIGHT around the drone, and a box is only tight
-# when it is large. At 5 m a 0.25 m drone spans ~25 px and the detector
-# draws a visibly inflated box; at 1.5 m it spans ~85 px and the box is
-# accurate (independently confirmed: the 1.5 m measurement reproduces the
-# IMX708's published 66 deg field of view, the 5 m one does not).
+# 1.5 m, NOT 5 m. The accuracy of this whole method depends on the
+# detection box being TIGHT around the drone, and a box is only tight when
+# it is large. At 5 m a 0.25 m drone spans ~25 px and the detector draws a
+# visibly inflated box; at 1.5 m it spans ~85 px and the box is accurate.
+#
+# ⚠️ THE ORIGINAL JUSTIFICATION FOR THIS NUMBER WAS WITHDRAWN (finding C3).
+# It read: "independently confirmed: the 1.5 m measurement reproduces the
+# IMX708's published 66 deg field of view, the 5 m one does not". No IMX708
+# exists on this station, so that confirmation was against the datasheet of
+# a sensor that is not installed and is no evidence for anything. The
+# large-box argument above stands on its own and is why the distance is
+# still 1.5 m; the corroboration does not.
 #
 # If you track a physically larger drone you can calibrate further away —
 # what matters is the BOX SIZE IN PIXELS, not the distance itself. The
@@ -156,27 +176,17 @@ CALIBRATION_DISTANCE_M = 1.5
 
 # Minimum box width, in pixels, for a calibration to be accepted.
 # Below this the box is too small for its edges to mean anything and the
-# resulting focal length will be inflated — which is exactly the failure
-# that produced the wrong NEAR value. 70 px is set from the measured
-# evidence: the 83.6 px box gave a datasheet-correct result, the 50.2 px
-# box was 2x wrong.
+# resulting focal length will be inflated. 70 px sits between the two
+# box sizes the operator actually measured (50.2 px and 83.6 px) on the
+# same camera at 5 m and 1.5 m, whose implied focal lengths differed by
+# exactly 2.00x — so one of them had to be wrong, and the small one is
+# the one whose edges cannot be trusted.
 MIN_CALIBRATION_BOX_PX = 70.0
 
 
 def focal_px_from_fov(fov_deg: float, image_dim_px: int) -> float:
 
     return (image_dim_px / 2.0) / float(np.tan(np.radians(fov_deg) / 2.0))
-
-
-def estimate_distance_m(apparent_width_px: float,
-                        camera_id: int) -> Optional[float]:
-
-    if DRONE_REAL_WIDTH_M is None:
-        return None
-    focal_px = CAMERA_FOCAL_PX.get(camera_id)
-    if not focal_px or apparent_width_px <= 1.0:
-        return None
-    return (DRONE_REAL_WIDTH_M * float(focal_px)) / float(apparent_width_px)
 
 _MIN_SPEED_SQ_JAC: float = 1.0    # px²/s²  — minimum v² for phi/omega Jacobians
 _MAX_VEL:          float = 500.0  # px/s
@@ -1145,6 +1155,33 @@ class HailoInference:
         self._src_w = 0
         self._CLS_MIN_CALLS   = 3
 
+        # ⚠️ WHERE THE FRAME TIME ACTUALLY GOES.
+        #
+        # predict_with_scores() was only ever timed as a whole, and on the
+        # target hardware that whole is ~29 ms out of a 33.3 ms frame budget —
+        # i.e. the single largest cost in the camera pipeline. But four very
+        # different things happen inside it, and they call for opposite fixes:
+        #
+        #   letterbox   numpy memory traffic on the CPU
+        #   infer       the Hailo-8L itself, synchronous, batch of one
+        #   decode      numpy work on three head tensors, on the CPU
+        #   nms         cv2.dnn.NMSBoxes, plus the tolist() conversions
+        #
+        # If `infer` dominates, the NPU is saturated and only a different
+        # model or an async/pipelined submission can help. If the three CPU
+        # stages dominate, the NPU is idle most of the frame and the fix is on
+        # this side of the PCIe bus. Published "Pi 5 + Hailo-8L does 60 fps"
+        # figures are NPU throughput in a pipelined benchmark, which is not
+        # the same measurement as this serial loop — so the split has to be
+        # measured here rather than inferred from a datasheet.
+        #
+        # Milliseconds of the MOST RECENT call. Plain floats, written once per
+        # invocation: no lock, because the camera worker is the only reader
+        # and it reads immediately after the call it just made.
+        # None = that stage did not run on the most recent frame.
+        self.stage_ms: dict = {"letterbox": None, "infer": None,
+                               "decode": None, "nms": None}
+
         self._ltrb_mode: Optional[str] = None   # 'stride' or 'pixel'
         self._ltrb_stride_score = 0.0
         self._ltrb_pixel_score  = 0.0
@@ -1259,11 +1296,29 @@ class HailoInference:
         # to duplicate the whole padded frame into self._in_buf[0] here is
         # no longer needed (removed; see __init__ for the buffer-aliasing
         # rationale).
+        # Stage timing: see the stage_ms note in __init__. time.monotonic() is
+        # a vDSO read on Linux (tens of nanoseconds), so four extra calls
+        # against a ~29 ms function are not measurable overhead.
+        _t0 = time.monotonic()
         _, ratio, pad_w, pad_h = self._letterbox(frame_rgb)
+        _t1 = time.monotonic()
 
         # 2. Inference
         raw: dict = self._pipeline.infer(
             {self.input_vstream_info.name: self._in_buf})
+        _t2 = time.monotonic()
+
+        self.stage_ms["letterbox"] = (_t1 - _t0) * 1000.0
+        self.stage_ms["infer"] = (_t2 - _t1) * 1000.0
+        # None, not 0.0, and set NOW so an early return below cannot leave the
+        # previous call's numbers behind. None means "this stage did not run on
+        # this frame" — NMS is genuinely skipped when nothing was detected, and
+        # most frames detect nothing. Recording a zero for those would drag the
+        # reported NMS cost toward zero and hide what it costs on the frames
+        # where it actually runs. Same rule the observation types follow: an
+        # absent measurement is never a zero.
+        self.stage_ms["decode"] = None
+        self.stage_ms["nms"] = None
 
         # 3. Parse outputs
         all_boxes:  List[np.ndarray] = []
@@ -1320,6 +1375,9 @@ class HailoInference:
                     all_boxes.append(boxes)
                     all_scores.append(scores)
 
+        _t3 = time.monotonic()
+        self.stage_ms["decode"] = (_t3 - _t2) * 1000.0
+
         if not all_boxes:
             return [], []
 
@@ -1329,6 +1387,7 @@ class HailoInference:
         idxs = cv2.dnn.NMSBoxes(
             merged_b.tolist(), merged_s.tolist(),
             self.conf_thresh, self.iou_thresh)
+        self.stage_ms["nms"] = (time.monotonic() - _t3) * 1000.0
         if len(idxs) == 0:
             return [], []
         keep = idxs.flatten()
@@ -1464,10 +1523,22 @@ def _check_camera_manager_is_current():
 def main():
     _check_camera_manager_is_current()
 
+    # ⚠️ The standalone loop must resolve camera roles the same way the
+    # unified station does (audit findings C1/M3), or it would be the one
+    # remaining place where a device index is treated as an identity — and
+    # its CAMERA_FOCAL_PX cache would stay empty, silently dropping every
+    # distance in metres and falling back to pixel-height switching.
+    from fusion_config import load as _load_config
+    _cfg = _load_config()
+    _geo = _cfg.geometry
+
     camera_manager = CameraManager(
         width=640,
         height=480,
         fps=30,
+        role_hints=_geo.camera_role_id_hint,
+        expected_sensor_model=_geo.expected_sensor_model,
+        lens_mm=_geo.lens_mm,
         # REVERTED from 60 back to None (= hard 30 fps lock).
         # Allowing the sensor to run faster shortens the maximum exposure
         # time, and the auto-exposure compensates with higher gain, i.e. a
@@ -1481,6 +1552,23 @@ def main():
         debounce_interval=0.5,
         warmup_frames=3,
     )
+
+    # Adopt the focal lengths derived from the real sensor mode, then bind
+    # role -> device index and populate this module's index-keyed cache.
+    global CAMERA_FOCAL_PX, DRONE_REAL_WIDTH_M
+    for _role, _focal in camera_manager.focal_px_by_role.items():
+        _geo.camera_focal_px_by_role[_role] = _focal
+        _geo.camera_focal_source[_role] = \
+            camera_manager.focal_source_by_role.get(
+                _role, "THEORETICAL(runtime-mode)")
+    _geo.bind_roles(camera_manager.roles)
+    CAMERA_FOCAL_PX = {
+        _cam: (None if _f is None else float(_f))
+        for _cam, _f in _geo.camera_focal_px.items()}
+    if _geo.drone_real_width_m is not None:
+        DRONE_REAL_WIDTH_M = float(_geo.drone_real_width_m)
+    for _line in _geo.focal_status_lines():
+        print(f"[optics] NOT CALIBRATED: {_line}")
 
     detector = HailoInference(
         "bestty_yolo260508.hef",
@@ -1641,7 +1729,7 @@ def main():
             elif target_distance_m is not None:
                 # PRIMARY PATH — distance-based switching.
                 if (
-                    current_camera == CameraManager.FAR_CAMERA_ID
+                    current_camera == camera_manager.tele_id
                     and target_distance_m < SWITCH_TO_NEAR_BELOW_M
                 ):
                     # AUDIT BUG #2: use the return value, so a switch
@@ -1652,7 +1740,7 @@ def main():
                               f"({target_distance_m:.1f} m)")
 
                 elif (
-                    current_camera == CameraManager.NEAR_CAMERA_ID
+                    current_camera == camera_manager.wide_id
                     and target_distance_m > SWITCH_TO_FAR_ABOVE_M
                 ):
                     if camera_manager.switch_to_far():
@@ -1661,14 +1749,14 @@ def main():
 
             elif max_height > 0:
                 if (
-                    current_camera == CameraManager.FAR_CAMERA_ID
+                    current_camera == camera_manager.tele_id
                     and max_height > THRESHOLD_NEAR_HEIGHT
                 ):
                     if camera_manager.switch_to_near():
                         print("[CameraSwitch] FAR -> NEAR (px fallback)")
 
                 elif (
-                    current_camera == CameraManager.NEAR_CAMERA_ID
+                    current_camera == camera_manager.wide_id
                     and max_height < THRESHOLD_FAR_HEIGHT
                 ):
                     if camera_manager.switch_to_far():
@@ -1695,10 +1783,10 @@ def main():
                 + (1.0 - alpha_fps) * display_fps
             )
 
-            if current_camera == CameraManager.FAR_CAMERA_ID:
-                cam_name = "IMX477 FAR"
+            if current_camera == camera_manager.tele_id:
+                cam_name = "TELE/IMX477P"
             else:
-                cam_name = "IMX708 NEAR"
+                cam_name = "WIDE/IMX477P"
 
             cv2.putText(
                 frame_bgr,

@@ -484,9 +484,11 @@ def cmd_doa(cfg: dict, seconds: float) -> None:
         print("   Записано srp_zero_deg (власний SRP-PHAT). Його напрямок")
         print("   обертання відомий із коду і не зберігається.")
     elif handedness_resolved:
+        # ⚠️ `doa_invert` більше НЕ пишеться (знахідка H3). Він дублював
+        # `doa_handedness`, у runtime не читався взагалі, і давав змогу
+        # файлу містити два суперечливі описи одного й того ж обертання.
         calibration.save({
             "doa_offset_deg": float(conv.zero_deg),
-            "doa_invert": conv.handedness is Handedness.COUNTER_CLOCKWISE,
             "doa_handedness": conv.handedness.value,
         })
         print("   Записано doa_offset_deg / doa_handedness (USB DSP).")

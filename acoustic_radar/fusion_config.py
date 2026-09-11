@@ -291,14 +291,29 @@ class CameraSwitchConfig:
     They do NOT describe how far the system can see. They decide which
     OPTICS to use for a drone that is already very close:
 
-        FAR  camera = IMX477, ~28° HFOV, focal 1274 px — the long lens
-        NEAR camera = IMX708, ~66° HFOV, focal ~502 px — the wide lens
+        TELE camera = IMX477P + Kowa 25 mm — the long lens (narrow FOV)
+        WIDE camera = IMX477P + 6 mm       — the wide lens
 
     Inside ~1.5 m the drone overflows the narrow lens's field of view, so
     the system swaps to the wide one. The acoustic sensor meanwhile works
     out to hundreds of metres. The two ranges are not comparable, which is
     exactly why acoustic distance must NOT drive this switch — see
     `allow_acoustic_fallback` below.
+
+    ⚠️ This docstring used to read "FAR camera = IMX477, focal 1274 px /
+    NEAR camera = IMX708, focal ~502 px" (audit findings C2/C3). There is
+    no IMX708 on this station, and those two focal lengths are in a 2.54
+    ratio while the lenses are in a 4.17 ratio, so they could not both
+    describe these optics. Roles and focal lengths now live in
+    GeometryConfig, keyed by role; see camera_focal_px_by_role.
+
+    ⚠️ THE THRESHOLDS BELOW ARE NOT INDEPENDENT OF THAT. They are compared
+    against a distance computed from the focal length, so a focal length
+    that changes by 3x moves the range at which the swap physically
+    happens by 3x, even though the numbers here do not change. They were
+    chosen under the OLD, wrong focal lengths and have NOT been re-derived
+    against a measured one — see HARDWARE_TEST_REQUIRED.md test HW-2, and
+    re-check them once a real calibration exists.
     """
 
     # [MEASURED/POLICY] Original values from TWO_CAMERAS_FIXED, preserved.
@@ -357,12 +372,10 @@ class GeometryConfig:
     optical axis points at.
     """
 
-    # [CALIBRATE] Azimuth (in the same 0–360° frame the acoustic subsystem
-    # reports, after radar_calibration.json's doa_offset_deg has been
-    # applied) that each camera's optical centre looks along.
-    # None = unknown = cue disabled. NEVER guess these.
+    # ── Runtime binding: see camera_focal_px below. Set by bind_roles()
+    # from camera_boresight_deg_by_role; do NOT put this in the JSON.
     camera_boresight_deg: Dict[int, Optional[float]] = field(
-        default_factory=lambda: {0: None, 1: None})
+        default_factory=dict)
 
     # [CALIBRATE] The value radar_calibration.json's `doa_offset_deg` had
     # when the boresight above was measured.
@@ -392,26 +405,178 @@ class GeometryConfig:
     # is wrong by twice the bearing.
     boresight_calibrated_handedness: Optional[str] = None
 
-    # [MEASURED] Horizontal focal length in pixels per camera, copied from
-    # TWO_CAMERAS_FIXED.CAMERA_FOCAL_PX so that one file drives both.
-    # Camera 0 (IMX477 FAR): two independent calibrations at 5.0 m and 1.5 m
-    #   agreed to 2.8% -> 1274.0 is trustworthy.
-    # Camera 1 (IMX708 NEAR): UNVERIFIED, two candidate values (502 vs 1003)
-    #   remain unresolved in the source comments. Any distance shown on the
-    #   NEAR camera inherits that uncertainty.
-    camera_focal_px: Dict[int, Optional[float]] = field(
-        default_factory=lambda: {0: 1274.0, 1: 501.7})
+    # ═══════════════════════════════════════════════════════════
+    #  STABLE CAMERA IDENTITY (audit finding C1)
+    # ═══════════════════════════════════════════════════════════
+
+    # [CALIBRATE] role -> a substring of that camera's libcamera `Id`.
+    #
+    # ⚠️ THE STATION WILL NOT START THE CAMERA SUBSYSTEM UNTIL THIS IS SET,
+    # and that is deliberate. Both cameras are the same sensor model
+    # (IMX477P), so an enumeration index is not an identity: if libcamera
+    # reorders them after a kernel update or a cable reseat, WIDE and TELE
+    # swap and every distance, every acoustic cue and every lens selection
+    # is wrong with no error anywhere.
+    #
+    # The Id is the sensor's device-tree path, whose `i2c@NNNNN` node is the
+    # physical CSI socket — stable across reboots and reordering. Run the
+    # station once to have the discovered Ids printed for you, or use
+    # `libcamera-hello --list-cameras`. See camera_identity.py and
+    # HARDWARE_TEST_REQUIRED.md test HW-1.
+    camera_role_id_hint: Dict[str, Optional[str]] = field(
+        default_factory=lambda: {"WIDE": None, "TELE": None})
+
+    # [POLICY] Every camera's reported Model must contain this. A match
+    # cannot tell WIDE from TELE (both are IMX477P) — it catches a
+    # *different* module being plugged in, whose pixel pitch would silently
+    # invalidate the theoretical focal lengths below.
+    expected_sensor_model: Optional[str] = "imx477"
+
+    # ═══════════════════════════════════════════════════════════
+    #  OPTICS — keyed by ROLE, never by index (audit findings C2/M3)
+    # ═══════════════════════════════════════════════════════════
+
+    # [HARDWARE FACT] Nominal lens focal length fitted to each role, in mm.
+    # Stated by the operator: 6 mm on WIDE, Kowa 25 mm on TELE.
+    lens_mm: Dict[str, float] = field(
+        default_factory=lambda: {"WIDE": 6.0, "TELE": 25.0})
+
+    # [THEORETICAL] Horizontal focal length in pixels of the DELIVERED frame.
+    #
+    # ⚠️ THESE ARE NOT MEASURED. They are computed from optics —
+    #     f_px = (f_mm / 1.55 um) * (output_width / sensor_crop_width)
+    # — assuming the IMX477's 1332x990 sensor mode, whose crop is 2664 full
+    # array pixels wide, scaled to a 640 px output:
+    #     WIDE  6 mm -> (6/0.00155)  * (640/2664) =  930 px  (HFOV 37.9 deg)
+    #     TELE 25 mm -> (25/0.00155) * (640/2664) = 3875 px  (HFOV  9.4 deg)
+    #
+    # WHY THE OLD VALUES WERE REPLACED. The previous pair was
+    # {0: 1274.0, 1: 501.7}. Identical sensors in an identical mode must
+    # have a pixel-focal ratio equal to their lens ratio, and they did not:
+    #     configured 1274.0 / 501.7 = 2.54
+    #     lenses          25 /   6  = 4.17     -> 39% apart
+    # Solving each configured value back to a lens gives 8.22 mm and
+    # 3.24 mm — neither of which is installed on this station. At least one
+    # was wrong, and the station's own logs showed the consequence: a
+    # `FAR -> NEAR (0.50 m)` switch requires a 637 px box at focal 1274,
+    # i.e. a drone filling the frame. The same box at 3875 px is 1.52 m.
+    #
+    # ⚠️ THEORETICAL IS NOT CALIBRATED. This assumes the lens is exactly
+    # its nominal focal length, a pinhole projection with no distortion,
+    # and the 1332x990 mode. When the camera subsystem starts it recomputes
+    # these from the sensor's ACTUAL ScalerCrop and overrides what is here
+    # — see CameraManager.
+    #
+    # ⚠️ HOW WRONG THESE ARE IS UNKNOWN. An earlier version of this comment
+    # said "expect a few percent of error either way". That bound was never
+    # measured, derived or checked against anything — it was a guess about
+    # lens manufacturing tolerance, and it ignored distortion and mounting
+    # entirely. Stating it gave the numbers an air of accuracy they have
+    # not earned, which is the exact failure this project forbids. The real
+    # error is UNKNOWN until HW-2 in HARDWARE_TEST_REQUIRED.md is performed;
+    # that calibration has NOT been done on this station.
+    camera_focal_px_by_role: Dict[str, Optional[float]] = field(
+        default_factory=lambda: {"WIDE": 930.0, "TELE": 3875.0})
+
+    # [DERIVED] Provenance of each focal length above. Set to CALIBRATED
+    # only by a real measurement; the UI and the start-up banner show this
+    # verbatim so a theoretical number can never be mistaken for a measured
+    # one. One of: "THEORETICAL", "THEORETICAL(runtime-mode)",
+    # "CALIBRATED", "UNCALIBRATED".
+    camera_focal_source: Dict[str, str] = field(
+        default_factory=lambda: {"WIDE": "THEORETICAL",
+                                 "TELE": "THEORETICAL"})
+
+    # [CALIBRATE] Boresight azimuth per ROLE. None = not measured = the
+    # acoustic cue is disabled for that camera. See camera_boresight_deg
+    # below for why an explicit 0.0 is treated as a measurement.
+    camera_boresight_deg_by_role: Dict[str, Optional[float]] = field(
+        default_factory=lambda: {"WIDE": None, "TELE": None})
+
+    # ── Runtime binding: role -> index, filled in by bind_roles() ──
+    #
+    # ⚠️ DO NOT SET THESE IN fusion_config.json. They are not configuration;
+    # they are the role-keyed values above, re-keyed by whichever device
+    # index each role resolved to at start-up. They exist because the
+    # consumers (camera_cue, sensor_fusion, the distance estimator) receive
+    # an `active_camera` INDEX from the frame that produced the pixels.
+    camera_focal_px: Dict[int, Optional[float]] = field(default_factory=dict)
 
     # [CALIBRATE] Real width of the drone being tracked, in metres. The
     # pinhole distance estimate scales linearly with this, so a 2x error
     # here is a 2x error in every visual distance.
     drone_real_width_m: Optional[float] = 0.25
 
-    # [POLICY] Vertical tolerance for the bearing cue. The acoustic array
-    # reports azimuth only — it has no elevation — so the cue can only be a
-    # vertical band, never a point. Drawing a point would imply an
-    # elevation measurement that does not exist.
-    cue_is_azimuth_only: bool = True
+    # ── Role binding ───────────────────────────────────────────
+
+    def bind_roles(self, roles: Dict[str, int]) -> None:
+        """
+        Re-key the role-keyed optics onto the device indices they resolved to.
+
+        Called ONCE, from CameraWorker._setup(), after
+        camera_identity.resolve_roles() has bound each role to a physical
+        camera. Until this runs the index-keyed dicts are EMPTY, so every
+        consumer sees "not calibrated" rather than a value belonging to
+        whichever camera happened to be index 0.
+
+        ⚠️ This is the join between the two halves of finding C1. The optics
+        are configured against a ROLE, because that is what the lens is
+        fitted to; the frame loop reports an INDEX, because that is what
+        produced the pixels. Doing the join here, once, at a point where the
+        mapping is known to be unambiguous, is what stops an index from
+        being treated as an identity anywhere downstream.
+        """
+        self.role_of_camera = {index: role for role, index in roles.items()}
+        self.camera_focal_px = {
+            index: self.camera_focal_px_by_role.get(role)
+            for role, index in roles.items()}
+        self.camera_boresight_deg = {
+            index: self.camera_boresight_deg_by_role.get(role)
+            for role, index in roles.items()}
+
+    def role_name(self, camera_id: int) -> str:
+        """Role of a device index, or CAM<n> before/without a binding."""
+        return getattr(self, "role_of_camera", {}).get(
+            camera_id, f"CAM{camera_id}")
+
+    def focal_status_lines(self) -> list[str]:
+        """
+        Start-up warning when any focal length is not a real measurement.
+
+        ⚠️ Loud on purpose. A theoretical focal length produces distances
+        that look exactly like measured ones — same units, same precision,
+        same place on the HUD — so the only thing separating them is
+        whether the station says so out loud, every single run.
+        """
+        out: list[str] = []
+        for role in sorted(self.camera_focal_px_by_role):
+            focal = self.camera_focal_px_by_role.get(role)
+            source = str(self.camera_focal_source.get(role, "UNKNOWN"))
+            if focal is None:
+                out.append(f"camera {role}: focal NOT CALIBRATED — no "
+                           f"distance in metres from this camera")
+            elif source.startswith("THEORETICAL"):
+                lens = self.lens_mm.get(role)
+                lens_s = f"{lens:.0f} mm" if lens else "unknown lens"
+                out.append(
+                    f"camera {role}: focal {focal:.0f} px is {source}, "
+                    f"derived from the nominal {lens_s} lens — NOT a "
+                    f"measurement. THE ERROR IN EVERY DISTANCE FROM THIS "
+                    f"CAMERA IS UNKNOWN until calibration: "
+                    f"HARDWARE_TEST_REQUIRED.md HW-2")
+        return out
+
+    # ⚠️ `cue_is_azimuth_only` WAS REMOVED HERE (audit finding M2).
+    #
+    # It read as a tunable policy but had exactly one reference in the whole
+    # project: its own declaration. Nothing consulted it. The property it
+    # described is real and still holds — the array reports azimuth with no
+    # elevation, so BearingProjector draws a vertical BAND and never a point
+    # — but that behaviour is unconditional in camera_cue.project(), not
+    # switchable. Leaving the key implied an operator could turn it off and
+    # get an elevation-resolved cue from a sensor that cannot measure
+    # elevation. Removed rather than wired up, because there is nothing to
+    # wire it to.
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -475,6 +640,40 @@ class FusionConfig:
     # box gets rejected by DOA noise alone; looser and an unrelated object
     # elsewhere in the frame silently cancels the region for a drone that
     # is still hidden behind a tree.
+    #
+    # ⚠️ FINDING N1 — THIS TOLERANCE IS UNREACHABLE ON THE TELE CAMERA,
+    # AND THE SYSTEM NOW SAYS SO INSTEAD OF REPORTING SILENT AGREEMENT.
+    #
+    # The tolerance is compared against |bearing - box angle|, where both
+    # the box angle and the bearing are bounded by the half-field h. The
+    # largest disagreement an in-view pair can produce is therefore
+    #
+    #     max |b - theta| = 2h = the FULL field of view
+    #
+    # reached when the bearing sits at one edge of the frame and the box at
+    # the other. With the corrected optics (finding C2):
+    #
+    #     TELE  25 mm -> fov  9.4 deg  <  20 deg  -> CAN NEVER REJECT
+    #     WIDE   6 mm -> fov 37.9 deg  >  20 deg  -> can reject
+    #
+    # So on TELE every in-frame box passes and a pass carries no
+    # cross-sensor evidence at all; on WIDE the gate genuinely works.
+    #
+    # ⚠️ An earlier write-up of N1 compared the tolerance against the HALF
+    # field and concluded the gate was dead on BOTH cameras. That was wrong
+    # by a factor of two: it implicitly assumed the bearing always sits at
+    # the boresight. The criterion is the full field, and it is now
+    # computed rather than asserted in prose — see
+    # BearingProjector.agreement_is_discriminating(), whose result is
+    # carried on every FusedTarget as sensor_agreement_discriminating.
+    #
+    # THE VALUE ITSELF IS NOT A FREE PARAMETER: it is the DOA's angular
+    # uncertainty, and it must not be tightened below the direction
+    # sensor's real accuracy or correct boxes start being rejected on DOA
+    # noise. 20 deg sits just above doa.py's stated +/-15 deg for SRP-PHAT
+    # on a 43 mm array. Measuring the XVF3800 DSP's actual accuracy is
+    # HW-6; until then this stays where it is, and the code reports where
+    # it has no power rather than pretending it does.
     cue_agreement_deg: float = 20.0
 
 
@@ -691,15 +890,33 @@ class LedConfig:
                                                # still held, see report
 
     # [POLICY] Minimum seconds between two hardware writes. Each write is a
-    # subprocess spawn (200-500 ms of python start-up, measured in doa.py),
-    # so this is a hard floor, not a preference. 10 Hz of *requests* is
-    # fine; the controller only writes when the effective frame changes.
+    # subprocess spawn, so this is a hard floor, not a preference. 10 Hz of
+    # *requests* is fine; the controller only writes when the effective
+    # frame changes.
+    #
+    # ⚠️ The cost quoted here used to be "200-500 ms of python start-up,
+    # measured in doa.py". That figure was never measured — doa.py's own
+    # comment has since been corrected against the target hardware, where
+    # a bare interpreter start is 18.3 ms and the full xvf_host.py call is
+    # 128.6 ms (n=20, `python diagnose.py xvf`). Neither is 200-500 ms, and
+    # neither is attributable to "python start-up". The 0.15 s floor is
+    # still reasonable, but it is a policy choice, not a number derived
+    # from that invented cost.
     min_write_interval_s: float = 0.15
 
-    # [POLICY] Bearing change, in degrees, that is worth a hardware write.
-    # Below this the sector would land on the same LED anyway. Set from the
-    # ring geometry at runtime if led_count is known.
-    bearing_quantum_deg: float = 10.0
+    # ⚠️ `bearing_quantum_deg` WAS REMOVED HERE (audit finding M2).
+    #
+    # It claimed to suppress hardware writes for bearing changes below 10
+    # degrees, and its own comment said it should be "set from the ring
+    # geometry at runtime". Neither happened: the only reference in the
+    # project was its own declaration.
+    #
+    # It is also SUPERSEDED, which is why it is removed rather than wired
+    # up. The controller already suppresses redundant writes by comparing
+    # the computed LED sector itself (`sector_indices` in
+    # LedController._should_write), so the threshold in use is the real
+    # angular pitch of the ring — 360/led_count — instead of a fixed 10
+    # degrees that would be wrong for any ring that is not 36 LEDs.
 
     # [POLICY] If no frame is submitted for this long the ring falls back
     # to the searching colour. This is the safety net for requirement 14:
@@ -821,8 +1038,13 @@ class StationConfig:
     def describe_calibration(self) -> list[str]:
         """Human-readable list of what is and is not calibrated."""
         out: list[str] = []
+        out.extend(self.geometry.focal_status_lines())
         for cam_id, focal in sorted(self.geometry.camera_focal_px.items()):
-            name = "FAR/IMX477" if cam_id == 0 else "NEAR/IMX708"
+            # ⚠️ Was `"FAR/IMX477" if cam_id == 0 else "NEAR/IMX708"`
+            # (audit finding C3). BOTH cameras on this station are IMX477P;
+            # no IMX708 is installed. The label is now the resolved ROLE,
+            # so it cannot contradict the hardware or the identity binding.
+            name = f"{self.geometry.role_name(cam_id)}/IMX477P"
             if focal:
                 rng = self.derive_visual_range_m(cam_id)
                 rng_s = f"{rng:.0f} m" if rng else "n/a"
@@ -962,10 +1184,20 @@ def load(path: Path | str = CONFIG_PATH) -> StationConfig:
             if key not in valid:
                 print(f"[config] unknown key '{section_name}.{key}' ignored")
                 continue
-            # JSON object keys are strings; camera-id maps must be ints.
-            if key in ("camera_boresight_deg", "camera_focal_px") \
-                    and isinstance(value, dict):
-                value = {int(k): v for k, v in value.items()}
+            # ⚠️ The index-keyed optics maps are RUNTIME BINDINGS, not
+            # configuration (audit finding C1). Accepting them from JSON is
+            # what let `camera_boresight_deg: {"0": 0.0, "1": 0.0}` sit in
+            # the file looking like a measurement while binding a boresight
+            # to an enumeration index that is not an identity. Configure
+            # the *_by_role maps instead; bind_roles() fills these in once
+            # the roles are resolved to devices.
+            if key in ("camera_boresight_deg", "camera_focal_px"):
+                by_role = f"{key}_by_role"
+                print(f"[config] '{section_name}.{key}' is IGNORED — it is "
+                      f"keyed by camera index, which is not a stable "
+                      f"identity on this station. Move these values to "
+                      f"'{section_name}.{by_role}', keyed by WIDE/TELE.")
+                continue
             setattr(section, key, value)
 
     return cfg

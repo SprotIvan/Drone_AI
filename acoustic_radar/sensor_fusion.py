@@ -214,6 +214,18 @@ class FusedTarget:
     #: |visual bearing − acoustic bearing| in degrees, or None when the
     #: mount geometry is uncalibrated and the comparison is impossible.
     sensor_agreement_deg: Optional[float] = None
+    #: PER OBSERVATION (finding N1, corrected by review defect D2): could
+    #: THIS check have gone the other way? True when it actually rejected,
+    #: or when a rejection was reachable for this bearing. False when the
+    #: pass was arithmetically guaranteed and therefore proves nothing.
+    #: None = optics uncalibrated or no bearing.
+    sensor_agreement_discriminating: Optional[bool] = None
+    #: CAMERA CAPABILITY: can this lens ever produce a disagreement beyond
+    #: the tolerance for a bearing that is itself in view? False on the
+    #: telephoto camera (9.4° field vs a 20° tolerance). A property of the
+    #: optics, not of this observation — see the two fields' docstrings in
+    #: camera_cue.BearingProjector.
+    sensor_agreement_capable: Optional[bool] = None
     #: True when the acoustic range says the target should be visible.
     in_camera_range: Optional[bool] = None
     camera_range_gate_m: Optional[float] = None
@@ -500,10 +512,30 @@ class SensorFusion:
                                      width_px=frame_w)
 
         agreement = None
+        agreement_discriminating = None
+        agreement_capable = None
         if visual_track is not None:
+            tol = self.config.fusion.cue_agreement_deg
             agreement = self.projector.agreement_deg(
                 active_camera, visual_track.center[0], bearing,
                 width_px=frame_w)
+            # ⚠️ Finding N1, corrected by review defect D2. TWO different
+            # questions, both computed for the camera that produced THIS
+            # frame:
+            #   capable        — can this LENS ever reject an in-view pair?
+            #                    (False on TELE: 9.4 deg field vs 20 deg)
+            #   discriminating — did THIS check have any power? True if it
+            #                    actually rejected, which happens on either
+            #                    camera once the bearing leaves the frame.
+            # Reporting only the first made a real rejection look like a
+            # guaranteed pass. The detection decision is unchanged.
+            agreement_capable = \
+                self.projector.agreement_span_covers_tolerance(
+                    active_camera, tol, width_px=frame_w)
+            agreement_discriminating = \
+                self.projector.agreement_discriminating(
+                    active_camera, bearing, agreement, tol,
+                    width_px=frame_w)
 
         cue_role = self._cue_role(acoustic, a_fresh, visual_track, cue,
                                   agreement)
@@ -540,6 +572,8 @@ class SensorFusion:
             bearing_cue=cue,
             cue_role=cue_role,
             sensor_agreement_deg=agreement,
+            sensor_agreement_discriminating=agreement_discriminating,
+            sensor_agreement_capable=agreement_capable,
             in_camera_range=in_range,
             camera_range_gate_m=gate_m,
             trail=tuple(self.history.trail(t)),

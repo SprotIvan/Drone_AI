@@ -130,9 +130,93 @@ class AcousticObservation:
     excess_db: float = 0.0
 
     # ── Bookkeeping ──
+    #
+    # ⚠️ FOUR DIFFERENT INSTANTS, AND THEY ARE NOT INTERCHANGEABLE
+    # (audit finding M1). This record used to carry only `timestamp`, set
+    # to `now()` at publish, and every consumer read it as "when the drone
+    # made this sound". It is not: it is when the STATION FINISHED DECIDING.
+    #
+    #   capture_start   = capture_end - analysis_window_s
+    #   capture_centre  = capture_end - analysis_window_s / 2
+    #   capture_end     the newest audio sample in the analysed window
+    #   timestamp       the decision was published (this is `timestamp`)
+    #
+    # The classifier runs on a 2.0 s sliding window advanced in 0.5 s hops,
+    # so the sound this record describes is centred about 1 s before
+    # `capture_end`, and the ALARM may additionally have needed several
+    # confirmations before it was raised. Stamping all of that with `now()`
+    # made a two-second-old acoustic picture look as fresh as a 20 ms
+    # camera frame when the two were fused.
+    #
+    # `timestamp` KEEPS ITS MEANING and keeps driving the freshness/lost
+    # timeouts: those exist to answer "is the acoustic subsystem still
+    # producing decisions?", which is genuinely about the decision time.
+    # What was missing was any way to ask the other question — "how old is
+    # the SOUND?" — which `sound_age_s()` now answers.
+    #
+    # All of these are `time.monotonic()` (see now()), so an NTP step on a
+    # Pi with no RTC cannot make an age negative or enormous.
     timestamp: float = field(default_factory=now)
+
+    #: Monotonic time of the newest audio sample in the analysed window.
+    #: None = the producer did not report it (a synthetic observation in a
+    #: test, or an older recording) — never assume it equals `timestamp`.
+    capture_end_ts: Optional[float] = None
+
+    #: Length of the analysis window in seconds (features.WINDOW_SEC = 2.0).
+    analysis_window_s: Optional[float] = None
+
     seq: int = 0
     overflow: bool = False             # audio buffer overrun on this block
+
+    @property
+    def capture_centre_ts(self) -> Optional[float]:
+        """
+        Monotonic time of the MIDDLE of the analysed audio window.
+
+        The single best instant to attribute the sound to: the window is
+        weighted roughly uniformly, so its centre is where the evidence
+        sits. None when the producer did not report capture timing.
+        """
+        if self.capture_end_ts is None or self.analysis_window_s is None:
+            return None
+        return self.capture_end_ts - float(self.analysis_window_s) / 2.0
+
+    @property
+    def capture_start_ts(self) -> Optional[float]:
+        """Monotonic time of the OLDEST audio sample in the window."""
+        if self.capture_end_ts is None or self.analysis_window_s is None:
+            return None
+        return self.capture_end_ts - float(self.analysis_window_s)
+
+    def sound_age_s(self, at: Optional[float] = None) -> Optional[float]:
+        """
+        How old the SOUND is, measured from the window centre.
+
+        ⚠️ Distinct from `now() - timestamp`, which is how old the DECISION
+        is. On this station the two differ by about one second plus any
+        confirmation delay, and that difference is the real acoustic-vs-
+        visual skew when the two sensors are fused. None when capture
+        timing is unavailable — never a substituted zero.
+        """
+        centre = self.capture_centre_ts
+        if centre is None:
+            return None
+        return (now() if at is None else at) - centre
+
+    def decision_lag_s(self) -> Optional[float]:
+        """
+        Seconds between the middle of the analysed audio and publishing.
+
+        This is the FIXED, structural part of acoustic latency — the
+        analysis window plus processing — as opposed to how long ago the
+        observation was published. Exposed so the HUD and the latency
+        report can state it instead of leaving it to be discovered.
+        """
+        centre = self.capture_centre_ts
+        if centre is None:
+            return None
+        return self.timestamp - centre
 
     @property
     def detected(self) -> bool:
