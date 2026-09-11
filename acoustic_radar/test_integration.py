@@ -1603,6 +1603,98 @@ def test_25_forensic_review_fixes():
     check("D6: and the CLI exposes --scene-changed",
           "scene_changed" in _insp.getsource(_diag.main))
 
+    # ═══════════════════════════════════════════════════════════
+    #  D7 — a missing AUDIO dependency must not kill the CAMERA
+    # ═══════════════════════════════════════════════════════════
+    #
+    # Found on the operator's Pi: with sounddevice absent, the acoustic
+    # subsystem reported OFFLINE correctly, and then the fusion loop
+    # crashed the entire station on its next update — after the camera had
+    # already opened both sensors and loaded the HEF. `acquisition_updates`
+    # called `effective_block_seconds`, which did an unguarded
+    # `from radar import BLOCK_SEC`; radar imports audio_io imports
+    # sounddevice.
+    import fusion_config as _fc
+    import sys as _sys
+
+    cfgD7 = load_config()
+    check("D7: the configured hop is used without importing radar at all",
+          cfgD7.acoustic.block_seconds and
+          cfgD7.acoustic.effective_block_seconds()
+          == cfgD7.acoustic.block_seconds,
+          f"hop {cfgD7.acoustic.effective_block_seconds()} s")
+
+    # Simulate the Pi: radar unimportable, and no configured hop either —
+    # the path that previously raised ModuleNotFoundError.
+    _saved_radar = _sys.modules.pop("radar", None)
+
+    class _BlockRadar:
+        def find_module(self, name, path=None):
+            return None
+
+    import builtins as _builtins
+    _real_import = _builtins.__import__
+
+    def _no_radar(name, *a, **k):
+        if name == "radar":
+            raise ModuleNotFoundError("No module named 'sounddevice'")
+        return _real_import(name, *a, **k)
+
+    _builtins.__import__ = _no_radar
+    try:
+        bare = replace(cfgD7.acoustic, block_seconds=None)
+        hop = bare.effective_block_seconds()
+        check("D7: with radar unimportable, the hop still resolves",
+              hop == _fc.RADAR_BLOCK_SEC_FALLBACK, f"{hop} s")
+        check("D7: and acquisition_updates does not raise",
+              bare.acquisition_updates() >= 1,
+              str(bare.acquisition_updates()))
+    except ModuleNotFoundError as exc:
+        check("D7: with radar unimportable, the hop still resolves", False,
+              f"still raises: {exc}")
+    finally:
+        _builtins.__import__ = _real_import
+        if _saved_radar is not None:
+            _sys.modules["radar"] = _saved_radar
+
+    # ⚠️ The fallback is a SECOND COPY of radar.BLOCK_SEC, which is exactly
+    # the drift M3 was about. Pin them together wherever radar can load.
+    try:
+        from radar import BLOCK_SEC as _REAL_BLOCK_SEC
+    except Exception:
+        _REAL_BLOCK_SEC = None
+    if _REAL_BLOCK_SEC is not None:
+        check("D7: the fallback still equals radar.BLOCK_SEC (no drift)",
+              _fc.RADAR_BLOCK_SEC_FALLBACK == _REAL_BLOCK_SEC,
+              f"{_fc.RADAR_BLOCK_SEC_FALLBACK} vs {_REAL_BLOCK_SEC}")
+
+    # ═══════════════════════════════════════════════════════════
+    #  D8 — the start-up banner must not miscount local changes
+    # ═══════════════════════════════════════════════════════════
+    #
+    # It counted every `git status --porcelain` line, INCLUDING untracked
+    # ("?? ...") entries, then claimed a pull would refuse to merge. On the
+    # operator's Pi that read "64 file(s) modified locally" with a clean
+    # tracked tree. Untracked files do not block a merge.
+    import main as _main
+    rev_src = _insp.getsource(_main._git_revision) \
+        if hasattr(_main, "_git_revision") else ""
+    if not rev_src:
+        for _name in dir(_main):
+            _obj = getattr(_main, _name)
+            if callable(_obj) and "REFUSE to merge" in str(
+                    getattr(_obj, "__doc__", "") or ""):
+                rev_src = _insp.getsource(_obj)
+                break
+    if not rev_src:
+        rev_src = _insp.getsource(_main)
+    check("D8: untracked files are excluded from the 'modified' count",
+          'startswith("??")' in rev_src,
+          "the banner must count only tracked modifications")
+    check("D8: and the pull warning is only claimed for tracked changes",
+          "tracked file(s) modified" in rev_src
+          and "the tracked tree is clean" in rev_src)
+
 
 def test_22_srp_gating():
     """Audit finding H5 — SRP-PHAT must refuse beamformed stereo."""

@@ -121,9 +121,25 @@ def code_version() -> str:
                 capture_output=True, text=True, timeout=3.0)
             suffix = ""
             if dirty.returncode == 0 and dirty.stdout.strip():
-                n = len(dirty.stdout.strip().splitlines())
-                suffix = (f"  [{n} file(s) modified locally — a `git pull` "
-                          f"will REFUSE to merge until they are resolved]")
+                # ⚠️ COUNT ONLY TRACKED CHANGES. This used to count every
+                # porcelain line, which includes UNTRACKED files ("?? ..."),
+                # and then assert that `git pull` would refuse to merge. That
+                # is simply false for untracked files — they do not block a
+                # merge — so the banner reported things like "64 file(s)
+                # modified locally" on a checkout whose tracked tree was
+                # clean, and sent the operator hunting for a problem that
+                # did not exist. Only tracked modifications can block a pull.
+                lines = dirty.stdout.strip().splitlines()
+                tracked = [ln for ln in lines if not ln.startswith("??")]
+                untracked = len(lines) - len(tracked)
+                if tracked:
+                    suffix = (f"  [{len(tracked)} tracked file(s) modified "
+                              f"locally — a `git pull` will REFUSE to merge "
+                              f"until they are resolved]")
+                elif untracked:
+                    suffix = (f"  [{untracked} untracked file(s) present; "
+                              f"the tracked tree is clean and `git pull` "
+                              f"is unaffected]")
             return out.stdout.strip() + suffix
     except (OSError, subprocess.SubprocessError) as exc:
         log.debug("could not read the git revision: %s", exc)

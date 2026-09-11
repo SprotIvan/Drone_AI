@@ -42,6 +42,17 @@ from typing import Any, Dict, Optional
 
 CONFIG_PATH = Path(__file__).with_name("fusion_config.json")
 
+#: Mirror of `radar.BLOCK_SEC`, used ONLY when radar.py cannot be imported
+#: because the audio stack (sounddevice) is absent. radar.py remains the
+#: authority; this exists so that a missing optional audio dependency
+#: degrades the acoustic subsystem alone instead of crashing the fusion
+#: loop and taking the camera down with it.
+#:
+#: ⚠️ A second copy of a constant is exactly the drift M3 was about, so it
+#: is not left to good intentions: test_integration.py asserts this equals
+#: radar.BLOCK_SEC wherever radar CAN be imported.
+RADAR_BLOCK_SEC_FALLBACK = 0.5
+
 
 # ═══════════════════════════════════════════════════════════════
 #  Acoustic subsystem
@@ -181,9 +192,39 @@ class AcousticConfig:
     block_seconds: Optional[float] = 0.25
 
     def effective_block_seconds(self) -> float:
-        """The hop actually in use. One converter, used by everything."""
-        from radar import BLOCK_SEC
-        return float(self.block_seconds or BLOCK_SEC)
+        """
+        The hop actually in use. One converter, used by everything.
+
+        ⚠️ THIS MUST NOT REQUIRE THE AUDIO STACK. It used to do an
+        unguarded `from radar import BLOCK_SEC`, and radar.py imports
+        audio_io, which imports sounddevice. On a machine where the audio
+        dependency is missing, the acoustic subsystem correctly reported
+        itself OFFLINE — and then the FUSION LOOP crashed the whole
+        station on the very next update, taking the camera down with it:
+
+            E station.acoustic acoustic subsystem could not start:
+                               No module named 'sounddevice'
+            E station.main     station crashed
+            ...  fusion_config.effective_block_seconds
+                 -> radar -> audio_io -> ModuleNotFoundError
+
+        That defeats the failure isolation this project is built around: a
+        missing optional dependency must degrade one subsystem, never kill
+        the others. The camera had already opened both sensors and loaded
+        the HEF successfully when this killed it.
+        """
+        # The configured hop wins, and it is set by default — so on the
+        # normal path radar.py is never imported here at all.
+        if self.block_seconds:
+            return float(self.block_seconds)
+        try:
+            from radar import BLOCK_SEC
+        except Exception:
+            # radar.py is unavailable (no audio stack). Its hop is mirrored
+            # below; test_integration asserts the two stay equal, so this
+            # cannot drift silently the way a second copy normally would.
+            return float(RADAR_BLOCK_SEC_FALLBACK)
+        return float(BLOCK_SEC)
 
     def acquisition_updates(self) -> int:
         """`stable_seconds_for_acquisition` expressed in acoustic updates."""
