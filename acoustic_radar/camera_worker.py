@@ -251,8 +251,20 @@ class CameraWorker:
             self._setup()
         except BaseException as exc:
             msg = str(exc) or exc.__class__.__name__
-            log.error("camera subsystem could not start: %s",
-                      msg.splitlines()[0])
+            # ⚠️ LOG EVERY LINE, not just the first.
+            #
+            # This used to log `msg.splitlines()[0]`. For an ordinary
+            # exception that is fine, but CameraIdentityError's whole value
+            # is in the lines AFTER the first: the list of cameras that
+            # were found, their Ids, and the exact JSON block to paste.
+            # Truncating it left an operator looking at "camera subsystem
+            # could not start: camera role(s) WIDE, TELE are not
+            # configured" with the remedy silently discarded — which is
+            # how a deliberately helpful failure turns into a dead end.
+            lines = msg.splitlines() or [msg]
+            log.error("camera subsystem could not start: %s", lines[0])
+            for line in lines[1:]:
+                log.error("  %s", line)
             self._set_health(SubsystemState.OFFLINE, "init failed", msg)
             return
 

@@ -4185,3 +4185,225 @@
 2026-08-13 18:24:24,798 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
 2026-08-13 18:24:24,798 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
 2026-08-13 18:24:24,798 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:21,479 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:21,480 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:21,480 INFO    station.fusion     STATE ACOUSTIC_TRACKING -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:21,481 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:21,482 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:21,482 INFO    station.fusion     STATE ACOUSTIC_TRACKING -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:21,484 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:21,485 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:21,485 INFO    station.fusion     STATE VISUAL_ACQUISITION -> ACOUSTIC_TRACKING  (camera offline, reverting to acoustic)  priority=ACOUSTIC
+2026-09-11 13:31:21,488 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:21,489 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:21,490 INFO    station.fusion     STATE ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (target inside camera range for 8 acoustic updates)  priority=ACOUSTIC
+2026-09-11 13:31:21,527 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:21,757 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:21,757 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:21,809 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:21,838 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:21,839 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:21,874 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:22,148 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:22,149 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:22,214 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:22,234 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:22,235 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:22,270 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:22,554 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:22,555 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:22,620 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:22,667 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:22,668 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:22,715 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:22,955 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:22,956 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:23,007 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:23,028 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:23,028 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:23,072 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:23,320 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:23,321 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:23,377 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:23,407 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:23,407 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:23,446 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:23,679 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:23,680 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:23,744 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:23,769 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:23,769 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:23,805 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:24,053 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:24,054 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:24,108 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:24,144 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:24,145 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:24,183 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:24,436 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:24,438 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:24,493 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:24,513 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:24,513 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:24,564 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:24,819 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:24,820 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:24,870 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:24,898 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:24,899 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:24,934 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:25,163 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:25,163 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:25,216 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:25,236 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:25,237 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:25,273 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:25,500 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:25,501 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:25,569 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:25,607 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:25,608 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:25,647 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:25,884 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:25,885 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:25,957 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:25,981 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:25,981 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:26,017 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:26,240 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:26,241 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:26,291 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:26,320 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:26,320 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:26,356 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:26,577 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:26,578 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:26,628 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:26,651 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:26,651 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:26,688 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:26,962 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:26,963 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:27,030 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:27,061 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:27,062 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:27,109 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:27,408 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:27,410 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:27,479 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:27,501 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:27,501 INFO    station.fusion     STATE VISUAL_LOST_ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (re-cueing camera from acoustic bearing)  priority=ACOUSTIC
+2026-09-11 13:31:27,543 INFO    station.fusion     STATE VISUAL_ACQUISITION -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:27,783 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:27,783 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:27,783 INFO    station.fusion     STATE ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (acoustic confirmed; range unknown, acquiring anyway)  priority=ACOUSTIC
+2026-09-11 13:31:27,788 WARNING station.led        LED status: UNAVAILABLE — xvf_host.py not found — set XVF_HOST_PATH. This is the only control path to the array that this project has verified
+2026-09-11 13:31:27,897 INFO    station.led        LED command resolution: auto_mode=LED_AUTO_MODE (exact match LED_AUTO_MODE); ring_colour=LED_RING_COLOUR (exact match LED_RING_COLOUR); led_colour=LED_INDIVIDUAL (exact match LED_INDIVIDUAL)
+2026-09-11 13:31:27,897 INFO    station.led        LED-related commands reported by the array: LED_AUTO_MODE, LED_INDIVIDUAL, LED_RING_COLOUR
+2026-09-11 13:31:28,003 WARNING station.led        LED: LED_AUTO_MODE failed: device not responding (failure 1)
+2026-09-11 13:31:28,003 INFO    station.led        LED status: ACTIVE — 12 LEDs via xvf_host.py
+2026-09-11 13:31:28,055 WARNING station.led        LED: LED_INDIVIDUAL failed: device not responding (failure 2)
+2026-09-11 13:31:28,055 WARNING station.led        LED status: UNAVAILABLE — 2 consecutive failures: LED_INDIVIDUAL failed: device not responding
+2026-09-11 13:31:28,406 INFO    station.led        LED command resolution: auto_mode=LED_AUTO_MODE (exact match LED_AUTO_MODE); ring_colour=LED_RING_COLOR (exact match LED_RING_COLOR); led_colour=LED_INDIVIDUAL (exact match LED_INDIVIDUAL)
+2026-09-11 13:31:28,407 INFO    station.led        LED-related commands reported by the array: LED_AUTO_MODE, LED_INDIVIDUAL, LED_RING_COLOR
+2026-09-11 13:31:28,707 INFO    station.led        array LED automatic mode disabled (LED_AUTO_MODE 0)
+2026-09-11 13:31:28,708 INFO    station.led        LED status: ACTIVE — 12 LEDs via xvf_host.py
+2026-09-11 13:31:29,376 INFO    station.led        LED worker stopped after 6 hardware writes
+2026-09-11 13:31:29,631 INFO    station.led        LED command resolution: auto_mode=LED_EFFECT (exact match LED_EFFECT); ring_colour=LED_RING_COLOR (exact match LED_RING_COLOR); led_colour: no matching command reported by the device
+2026-09-11 13:31:29,632 INFO    station.led        LED-related commands reported by the array: LED_BRIGHTNESS, LED_COLOR, LED_DOA_COLOR, LED_EFFECT, LED_GAMMIFY, LED_RING_COLOR, LED_SPEED
+2026-09-11 13:31:29,762 INFO    station.led        LED ring command LED_RING_COLOR takes 12 value(s) — one per LED, the whole ring paints in a single call
+2026-09-11 13:31:29,907 INFO    station.led        array LED automatic mode disabled (LED_EFFECT 0)
+2026-09-11 13:31:29,907 INFO    station.led        LED status: ACTIVE — 12 LEDs via xvf_host.py
+2026-09-11 13:31:30,261 INFO    station.led        LED worker stopped after 4 hardware writes
+2026-09-11 13:31:30,462 WARNING station.led        no LED frame for 0.2s — falling back to SEARCHING (the station may have stalled)
+2026-09-11 13:31:30,771 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:30,772 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:30,772 INFO    station.fusion     STATE ACOUSTIC_TRACKING -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:30,773 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:30,773 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:30,774 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:30,774 INFO    station.fusion     STATE ACOUSTIC_TRACKING -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:30,774 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:30,774 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:30,775 INFO    station.fusion     STATE ACOUSTIC_TRACKING -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:30,775 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:30,775 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:30,775 INFO    station.fusion     STATE ACOUSTIC_TRACKING -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:30,776 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:30,776 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:30,776 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:30,777 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:30,777 INFO    station.fusion     STATE ACOUSTIC_TRACKING -> TARGET_LOST  (both sensors lost the target (30.5s without contact))  priority=NONE
+2026-09-11 13:31:30,833 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:30,833 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:30,872 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:30,872 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:30,906 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:30,906 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:30,935 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:30,936 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:30,966 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:30,967 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:30,998 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:30,998 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:31,033 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:31,034 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:31,063 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:31,063 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:31,092 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:31,092 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:31,120 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:31,120 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:31,149 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:31,149 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:31,155 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:31,155 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:31,158 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:31,159 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:31,162 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:31,163 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:31,163 INFO    station.fusion     STATE ACOUSTIC_TRACKING -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:31,163 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:31,877 INFO    station.web        [WEB] FastAPI server started
+2026-09-11 13:31:31,878 INFO    station.web        [WEB] Listening on 0.0.0.0:5099
+2026-09-11 13:31:31,889 INFO    station.web        [WEB] Local URL: http://192.168.50.2:5099  <-- expected Ethernet
+2026-09-11 13:31:31,890 INFO    station.web        [WEB] MJPEG:     http://192.168.50.2:5099/video_feed
+2026-09-11 13:31:31,890 INFO    station.web        [WEB] Local URL: http://192.168.1.57:5099
+2026-09-11 13:31:31,890 INFO    station.web        [WEB] MJPEG:     http://192.168.1.57:5099/video_feed
+2026-09-11 13:31:31,890 INFO    station.web        [WEB] Local URL: http://169.254.79.198:5099
+2026-09-11 13:31:31,890 INFO    station.web        [WEB] MJPEG:     http://169.254.79.198:5099/video_feed
+2026-09-11 13:31:32,515 INFO    station.web        [WEB] MJPEG client connected (1 now streaming)
+2026-09-11 13:31:38,052 INFO    station.web        [WEB] MJPEG client disconnected
+2026-09-11 13:31:38,062 INFO    station.web        [WEB] MJPEG client connected (1 now streaming)
+2026-09-11 13:31:38,076 INFO    station.web        [WEB] MJPEG client connected (2 now streaming)
+2026-09-11 13:31:38,076 INFO    station.web        [WEB] MJPEG client connected (3 now streaming)
+2026-09-11 13:31:46,446 INFO    station.web        [WEB] MJPEG client disconnected
+2026-09-11 13:31:46,532 INFO    station.camera     camera switch -> TELE/IMX477P: cleared 2 track(s) and the ego-motion reference (optical flow must never cross two different lenses)
+2026-09-11 13:31:46,532 INFO    station.camera     camera switch -> WIDE/IMX477P: cleared 2 track(s) and the ego-motion reference (optical flow must never cross two different lenses)
+2026-09-11 13:31:46,532 INFO    station.camera     camera switch -> TELE/IMX477P: cleared 2 track(s) and the ego-motion reference (optical flow must never cross two different lenses)
+2026-09-11 13:31:46,532 INFO    station.camera     camera switch -> WIDE/IMX477P: cleared 1 track(s) and the ego-motion reference (optical flow must never cross two different lenses)
+2026-09-11 13:31:46,532 INFO    station.camera     camera switch -> TELE/IMX477P: cleared 1 track(s) and the ego-motion reference (optical flow must never cross two different lenses)
+2026-09-11 13:31:50,985 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:50,986 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:50,988 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:50,988 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:50,989 INFO    station.fusion     STATE ACOUSTIC_TRACKING -> VISUAL_ACQUISITION  (acoustic confirmed; range unknown, acquiring anyway)  priority=ACOUSTIC
+2026-09-11 13:31:50,990 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:50,990 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:51,005 INFO    station.fusion     STATE ACOUSTIC_TRACKING -> TARGET_LOST  (both sensors lost the target (9.0s without contact))  priority=NONE
+2026-09-11 13:31:51,006 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:51,006 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:51,606 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:51,610 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> TARGET_LOST  (both sensors lost the target (30.0s without contact))  priority=NONE
+2026-09-11 13:31:55,398 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:55,399 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:55,399 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:55,400 INFO    station.fusion     STATE ACOUSTIC_TRACKING -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:55,401 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:55,401 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:55,401 INFO    station.fusion     STATE ACOUSTIC_TRACKING -> VISUAL_TRACKING  (YOLO confirmed the target)  priority=CAMERA
+2026-09-11 13:31:55,402 INFO    station.fusion     STATE VISUAL_TRACKING -> VISUAL_LOST_ACOUSTIC_TRACKING  (visual track lost, acoustic still holds the target)  priority=ACOUSTIC
+2026-09-11 13:31:55,403 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:55,403 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC
+2026-09-11 13:31:55,403 INFO    station.fusion     STATE SEARCHING -> ACOUSTIC_DETECTED  (acoustic contact)  priority=ACOUSTIC
+2026-09-11 13:31:55,404 INFO    station.fusion     STATE ACOUSTIC_DETECTED -> ACOUSTIC_TRACKING  (acoustic alarm confirmed)  priority=ACOUSTIC

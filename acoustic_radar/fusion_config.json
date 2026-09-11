@@ -6,8 +6,8 @@
   },
   "geometry": {
     "camera_role_id_hint": {
-      "WIDE": null,
-      "TELE": null
+      "WIDE": "i2c@80000",
+      "TELE": "i2c@88000"
     },
     "camera_boresight_deg_by_role": {
       "WIDE": null,
