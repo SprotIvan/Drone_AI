@@ -7,24 +7,32 @@ from scipy.optimize import linear_sum_assignment
 from typing import Deque, List, Tuple, Optional
 from camera_manager import CameraManager
 
-# Boundary requested: closer than 1.5 m -> NEAR, farther -> FAR.
+# Camera selection boundary, as a FRACTION OF THE FRAME WIDTH.
 #
-# The two numbers are deliberately NOT both 1.5. A single shared boundary
-# makes the system oscillate: at exactly 1.5 m the measured distance
-# jitters by a few centimetres frame to frame, so it would switch camera,
-# immediately qualify to switch back, and keep doing that (limited only
-# by the 0.5 s debounce). The 0.5 m gap means: switch to NEAR once the
-# drone is genuinely inside 1.5 m, and only return to FAR once it has
-# clearly left, past 2.0 m. Between the two it simply keeps whichever
-# camera it already has.
-SWITCH_TO_NEAR_BELOW_M = 1.5
-SWITCH_TO_FAR_ABOVE_M  = 2.0
-
-# FALLBACK, used only when the active camera has no focal calibration
-# (CAMERA_FOCAL_PX entry is None). These are the original pixel-height
-# thresholds, kept so an uncalibrated system still switches at all.
-THRESHOLD_NEAR_HEIGHT = 120
-THRESHOLD_FAR_HEIGHT = 80
+# ⚠️ THESE REPLACED `SWITCH_TO_NEAR_BELOW_M = 1.5` / `SWITCH_TO_FAR_ABOVE_M
+# = 2.0` AND THE PIXEL-HEIGHT FALLBACK (finding N3). The metric form was
+# arithmetically unreachable once C2 corrected the TELE focal length: a
+# 1.5 m threshold required a 652 px box in a 640 px frame, so the WIDE
+# camera could never be selected. The fallback never ran either, because it
+# was guarded on "no focal calibration" and a focal length is always set.
+#
+# The question the switch really asks — "has the target outgrown this
+# lens?" — is angular, and box_px/frame_px IS that angle as a fraction of
+# the field of view. It needs no focal calibration, so it works with the
+# current THEORETICAL optics and will not need re-deriving after HW-2.
+#
+# The two numbers are deliberately far apart. A single shared boundary
+# makes the system oscillate: at the crossover the measured box jitters
+# frame to frame, so it would switch camera, immediately qualify to switch
+# back, and keep doing that (limited only by the 0.5 s debounce). The gap
+# means: go WIDE once the drone genuinely fills the long lens, and only
+# return to TELE once it has clearly shrunk again.
+#
+# Kept numerically identical to CameraSwitchConfig so the standalone loop
+# in this file and the station's CameraSwitchPolicy cannot diverge;
+# test_integration.py asserts they match.
+SWITCH_TO_WIDE_ABOVE_FRAC = 0.60
+SWITCH_TO_TELE_BELOW_FRAC = 0.25
 # INTEGRATION CHANGE (unified system): the Hailo runtime is imported
 # lazily instead of at module import time.
 #
@@ -1721,46 +1729,36 @@ def main():
 
             if switch_frozen:
                 # Switching held by the 'f' key. Needed for calibration:
-                # CALIBRATION_DISTANCE_M and SWITCH_TO_NEAR_BELOW_M are
-                # both 1.5 m, so without this the camera would switch out
-                # from under you at exactly the moment you press 'c'.
+                # without it the camera can swap out from under you at
+                # exactly the moment you press 'c'.
                 pass
 
-            elif target_distance_m is not None:
-                # PRIMARY PATH — distance-based switching.
+            elif max_width_px > 0 and frame_bgr.shape[1] > 0:
+                # ⚠️ BOX FRACTION, not metres (finding N3). This loop used
+                # the same 1.5 m / 2.0 m thresholds as the station, and
+                # they became unreachable on TELE once the focal length was
+                # corrected: 1.5 m needs a 652 px box in a 640 px frame.
+                # Kept identical to CameraSwitchPolicy so the standalone
+                # tool and the station cannot diverge.
+                frac = float(max_width_px) / float(frame_bgr.shape[1])
                 if (
                     current_camera == camera_manager.tele_id
-                    and target_distance_m < SWITCH_TO_NEAR_BELOW_M
+                    and frac > SWITCH_TO_WIDE_ABOVE_FRAC
                 ):
                     # AUDIT BUG #2: use the return value, so a switch
                     # suppressed by the debounce is distinguishable from
                     # one that actually happened.
-                    if camera_manager.switch_to_near():
-                        print(f"[CameraSwitch] FAR -> NEAR "
-                              f"({target_distance_m:.1f} m)")
+                    if camera_manager.switch_to_wide():
+                        print(f"[CameraSwitch] TELE -> WIDE "
+                              f"(box {frac:.0%} of frame)")
 
                 elif (
                     current_camera == camera_manager.wide_id
-                    and target_distance_m > SWITCH_TO_FAR_ABOVE_M
+                    and frac < SWITCH_TO_TELE_BELOW_FRAC
                 ):
-                    if camera_manager.switch_to_far():
-                        print(f"[CameraSwitch] NEAR -> FAR "
-                              f"({target_distance_m:.1f} m)")
-
-            elif max_height > 0:
-                if (
-                    current_camera == camera_manager.tele_id
-                    and max_height > THRESHOLD_NEAR_HEIGHT
-                ):
-                    if camera_manager.switch_to_near():
-                        print("[CameraSwitch] FAR -> NEAR (px fallback)")
-
-                elif (
-                    current_camera == camera_manager.wide_id
-                    and max_height < THRESHOLD_FAR_HEIGHT
-                ):
-                    if camera_manager.switch_to_far():
-                        print("[CameraSwitch] NEAR -> FAR (px fallback)")
+                    if camera_manager.switch_to_tele():
+                        print(f"[CameraSwitch] WIDE -> TELE "
+                              f"(box {frac:.0%} of frame)")
 
             if run_detector and yolo_time > 0:
                 yolo_fps = 1.0 / yolo_time

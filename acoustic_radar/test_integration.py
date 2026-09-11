@@ -409,7 +409,14 @@ def test_7_switch_oscillation():
     real = camera_manager.CameraManager
     camera_manager.CameraManager = StubManager
     try:
-        # Mid-band hover with jitter crossing BOTH thresholds.
+        # ⚠️ DRIVEN BY BOX FRACTION, not metres (finding N3). The band is
+        # 0.25 -> 0.60 of the frame width; mid-band is ~0.42, and the
+        # jitter below is wide enough to cross BOTH edges on single frames.
+        W = 640
+        def drive(policy, mgr, frac):
+            policy.evaluate(mgr, mgr.get_active_camera(),
+                            box_width_px=float(frac) * W, frame_width_px=W)
+
         results = {}
         for frames in (1, cfg.switching.confirm_frames):
             cfg.switching.confirm_frames = frames
@@ -417,8 +424,7 @@ def test_7_switch_oscillation():
             mgr = StubManager()
             rng = np.random.default_rng(1)
             for _ in range(300):
-                d = 1.75 + float(rng.normal(0.0, 0.35))
-                policy.evaluate(mgr, mgr.get_active_camera(), d, 100.0)
+                drive(policy, mgr, 0.42 + float(rng.normal(0.0, 0.18)))
             results[frames] = mgr.switches
 
         single = results[1]
@@ -429,18 +435,47 @@ def test_7_switch_oscillation():
               confirmed == 0, f"{confirmed} switches / 300 frames")
 
         # A genuine approach must still switch, exactly once each way.
+        # The drone grows from 10% of the frame to 80% and back.
         policy = CameraSwitchPolicy(cfg, events)
         mgr = StubManager()
-        for d in np.linspace(3.0, 0.8, 60):
-            policy.evaluate(mgr, mgr.get_active_camera(), float(d), 100.0)
+        for f in np.linspace(0.10, 0.80, 60):
+            drive(policy, mgr, f)
         inbound = mgr.switches
-        for d in np.linspace(0.8, 3.0, 60):
-            policy.evaluate(mgr, mgr.get_active_camera(), float(d), 100.0)
-        check("a genuine approach still switches FAR->NEAR once",
+        for f in np.linspace(0.80, 0.10, 60):
+            drive(policy, mgr, f)
+        check("a genuine approach still switches TELE->WIDE once",
               inbound == 1, f"{inbound} switch(es)")
-        check("and NEAR->FAR once on departure",
-              mgr.switches == 2 and mgr.active == 0,
+        check("and WIDE->TELE once on departure",
+              mgr.switches == 2 and mgr.active == TEST_ROLES["TELE"],
               f"{mgr.switches} total, now on camera {mgr.active}")
+
+        # ⚠️ N3 REGRESSION: the threshold must be REACHABLE on TELE.
+        #
+        # With the corrected focal (3910 px) the old metric threshold of
+        # 1.5 m required a 652 px box in a 640 px frame, so the WIDE camera
+        # could never be selected at all — the drone was seen and the
+        # station simply never switched. A fraction of the frame is
+        # reachable by construction, but assert it rather than trust it.
+        check("N3: the TELE->WIDE threshold is inside the frame",
+              cfg.switching.switch_to_wide_above_frac < 1.0,
+              f"{cfg.switching.switch_to_wide_above_frac:.0%} of frame width")
+        policy = CameraSwitchPolicy(cfg, events)
+        mgr = StubManager()
+        for _ in range(cfg.switching.confirm_frames + 1):
+            drive(policy, mgr, cfg.switching.switch_to_wide_above_frac + 0.05)
+        check("N3: a box just over the threshold DOES select WIDE",
+              mgr.active == TEST_ROLES["WIDE"],
+              f"now on camera {mgr.active}")
+
+        # And the two copies of the constants must not drift.
+        import TWO_CAMERAS_FIXED as _tc2
+        check("N3: the standalone loop uses the same thresholds",
+              _tc2.SWITCH_TO_WIDE_ABOVE_FRAC
+              == cfg.switching.switch_to_wide_above_frac
+              and _tc2.SWITCH_TO_TELE_BELOW_FRAC
+              == cfg.switching.switch_to_tele_below_frac,
+              f"{_tc2.SWITCH_TO_WIDE_ABOVE_FRAC} / "
+              f"{_tc2.SWITCH_TO_TELE_BELOW_FRAC}")
     finally:
         camera_manager.CameraManager = real
 

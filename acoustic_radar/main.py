@@ -181,10 +181,16 @@ def print_banner(config: fusion_config.StationConfig, hef_path: str) -> None:
                     "uncalibrated) — visual acquisition will run on acoustic "
                     "confirmation alone")
 
-    log.info("  camera switch: NEAR below %.2f m, FAR above %.2f m, "
-             "%d-frame confirmation",
-             config.switching.switch_to_near_below_m,
-             config.switching.switch_to_far_above_m,
+    # ⚠️ Reported as a fraction of the frame, because that is what the
+    # policy now compares (finding N3). The pixel equivalents are shown
+    # too, since that is what an operator sees on the HUD.
+    _w = config.visual.frame_width
+    log.info("  camera switch: -> WIDE above %.0f%% of frame width (%.0f px), "
+             "-> TELE below %.0f%% (%.0f px), %d-frame confirmation",
+             config.switching.switch_to_wide_above_frac * 100.0,
+             config.switching.switch_to_wide_above_frac * _w,
+             config.switching.switch_to_tele_below_frac * 100.0,
+             config.switching.switch_to_tele_below_frac * _w,
              config.switching.confirm_frames)
 
     led = config.led

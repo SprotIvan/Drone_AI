@@ -348,38 +348,74 @@ class CameraSwitchConfig:
     describe these optics. Roles and focal lengths now live in
     GeometryConfig, keyed by role; see camera_focal_px_by_role.
 
-    ⚠️ THE THRESHOLDS BELOW ARE NOT INDEPENDENT OF THAT. They are compared
-    against a distance computed from the focal length, so a focal length
-    that changes by 3x moves the range at which the swap physically
-    happens by 3x, even though the numbers here do not change. They were
-    chosen under the OLD, wrong focal lengths and have NOT been re-derived
-    against a measured one — see HARDWARE_TEST_REQUIRED.md test HW-2, and
-    re-check them once a real calibration exists.
+    ⚠️ THE SWITCH NO LONGER GOES THROUGH THE FOCAL LENGTH AT ALL. It used
+    to compare a distance in metres, which made a geometric decision
+    depend on a calibration this station does not yet have — and after the
+    focal length was corrected the threshold became unreachable. It is now
+    a fraction of the frame width; see the fields below.
     """
 
-    # [MEASURED/POLICY] Original values from TWO_CAMERAS_FIXED, preserved.
-    # The 0.5 m gap is the hysteresis band: switch in at 1.5 m, back out
-    # only past 2.0 m, hold whatever you have in between.
-    switch_to_near_below_m: float = 1.5
-    switch_to_far_above_m: float = 2.0
+    # ═══════════════════════════════════════════════════════════
+    #  ⚠️ THE SWITCH IS ON BOX SIZE, NOT ON DISTANCE (finding N3)
+    # ═══════════════════════════════════════════════════════════
+    #
+    # WHAT WAS HERE: `switch_to_near_below_m = 1.5` /
+    # `switch_to_far_above_m = 2.0`, compared against the metric distance
+    # from `estimate_distance_m()`, plus a pixel-height FALLBACK used only
+    # when the optics were uncalibrated.
+    #
+    # THE BUG THAT REPLACED IT, observed on the station: after C2 corrected
+    # the TELE focal length from 1274 px to ~3910 px, the switch became
+    # ARITHMETICALLY UNREACHABLE.
+    #
+    #     distance = 0.25 m * 3910 px / box_px
+    #     distance < 1.5 m   requires   box > 652 px
+    #     ...in a frame that is 640 px wide.
+    #
+    # The smallest distance TELE can report is 0.25*3910/640 = 1.53 m,
+    # which is ABOVE the 1.5 m threshold, so `want_wide` was never true and
+    # the WIDE camera could never be selected. The pixel fallback did not
+    # save it either: that branch runs only when distance is None, and with
+    # a focal length configured the distance is always a number. With the
+    # OLD, wrong focal the same threshold needed a 212 px box and looked
+    # perfectly healthy — the defect was created by making the optics
+    # correct.
+    #
+    # WHY A FRACTION OF THE FRAME IS THE RIGHT CRITERION. The question the
+    # switch actually asks is "has the target outgrown this lens?", and
+    # that is an ANGULAR question: box_px / frame_px is the target's
+    # angular size as a fraction of the field of view. Expressing it in
+    # metres routed it through the focal length for no reason, which
+    # coupled a geometric decision to a calibration this station does not
+    # yet have (HW-2). The fraction needs no calibration at all, so it
+    # works today with THEORETICAL optics and will not need re-deriving
+    # after HW-2 — and it made the pixel fallback redundant, so that pair
+    # of keys is gone rather than left as a dead branch.
+    #
+    # [POLICY] Switch to WIDE once the box exceeds this fraction of the
+    # frame WIDTH. 0.60 leaves clear margin before the box reaches the
+    # frame edge and gets clipped, which is where the size estimate stops
+    # being trustworthy.
+    switch_to_wide_above_frac: float = 0.60
 
-    # [POLICY] NEW — temporal confirmation on top of the distance
-    # hysteresis. The original code switched on a SINGLE frame's estimate,
-    # so one inflated bounding box could trigger a swap. The drone must now
-    # be on the same side of the threshold for this many consecutive frames.
-    # 5 frames at 30 fps = 0.17 s, which is short enough to be invisible to
-    # an operator and long enough to reject per-frame box jitter.
+    # [POLICY] Switch back to TELE once the box falls below this fraction.
+    # The 0.60/0.25 gap is the hysteresis band — much wider in relative
+    # terms than the old 1.5/2.0 m pair, because box size varies faster
+    # than distance near the crossover.
+    switch_to_tele_below_frac: float = 0.25
+
+    # [POLICY] Temporal confirmation on top of the hysteresis. The original
+    # code switched on a SINGLE frame's estimate, so one inflated bounding
+    # box could trigger a swap. The drone must now be on the same side of
+    # the threshold for this many consecutive frames. 5 frames at 30 fps =
+    # 0.17 s, short enough to be invisible and long enough to reject
+    # per-frame box jitter.
     confirm_frames: int = 5
 
     # [MEASURED] Hard debounce inside CameraManager, in seconds. A switch
     # physically restarts the pipeline on the other sensor, so it must not
     # happen more often than this regardless of what the policy wants.
     debounce_interval_s: float = 0.5
-
-    # [MEASURED] Fallback pixel-height thresholds, used only when the active
-    # camera has no focal calibration and therefore no distance in metres.
-    fallback_near_height_px: float = 120.0
-    fallback_far_height_px: float = 80.0
 
     # [POLICY] Deliberately False. Acoustic range CANNOT drive this switch:
     # its floor (ranging.RangeEstimator.MIN_DISTANCE_M = 2.0 m) is already

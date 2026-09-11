@@ -57,11 +57,17 @@ class CameraSwitchPolicy:
     """
     Decides which camera should be active.
 
-    Preserves the original logic exactly — distance-based with a 1.5 m /
-    2.0 m hysteresis band, falling back to pixel height when the active
-    camera has no focal calibration — and adds ONE improvement:
+    The decision is the target's box width as a FRACTION OF THE FRAME —
+    an angular measure of "has the target outgrown this lens?" — with a
+    0.60 / 0.25 hysteresis band, plus:
 
         the condition must hold for `confirm_frames` consecutive frames.
+
+    ⚠️ It was originally a distance in metres (1.5 m / 2.0 m) with a
+    pixel-height fallback for uncalibrated optics. That became unreachable
+    on TELE once the focal length was corrected — 1.5 m needed a 652 px box
+    in a 640 px frame — and the fallback never ran because a configured
+    focal length always yields a distance. See CameraSwitchConfig.
 
     Why: the original switched on a single frame's estimate. A bounding box
     that jitters by a few pixels changes the derived distance by tens of
@@ -85,6 +91,11 @@ class CameraSwitchPolicy:
         self._near_streak = 0
         self._far_streak = 0
         self.last_reason = ""
+        # Fallback frame width, used only when a caller does not pass the
+        # real one. The decision is a FRACTION of the frame, so it needs a
+        # width; the configured capture width is the honest default.
+        self.config_frame_width = int(getattr(config.visual,
+                                              "frame_width", 0) or 0)
 
     def freeze(self, frozen: bool) -> None:
         """Hold the current camera (used while calibrating)."""
@@ -92,11 +103,18 @@ class CameraSwitchPolicy:
         self._near_streak = self._far_streak = 0
 
     def evaluate(self, manager, current_camera: int,
-                 distance_m: Optional[float],
-                 max_box_height_px: float) -> Optional[str]:
+                 box_width_px: float,
+                 frame_width_px: Optional[int] = None,
+                 distance_m: Optional[float] = None) -> Optional[str]:
         """
         Returns a human-readable description of a switch that happened, or
         None. Never raises: a switching failure must not stop the frame loop.
+
+        ⚠️ THE DECISION IS ON BOX SIZE RELATIVE TO THE FRAME (finding N3),
+        not on distance in metres. `distance_m` is accepted only so the log
+        line can quote it; nothing branches on it. See
+        CameraSwitchConfig for why the metric form was unreachable once the
+        focal length was corrected.
         """
         if self.frozen:
             return None
@@ -110,24 +128,19 @@ class CameraSwitchPolicy:
         wide_id = manager.wide_id
         tele_id = manager.tele_id
 
-        want_wide = want_tele = False
-        basis = ""
-
-        if distance_m is not None:
-            # PRIMARY PATH — metric distance with hysteresis.
-            want_wide = distance_m < cfg.switch_to_near_below_m
-            want_tele = distance_m > cfg.switch_to_far_above_m
-            basis = f"{distance_m:.2f} m"
-        elif max_box_height_px > 0:
-            # FALLBACK — uncalibrated optics, pixel height only.
-            want_wide = max_box_height_px > cfg.fallback_near_height_px
-            want_tele = max_box_height_px < cfg.fallback_far_height_px
-            basis = f"{max_box_height_px:.0f} px"
-        else:
-            # No target at all: decay both streaks so a stale streak cannot
-            # trigger a switch later.
+        width = int(frame_width_px or self.config_frame_width or 0)
+        if width <= 0 or box_width_px <= 0:
+            # No target, or no frame to measure it against: decay both
+            # streaks so a stale one cannot trigger a switch later.
             self._near_streak = self._far_streak = 0
             return None
+
+        frac = float(box_width_px) / float(width)
+        want_wide = frac > cfg.switch_to_wide_above_frac
+        want_tele = frac < cfg.switch_to_tele_below_frac
+        basis = (f"box {box_width_px:.0f}/{width} px = {frac:.0%} of frame"
+                 + (f", ~{distance_m:.2f} m" if distance_m is not None
+                    else ""))
 
         self._near_streak = self._near_streak + 1 if want_wide else 0
         self._far_streak = self._far_streak + 1 if want_tele else 0
@@ -587,8 +600,11 @@ class CameraWorker:
             # Decided FROM this frame, applied to the NEXT one.
             switch_distance = tc.estimate_distance_m(max_box_w, frame_camera)
             try:
-                switched = self._policy.evaluate(self._manager, frame_camera,
-                                                 switch_distance, max_box_h)
+                switched = self._policy.evaluate(
+                    self._manager, frame_camera,
+                    box_width_px=max_box_w,
+                    frame_width_px=frame_bgr.shape[1],
+                    distance_m=switch_distance)
                 if switched:
                     # Deliberately does NOT update frame_camera — see above.
                     log.info("camera switched: %s (takes effect next frame)",
@@ -918,16 +934,24 @@ if __name__ == "__main__":
     print("camera_worker.py — camera switching policy test")
     print("=" * 66)
 
-    print("\nTEST 7: distance fluctuating around the switching thresholds.")
-    print("Case A: small jitter at 1.5 m (sigma 5 cm). The existing 1.5/2.0 m")
-    print("        hysteresis band alone already handles this.")
-    print("Case B: a drone hovering mid-band at 1.75 m with realistic box")
-    print("        jitter (sigma 35 cm), so single frames land BOTH below")
-    print("        1.5 m and above 2.0 m. This is the case the hysteresis")
-    print("        band cannot catch, and where the original single-frame")
-    print("        decision oscillates.\n")
+    print("\nTEST 7: box size fluctuating around the switching thresholds.")
+    print("Case A: small jitter right at the 60% edge (sigma 2%). The")
+    print("        0.60/0.25 hysteresis band alone already handles this.")
+    print("Case B: a drone hovering mid-band at 42% of the frame width,")
+    print("        with realistic box jitter (sigma 18%), so single frames")
+    print("        land BOTH above 60% and below 25%. This is the case the")
+    print("        hysteresis band cannot catch, and where the original")
+    print("        single-frame decision oscillates.\n")
 
-    for case, (mean, sigma) in (("A", (1.5, 0.05)), ("B", (1.75, 0.35))):
+    W = cfg.visual.frame_width
+
+    def drive(policy, mgr, frac):
+        """One frame in which the target box is `frac` of the frame width."""
+        policy.evaluate(mgr, mgr.get_active_camera(),
+                        box_width_px=float(frac) * W, frame_width_px=W)
+
+    # Bands are now FRACTIONS of the frame (finding N3): 0.60 in, 0.25 out.
+    for case, (mean, sigma) in (("A", (0.60, 0.02)), ("B", (0.42, 0.18))):
         for confirm_frames, label in (
                 (1, "confirm_frames=1 (original behaviour)"),
                 (5, "confirm_frames=5 (this integration)")):
@@ -936,8 +960,7 @@ if __name__ == "__main__":
             mgr = StubManager(debounce=0.0)   # debounce off, to isolate policy
             rng = np.random.default_rng(1)
             for _ in range(300):
-                d = mean + float(rng.normal(0.0, sigma))
-                policy.evaluate(mgr, mgr.get_active_camera(), d, 100.0)
+                drive(policy, mgr, mean + float(rng.normal(0.0, sigma)))
             print(f"   case {case}  {label:<40} -> "
                   f"{mgr.switches:3d} switch(es) / 300 frames")
         print()
@@ -946,12 +969,12 @@ if __name__ == "__main__":
     cfg.switching.confirm_frames = 5
     policy = CameraSwitchPolicy(cfg, events)
     mgr = StubManager(debounce=0.0)
-    for d in np.linspace(3.0, 0.8, 60):
-        policy.evaluate(mgr, mgr.get_active_camera(), float(d), 100.0)
-    print(f"   3.0 m -> 0.8 m approach                  -> "
+    for f in np.linspace(0.10, 0.80, 60):
+        drive(policy, mgr, float(f))
+    print(f"   box 10% -> 80% of frame (approach)       -> "
           f"{mgr.switches} switch(es), now on camera {mgr.active}")
-    for d in np.linspace(0.8, 3.0, 60):
-        policy.evaluate(mgr, mgr.get_active_camera(), float(d), 100.0)
-    print(f"   0.8 m -> 3.0 m departure                 -> "
+    for f in np.linspace(0.80, 0.10, 60):
+        drive(policy, mgr, float(f))
+    print(f"   box 80% -> 10% of frame (departure)      -> "
           f"{mgr.switches} switch(es) total, now on camera {mgr.active}")
     print()
