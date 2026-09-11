@@ -2189,19 +2189,35 @@ def test_12_led_ring():
           f"CW -> LED {base}, CCW -> LED {mirrored}")
 
     # ── J: hardware absent or broken must not affect detection ──
-    led = rl.RespeakerLed(LedConfig(enabled=True, led_count=N),
-                          script_path=None)
-    led.start()
-    # find_xvf_host() searches the home directory under a 2 s budget, so
-    # poll rather than sleeping a guessed amount.
-    deadline = time.monotonic() + 8.0
-    while led.status is rl.LedStatus.STARTING and time.monotonic() < deadline:
-        led.submit(rl.LedFrame(rl.LedMode.ALARM, 142.0))
-        time.sleep(0.05)
-    check("J: no xvf_host.py -> LED UNAVAILABLE, no exception",
-          led.status is rl.LedStatus.UNAVAILABLE,
-          led.detail or f"status={led.status.value}")
-    led.stop(timeout=1.0)
+    #
+    # ⚠️ THE ABSENCE MUST BE FORCED, NOT ASSUMED. This used to pass
+    # `script_path=None` and rely on there being no xvf_host.py anywhere.
+    # But `script_path=None` does not mean "absent" — RespeakerLed treats
+    # it as "go and look", and `find_xvf_host()` searches the home
+    # directory. On a real station it FINDS the script, the ring comes up
+    # AVAILABLE, and this check failed on the target hardware while passing
+    # on any machine that happened not to have the file. It was testing the
+    # developer's filesystem, not the degradation path.
+    #
+    # Patching the lookup makes the condition under test actually hold,
+    # everywhere.
+    _real_find = rl.find_xvf_host
+    rl.find_xvf_host = lambda *a, **k: None
+    try:
+        led = rl.RespeakerLed(LedConfig(enabled=True, led_count=N),
+                              script_path=None)
+        led.start()
+        deadline = time.monotonic() + 8.0
+        while (led.status is rl.LedStatus.STARTING
+               and time.monotonic() < deadline):
+            led.submit(rl.LedFrame(rl.LedMode.ALARM, 142.0))
+            time.sleep(0.05)
+        check("J: no xvf_host.py -> LED UNAVAILABLE, no exception",
+              led.status is rl.LedStatus.UNAVAILABLE,
+              led.detail or f"status={led.status.value}")
+        led.stop(timeout=1.0)
+    finally:
+        rl.find_xvf_host = _real_find
 
     broken = _make_failing_xvf_host()
     led = rl.RespeakerLed(
@@ -3147,9 +3163,25 @@ def test_17_web_server():
                 break
         r.close()
 
-    # 8 s, not 2.5 s: the client-count assertion below polls until the
-    # PREVIOUS reader's server-side generator has unregistered, and these
-    # three must still be streaming while that settles.
+    # ⚠️ ESTABLISH A ZERO BASELINE FIRST, rather than racing the reaper.
+    #
+    # The /video_feed reader above was closed on the CLIENT side, but the
+    # server-side generator only runs its `finally` — and only then
+    # unregisters — when it next tries to write into the dead socket. How
+    # long that takes depends entirely on how fast the machine is: this
+    # assertion passed on a fast desktop and failed on the target Pi,
+    # reporting 4 clients because the closed reader was still counted.
+    #
+    # Polling for "3" was the wrong fix: it cannot distinguish "the stale
+    # client went away" from "one of ours has not connected yet". Waiting
+    # for the count to reach ZERO before opening the three watchers makes
+    # the subsequent assertion exact on any machine.
+    for _ in range(200):
+        if _json.loads(_url.urlopen(base + "/status",
+                                    timeout=5).read())["clients"] == 0:
+            break
+        time.sleep(0.1)
+
     threads = [_th.Thread(target=watch, args=(8.0,), daemon=True)
                for _ in range(3)]
     for t in threads:
@@ -3160,17 +3192,11 @@ def test_17_web_server():
           multi["jpeg_fps"] < solo * 2.0,
           f"{solo:.0f} fps solo -> {multi['jpeg_fps']:.0f} fps with "
           f"{multi['clients']} clients (a per-client encode would be ~3x)")
-    # ⚠️ The count is polled rather than sampled once. The previous
-    # /video_feed reader above was closed on the CLIENT side, but the
-    # server-side generator only runs its `finally` (and so only
-    # unregisters) when it next tries to write into the dead socket. Until
-    # then the closed reader is legitimately still counted, so a single
-    # sample could see 4 and fail on timing alone rather than on the
-    # accounting being wrong. This still asserts EXACTLY 3 — it just lets
-    # the asynchronous disconnect land first.
-    for _ in range(40):
+    # All three connected, and the baseline above was zero, so this is an
+    # exact count rather than a race against the reaper.
+    for _ in range(50):
         multi = _json.loads(_url.urlopen(base + "/status", timeout=5).read())
-        if multi["clients"] == 3:
+        if multi["clients"] >= 3:
             break
         time.sleep(0.1)
     check("every client is counted", multi["clients"] == 3,

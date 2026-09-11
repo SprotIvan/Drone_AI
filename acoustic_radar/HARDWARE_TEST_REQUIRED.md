@@ -77,18 +77,37 @@ python -c "from picamera2 import Picamera2; \
            import json; print(json.dumps(Picamera2.global_camera_info(), indent=2))"
 ```
 
-⚠️ **Verify this yourself rather than trusting the claim.** The station's
-suggestion assumes the two `Id`s differ in an `i2c@NNNNN` node, and that
-this node identifies the physical CSI connector. That is standard on a
-Pi 5 with two CSI ports, but **nothing in the code proves it** and it is not
-true for every topology (a camera multiplexer can put both sensors on one
-I2C controller at different chip addresses). If both suggested hints come
-out identical, that is what happened — pick a longer unique fragment of each
-full `Id` instead; the station will refuse an ambiguous hint rather than
-guess.
+### ✅ OBSERVED ON THIS STATION — the Ids are known
 
-Read the roles off the start-up line above, then record the matching Id
-fragments:
+Run on the operator's Pi 5 (`Picamera2.global_camera_info()`):
+
+```json
+[
+  { "Model": "imx477", "Num": 0, "Rotation": 180,
+    "Id": "/base/axi/pcie@1000120000/rp1/i2c@88000/imx477@1a" },
+  { "Model": "imx477", "Num": 1, "Rotation": 180,
+    "Id": "/base/axi/pcie@1000120000/rp1/i2c@80000/imx477@1a" }
+]
+```
+
+This **confirms**, on the real hardware:
+
+* both cameras are `imx477` — consistent with the stated IMX477P, and the
+  IMX708 references removed in C3 were indeed wrong;
+* the two `Id`s differ in the I2C controller node, `i2c@88000` vs
+  `i2c@80000`, so the assumption behind `camera_role_id_hint` holds here and
+  those two fragments are valid, unambiguous hints;
+* both report `Rotation: 180` — consistent with each other, so the optical
+  role check compares like with like.
+
+⚠️ **WHAT THIS STILL DOES NOT TELL US: which of them carries the 6 mm lens
+and which the Kowa 25 mm.** Nothing in this output distinguishes them —
+identical model, identical rotation. That is the remaining part of HW-1 and
+it needs eyes on the images. **Do not fill in the hint from a guess:** a
+wrong hint that goes unnoticed is precisely the silent lens transposition
+this whole mechanism exists to prevent.
+
+Determine it either way below, then record the matching Id fragments:
 
 ```json
 "geometry": {
@@ -105,17 +124,33 @@ it means a camera was moved to the other socket, or the lenses were swapped
 between bodies — the exact silent transposition this mechanism exists to
 catch.
 
-### Independent visual confirmation (30 seconds, worth doing once)
+### Deciding which is which — 30 seconds, and it settles HW-1
 
 ```bash
-libcamera-still --camera 0 -o /tmp/cam0.jpg -n -t 500
-libcamera-still --camera 1 -o /tmp/cam1.jpg -n -t 500
+# Newer Raspberry Pi OS:
+rpicam-still --camera 0 -o /tmp/cam0.jpg -n -t 800
+rpicam-still --camera 1 -o /tmp/cam1.jpg -n -t 800
+# Older OS uses libcamera-still with the same arguments.
 ```
 
-Open both. **The TELE image is dramatically more magnified** — roughly
-4.17×. This is unmistakable by eye. Confirm it agrees with what the station
-reported. If the two images look similarly wide, the lenses are not what the
-hardware notes say and everything downstream is void.
+Open both images. **The TELE (25 mm) image is dramatically more
+magnified — about 4.17×.** It shows a small central slice of what the WIDE
+(6 mm) image shows. This is unmistakable by eye; no measurement is needed.
+
+Then, for the Ids observed above:
+
+| If the magnified image is… | WIDE hint | TELE hint |
+| --- | --- | --- |
+| `--camera 1` (`i2c@80000`) | `i2c@88000` | `i2c@80000` |
+| `--camera 0` (`i2c@88000`) | `i2c@80000` | `i2c@88000` |
+
+⚠️ If the two images look **similarly wide**, stop: the lenses are not what
+the hardware notes say, and every distance, gate and threshold downstream is
+void until that is resolved.
+
+**Cross-check:** with a textured scene in view the station works this out
+itself and prints its answer. If your hint and its measurement disagree it
+refuses to start and says so — that is the check doing its job, not a fault.
 
 ### Reboot stability (the point of the whole fix)
 
