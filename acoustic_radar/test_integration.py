@@ -3854,6 +3854,482 @@ def test_18_doa_fix_regressions():
           "дзеркально" not in banner and "UNKNOWN" in banner, banner)
 
 
+def test_26_smart_crop():
+    """
+    SMART CROP — native-resolution windows for small (far) targets.
+
+    OFF by default, and then the original pipeline exactly. ON, the geometry
+    that moves a box from a native window into the published frame must be
+    exact, one drone seen twice must stay one detection, and nothing
+    downstream may ever see a second pixel space.
+    """
+    header("TEST 26 — smart crop (native windows for far targets)")
+    import inspect as _insp
+
+    import cv2 as _cv2
+
+    import camera_manager as cm
+    import camera_worker as cw
+    import smart_crop as sc
+    import TWO_CAMERAS_FIXED as _tc
+
+    # ── 1. Configuration ──
+    cfg = load_config()
+    check("SC: crop mode is OFF by default", cfg.visual.crop_mode is False)
+    check("SC: switched on, it adds ONE crop per detector run by default",
+          cfg.visual.crop_max_per_frame == 1)
+
+    # ── 2. Stream and window geometry ──
+    check("SC: the 1332x990 mode gives a 1320x990 native stream (4:3, "
+          "like 640x480)",
+          sc.native_stream_size((1332, 990), (640, 480)) == (1320, 990),
+          str(sc.native_stream_size((1332, 990), (640, 480))))
+    check("SC: the 2028x1520 mode gives 2026x1520",
+          sc.native_stream_size((2028, 1520), (640, 480)) == (2026, 1520))
+
+    def coverage(size, tiles):
+        covered = np.zeros((size[1], size[0]), bool)
+        for x, y in tiles:
+            covered[y:y + 640, x:x + 640] = True
+        return bool(covered.all())
+
+    tiles = sc.tile_origins((1320, 990), 640)
+    check("SC: 1320x990 is tiled by 6 windows", len(tiles) == 6, str(tiles))
+    check("SC: ...which cover every native pixel", coverage((1320, 990),
+                                                            tiles))
+    check("SC: ...and never leave the frame",
+          all(0 <= x <= 680 and 0 <= y <= 350 for x, y in tiles))
+    tiles12 = sc.tile_origins((2026, 1520), 640)
+    check("SC: 2026x1520 is tiled by 12 windows covering everything",
+          len(tiles12) == 12 and coverage((2026, 1520), tiles12))
+    check("SC: a frame smaller than one window gets no windows",
+          sc.tile_origins((600, 480), 640) == [])
+    check("SC: a centred window is clamped inside the frame",
+          sc.centred_origin((10, 10), (1320, 990), 640) == (0, 0)
+          and sc.centred_origin((1315, 985), (1320, 990), 640) == (680, 350)
+          and sc.centred_origin((660, 495), (1320, 990), 640) == (340, 175))
+
+    # ── 3. Window -> published frame ──
+    scale = (1320 / 640.0, 990 / 480.0)          # 2.0625 on both axes
+    b, _ = sc.boxes_from_crop([np.array([100., 50., 20., 20.], np.float32)],
+                              [0.9], (340, 350), 640, (1320, 990), scale)
+    expected = np.array([440 / 2.0625, 400 / 2.0625,
+                         20 / 2.0625, 20 / 2.0625])
+    check("SC: a window box lands at the right published position",
+          len(b) == 1 and np.allclose(b[0], expected, atol=1e-3),
+          f"{b[0] if b else None} vs {expected}")
+    cut = [np.array([0., 100., 30., 30.], np.float32)]
+    b_inner, _ = sc.boxes_from_crop(cut, [0.9], (340, 0), 640, (1320, 990),
+                                    scale)
+    b_frame, _ = sc.boxes_from_crop(cut, [0.9], (0, 0), 640, (1320, 990),
+                                    scale)
+    check("SC: a box cut by an INNER window edge is discarded", b_inner == [])
+    check("SC: a box at the FRAME edge is kept, as the full frame keeps it",
+          len(b_frame) == 1)
+
+    # ── 4. Merging ──
+    full = ([np.array([100., 100., 16., 16.], np.float32)], [0.6])
+    tight = ([np.array([103., 103., 10., 10.], np.float32)], [0.9])
+    iou, _ = sc._overlaps(full[0][0], tight[0][0])
+    mb, ms = sc.merge_detections([full, tight], 0.45)
+    check("SC: one drone at two resolutions is ONE detection (the "
+          "higher score)", len(mb) == 1 and abs(ms[0] - 0.9) < 1e-6,
+          f"{len(mb)} box(es)")
+    check("SC: ...in a case plain IoU NMS would have kept twice",
+          iou < 0.45, f"IoU {iou:.2f}")
+    other = ([np.array([400., 300., 10., 10.], np.float32)], [0.8])
+    check("SC: two separate targets stay two",
+          len(sc.merge_detections([full, other], 0.45)[0]) == 2)
+    lone = ([np.array([1., 2., 3., 4.], np.float32)], [0.5])
+    lb, ls = sc.merge_detections([lone, ([], [])], 0.45)
+    check("SC: a lone full-frame result passes through untouched",
+          len(lb) == 1 and lb[0] is lone[0][0] and ls == [0.5])
+
+    # ── 5. Window placement ──
+    planner = sc.CropPlanner()
+    swept = []
+    for _ in range(6):
+        swept += planner.plan((1320, 990), scale, 640, 1, [], 24.0)
+    check("SC: with no target the sweep visits every window in turn",
+          sorted(swept) == sorted(tiles), str(swept))
+    small = [(320.0, 240.0, 10.0, 10.0)]         # centre -> native (660, 495)
+    check("SC: a small confirmed track gets a window centred on it",
+          sc.CropPlanner().plan((1320, 990), scale, 640, 1, small, 24.0)
+          == [(340, 175)])
+    big = [(320.0, 240.0, 80.0, 80.0)]
+    check("SC: a large (near) track does not take the window",
+          sc.CropPlanner().plan((1320, 990), scale, 640, 1, big, 24.0)
+          == [tiles[0]])
+    two = sc.CropPlanner().plan((1320, 990), scale, 640, 2, small, 24.0)
+    check("SC: with 2 crops, one follows the target and one keeps sweeping",
+          len(two) == 2 and two[0] == (340, 175), str(two))
+    check("SC: crop_max_per_frame = 0 plans nothing",
+          sc.CropPlanner().plan((1320, 990), scale, 640, 0, small, 24.0) == [])
+
+    # ── 6. Stream alignment is MEASURED, not assumed ──
+    rng = np.random.default_rng(5)
+    base = rng.integers(0, 255, (99, 132), dtype=np.uint8)
+    native = np.dstack([_cv2.resize(base, (1320, 990),
+                                    interpolation=_cv2.INTER_CUBIC)] * 3)
+    pub = _cv2.resize(native, (640, 480), interpolation=_cv2.INTER_AREA)
+    r = sc.measure_stream_alignment(native, pub)
+    check("SC: aligned streams are measured ALIGNED", r.verdict == "ALIGNED",
+          r.detail)
+    r = sc.measure_stream_alignment(native, np.roll(pub, 3, axis=1))
+    check("SC: a 3 px offset between the streams is caught",
+          r.verdict == "MISALIGNED"
+          and all(abs(s[0] + 3.0) < 0.2 and abs(s[1]) < 0.2
+                  for s in (r.left, r.right)), r.detail)
+    # ⚠️ The failure mode found ON THE STATION: a natural scene is dominated
+    # by large smooth structures, so plain correlation barely changes over a
+    # pixel — on the real outdoor frames it was still 0.995-0.999 two pixels
+    # from the peak — and the first version called perfectly aligned streams
+    # INCONCLUSIVE ten times out of ten. A heavily smoothed scene reproduces
+    # it; the first check proves this one really does.
+    smooth = _cv2.GaussianBlur(native, (0, 0), 24.0)
+    smooth_pub = _cv2.resize(smooth, (640, 480), interpolation=_cv2.INTER_AREA)
+    g_small = _cv2.resize(smooth.mean(axis=2).astype(np.float32), (640, 480),
+                          interpolation=_cv2.INTER_AREA)
+    ncc = _cv2.matchTemplate(
+        g_small[:, :219], smooth_pub.mean(axis=2).astype(np.float32)[6:474,
+                                                                     6:213],
+        _cv2.TM_CCOEFF_NORMED)
+    check("SC: the smooth scene reproduces the station case (correlation "
+          "still > 0.98 two pixels off the peak)",
+          float(ncc[6, 8]) > 0.98, f"{float(ncc[6, 8]):.4f}")
+    r = sc.measure_stream_alignment(smooth, smooth_pub)
+    check("SC: ...and is nevertheless measured ALIGNED",
+          r.verdict == "ALIGNED", r.detail)
+    r = sc.measure_stream_alignment(
+        rng.normal(128, 30, (990, 1320, 3)).clip(0, 255).astype(np.uint8),
+        rng.normal(128, 30, (480, 640, 3)).clip(0, 255).astype(np.uint8))
+    check("SC: textured frames with no content in common are INCONCLUSIVE "
+          "(weak response, not a guessed shift)",
+          r.verdict == "INCONCLUSIVE" and "too weak" in r.detail, r.detail)
+    zoom = _cv2.resize(native[:, 12:1308], (640, 480),
+                       interpolation=_cv2.INTER_AREA)
+    r = sc.measure_stream_alignment(native, zoom)
+    check("SC: a scale mismatch is caught (left and right disagree)",
+          r.verdict == "MISALIGNED" and r.left[0] > 0 > r.right[0], r.detail)
+    r = sc.measure_stream_alignment(np.full_like(native, 128),
+                                    np.full_like(pub, 128))
+    check("SC: blank sky is INCONCLUSIVE, never assumed aligned",
+          r.verdict == "INCONCLUSIVE", r.detail)
+
+    # ── 7. CameraManager: two streams from one exposure, same sensor mode ──
+    INFO = [
+        {"Num": 0, "Model": "imx477",
+         "Id": "/base/axi/pcie@120000/rp1/i2c@88000/imx477@1a"},
+        {"Num": 1, "Model": "imx477",
+         "Id": "/base/axi/pcie@120000/rp1/i2c@80000/imx477@1a"},
+    ]
+    HINTS = {"WIDE": "i2c@88000", "TELE": "i2c@80000"}
+
+    class _Request:
+        def __init__(self, cam):
+            self.cam = cam
+
+        def make_array(self, name):
+            return self.cam.render(name)
+
+        def get_metadata(self):
+            return {"SensorTimestamp": 123456789}
+
+        def release(self):
+            self.cam.released += 1
+
+    class CropCam:
+        """Picamera2 stand-in: reports the mode it chose, accepts or refuses
+        a second stream, returns frames of the configured sizes."""
+        lores_ok = True
+        report_sensor = True
+        default_mode = (1332, 990)
+
+        def __init__(self, camera_num=0):
+            self.num = camera_num
+            self.camera_properties = {"PixelArraySize": (4056, 3040)}
+            self.configs = []
+            self.requests = self.released = 0
+
+        def create_video_configuration(self, **kw):
+            return dict(kw)
+
+        def configure(self, cfg):
+            if "lores" in cfg and not CropCam.lores_ok:
+                raise RuntimeError("second stream not supported")
+            self.configs.append(cfg)
+
+        def camera_configuration(self):
+            cfg = self.configs[-1]
+            out = {"main": {"size": tuple(cfg["main"]["size"])}}
+            if "lores" in cfg:
+                out["lores"] = {"size": tuple(cfg["lores"]["size"])}
+            if CropCam.report_sensor:
+                pinned = (cfg.get("sensor") or {}).get("output_size")
+                out["sensor"] = {"output_size": tuple(pinned
+                                                      or CropCam.default_mode),
+                                 "bit_depth": 10}
+            return out
+
+        def capture_metadata(self):
+            return {"ScalerCrop": (0, 0, 2664, 1980)}
+
+        def render(self, name):
+            w, h = self.camera_configuration()[name]["size"]
+            return np.full((h, w, 3), 128, np.uint8)
+
+        def capture_array(self, name="main"):
+            return self.render(name)
+
+        def capture_request(self):
+            self.requests += 1
+            return _Request(self)
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def close(self):
+            pass
+
+    def build(**crop):
+        cm.Picamera2 = CropCam
+        return cm.CameraManager(
+            width=640, height=480, fps=30, warmup_frames=0,
+            role_hints=HINTS, info_provider=lambda: list(INFO),
+            lens_mm={"WIDE": 6.0, "TELE": 25.0}, **crop)
+
+    saved = cm.Picamera2
+    try:
+        CropCam.lores_ok, CropCam.report_sensor = True, True
+        off = build()
+        cam = off.picams[off.active_camera]
+        check("SC: crop mode off configures ONE 640x480 stream, as before",
+              len(cam.configs) == 1 and "lores" not in cam.configs[0]
+              and cam.configs[0]["main"]["size"] == (640, 480))
+        f, n, _ = off.get_frames_and_sensor_ns()
+        check("SC: ...and delivers no native frame",
+              n is None and f.shape == (480, 640, 3))
+
+        on = build(crop_mode=True)
+        cam = on.picams[on.active_camera]
+        last = cam.configs[-1]
+        check("SC: crop mode PINS the sensor mode chosen without it",
+              last.get("sensor") == {"output_size": (1332, 990),
+                                     "bit_depth": 10}, str(last.get("sensor")))
+        check("SC: the native stream is the aspect-matched 1320x990",
+              last["main"]["size"] == (1320, 990))
+        check("SC: the published stream stays 640x480",
+              last["lores"]["size"] == (640, 480))
+        f, n, ts = on.get_frames_and_sensor_ns()
+        check("SC: one capture returns BOTH views of the same exposure",
+              f.shape == (480, 640, 3) and n.shape == (990, 1320, 3)
+              and ts == 123456789, f"{f.shape} / {n.shape} / {ts}")
+        f2, _ = on.get_frame_and_sensor_ns()
+        check("SC: the single-frame API still returns the PUBLISHED frame",
+              f2.shape == (480, 640, 3))
+        check("SC: every capture request is released",
+              cam.requests > 0 and cam.released == cam.requests,
+              f"{cam.released}/{cam.requests}")
+        check("SC: the focal length still describes the PUBLISHED frame",
+              abs(on.focal_px_by_role["WIDE"] - 930.0) < 2.0
+              and abs(on.focal_px_by_role["TELE"] - 3875.0) < 5.0,
+              str({k: round(v) for k, v in on.focal_px_by_role.items()}))
+
+        CropCam.lores_ok = False
+        rs = build(crop_mode=True)
+        s = rs.crop_streams.get(rs.active_camera) or {}
+        check("SC: a camera refusing a second stream falls back to 'resize'",
+              s.get("source") == "resize", str(s))
+        f, n, _ = rs.get_frames_and_sensor_ns()
+        check("SC: ...and still publishes 640x480, downscaled from native",
+              f.shape == (480, 640, 3) and n.shape == (990, 1320, 3))
+        CropCam.lores_ok = True
+
+        CropCam.report_sensor = False
+        blind = build(crop_mode=True)
+        check("SC: an unreadable sensor mode DISABLES crop mode instead of "
+              "guessing", blind.crop_streams == {}
+              and len(blind.picams[blind.active_camera].configs) == 1)
+        f, n, _ = blind.get_frames_and_sensor_ns()
+        check("SC: ...leaving the original single stream running",
+              n is None and f.shape == (480, 640, 3))
+        pinned = build(crop_mode=True, crop_sensor_size=[1332, 990])
+        check("SC: an explicit crop_sensor_size enables it again",
+              (pinned.crop_streams.get(pinned.active_camera) or {})
+              .get("native") == (1320, 990))
+        CropCam.report_sensor = True
+    finally:
+        cm.Picamera2 = saved
+
+    # ── 8. The worker's detection step, end to end ──
+    class DarkBlobDetector:
+        """Stands in for YOLO: finds dark blobs at least `min_px` wide —
+        i.e. a detector with a resolution limit, which is exactly what the
+        native windows exist to beat."""
+        input_shape = (640, 640)
+
+        def __init__(self, min_px=12):
+            self.min_px = min_px
+            self.stage_ms = {"letterbox": 0.1, "infer": 1.0, "decode": 0.1,
+                             "nms": None}
+
+        def predict_with_scores(self, img):
+            mask = (np.asarray(img)[:, :, 0] < 40).astype(np.uint8)
+            n_lab, _lab, stats, _c = _cv2.connectedComponentsWithStats(mask)
+            boxes, scores = [], []
+            for i in range(1, n_lab):
+                x, y, w, h, _area = (int(v) for v in stats[i])
+                if w >= self.min_px and h >= self.min_px:
+                    boxes.append(np.array([x, y, w, h], np.float32))
+                    scores.append(0.9)
+            return boxes, scores
+
+    def make_worker(max_crops):
+        wcfg = load_config()
+        wcfg.visual.crop_mode = True
+        wcfg.visual.crop_max_per_frame = max_crops
+        w = cw.CameraWorker.__new__(cw.CameraWorker)
+        w.config = wcfg
+        w._detector = DarkBlobDetector()
+        w._tracker = _tc.AdvancedADASTracker()
+        w._crop_planner = sc.CropPlanner()
+        w._last_crop_origins = []
+        return w
+
+    def scene(blobs):
+        frame = np.full((990, 1320, 3), 120, np.uint8)
+        for x, y, size in blobs:
+            frame[y:y + size, x:x + size] = 20
+        return frame, _cv2.resize(frame, (640, 480),
+                                  interpolation=_cv2.INTER_AREA)
+
+    # A 20 px target in native pixels is ~9.7 px in the published frame —
+    # below this detector's 12 px limit, above it natively.
+    native, pub = scene([(1000, 300, 20)])
+    b0, _ = make_worker(0)._detect_with_crops(pub, native, pub)
+    check("SC: the full frame alone MISSES the far target", b0 == [])
+    w = make_worker(1)
+    found = []
+    for run in range(6):
+        b, _ = w._detect_with_crops(pub, native, pub)
+        if b:
+            found.append((run, list(w._last_crop_origins), b))
+    check("SC: the native sweep FINDS it, in the window that contains it",
+          len(found) == 1 and found[0][1] == [(680, 0)],
+          str([(r, o) for r, o, _ in found]))
+    want = np.array([1000 / 2.0625, 300 / 2.0625, 20 / 2.0625, 20 / 2.0625])
+    check("SC: ...and maps it to the right place in the published frame",
+          bool(found) and np.allclose(found[0][2][0], want, atol=0.05),
+          f"{found[0][2][0] if found else None} vs {want}")
+
+    native, pub = scene([(965, 300, 20)])        # straddles windows 340/680
+    w = make_worker(1)
+    widths = []
+    for _ in range(6):
+        b, _ = w._detect_with_crops(pub, native, pub)
+        widths += [float(x[2]) for x in b]
+    check("SC: a target cut by a window edge is never reported half-size",
+          bool(widths) and all(abs(v - 20 / 2.0625) < 0.05 for v in widths),
+          str([round(v, 2) for v in widths]))
+
+    native, pub = scene([(100, 100, 120)])       # near: seen by both paths
+    w = make_worker(1)
+    b, _ = w._detect_with_crops(pub, native, pub)
+    check("SC: a near target seen in the full frame AND a window is ONE "
+          "detection", len(b) == 1 and w._last_crop_origins == [(0, 0)],
+          f"{len(b)} box(es), windows {w._last_crop_origins}")
+
+    ref = DarkBlobDetector().predict_with_scores(pub)
+    got = make_worker(0)._detect_with_crops(pub, native, pub)
+    check("SC: crop_max_per_frame = 0 returns EXACTLY the full-frame result",
+          len(got[0]) == len(ref[0])
+          and all(np.array_equal(a, c) for a, c in zip(got[0], ref[0]))
+          and got[1] == ref[1])
+
+    # ── 9. Candidates get a window (defect found on the station) ──
+    #
+    # ⚠️ The first planner gave windows to CONFIRMED tracks only. A far
+    # target that only a native window can see then had to be confirmed by
+    # the sweep alone — 3 detections before 4 consecutive misses — while the
+    # sweep came back to its window only once every 6 runs. In most of the
+    # frame the new track died between two visits: in a simulation with the
+    # real tracker, 67 % of positions NEVER confirmed with one crop.
+    cand = [(320.0, 240.0, 10.0, 10.0)]
+    check("SC: a small UNCONFIRMED track gets the window when no confirmed "
+          "one needs it",
+          sc.CropPlanner().plan((1320, 990), scale, 640, 1, [], 24.0,
+                                candidate_boxes=cand) == [(340, 175)])
+    conf_far = [(100.0, 100.0, 8.0, 8.0)]            # native (206, 206)
+    check("SC: a small CONFIRMED track keeps priority over a candidate",
+          sc.CropPlanner().plan((1320, 990), scale, 640, 1, conf_far, 24.0,
+                                candidate_boxes=cand) == [(0, 0)])
+
+    def acquire(target_xy, runs=20):
+        """Runs of the REAL tracker until a far target is confirmed."""
+        w = make_worker(1)
+        frame = np.full((990, 1320, 3), 120, np.uint8)
+        x, y = target_xy
+        frame[y:y + 20, x:x + 20] = 20          # ~9.7 published px: crop only
+        small_pub = _cv2.resize(frame, (640, 480),
+                                interpolation=_cv2.INTER_AREA)
+        for k in range(runs):
+            dets, scs = w._detect_with_crops(small_pub, frame, small_pub)
+            w._tracker.process_frame(small_pub, dets, run_association=True,
+                                     detection_scores=scs)
+            if any(t.state == _tc.TrackState.Confirmed
+                   for t in w._tracker.tracks):
+                return k
+        return None
+
+    for label, xy in (("a corner", (1000, 300)), ("an edge", (150, 800))):
+        k = acquire(xy)
+        check(f"SC: a far target in {label} (one window covers it) is "
+              f"CONFIRMED with one crop", k is not None and k <= 8,
+              f"confirmed at detector run {k}")
+
+    # ── 10. Detection log ──
+    import json as _json
+    import tempfile as _tempfile
+    tmp = _tempfile.mkdtemp()
+    w = make_worker(1)
+    w.config.logging.log_dir = tmp
+    w.events = EventLogger(logging.getLogger("station.test"), w.config.logging)
+    w._manager = None
+    w._frame_count = 7
+    w._det_log, w._det_log_failed = None, False
+    native, pub = scene([(1000, 300, 20), (100, 100, 120)])
+    for _ in range(3):
+        diag = {}
+        dets, scs = w._detect_with_crops(pub, native, pub, diag)
+        w._tracker.process_frame(pub, dets, run_association=True,
+                                 detection_scores=scs)
+        w._log_detection_run(0, 57.0, diag, dets, scs)
+    w._det_log.close()
+    import glob as _glob
+    files = _glob.glob(tmp + "/detections_*.jsonl")
+    lines = open(files[0], encoding="utf-8").read().splitlines() if files \
+        else []
+    rec = _json.loads(lines[-1]) if lines else {}
+    check("SC: the detection log writes one JSON line per detector run",
+          len(files) == 1 and len(lines) == 3, f"{len(files)} file(s), "
+          f"{len(lines)} line(s)")
+    check("SC: ...with what the full frame, each window and the tracker saw",
+          rec.get("mode") == "crop" and len(rec.get("full", [])) == 1
+          and len(rec.get("crops", [])) == 1
+          and all(len(b) == 5 for b in rec.get("merged", []))
+          and {"id", "state", "box", "hits", "miss", "score"}
+          <= set((rec.get("tracks") or [{}])[0]), str(rec)[:120])
+
+    loop_src = _insp.getsource(cw.CameraWorker._loop)
+    loop_code = "\n".join(ln.split("#", 1)[0] for ln in loop_src.splitlines())
+    check("SC: the tracker is still called ONCE per frame (one association "
+          "over the merged detections)",
+          loop_code.count("process_frame(") == 1)
+
+
 def main() -> int:
     logging.getLogger("station").setLevel(logging.CRITICAL)
 
@@ -3873,7 +4349,7 @@ def main() -> int:
                test_21_hardware_claims, test_22_srp_gating,
                test_23_acoustic_timestamp_semantics,
                test_24_camera_manager_role_resolution,
-               test_25_forensic_review_fixes,
+               test_25_forensic_review_fixes, test_26_smart_crop,
                test_regressions, test_final_audit_regressions,
                test_honesty, test_thread_safety):
         try:

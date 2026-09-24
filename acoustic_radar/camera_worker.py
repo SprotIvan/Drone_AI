@@ -40,6 +40,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
+import smart_crop
 from fusion_config import StationConfig
 from latency import BUDGET
 from station_logging import EventLogger
@@ -220,6 +221,17 @@ class CameraWorker:
         # Requested from the UI thread, serviced on the camera thread.
         self._calibrate_request = threading.Event()
 
+        # ── Smart crop (VisualConfig.crop_mode) ──
+        # Where the native windows go, and what the last detector run used.
+        self._crop_planner = smart_crop.CropPlanner()
+        self._last_crop_origins: List[Tuple[int, int]] = []
+        # Per camera: the one-off stream-alignment measurement.
+        self._align_state: dict = {}
+        # VisualConfig.detection_log: the open .jsonl file, opened on the
+        # first detector run and closed at teardown.
+        self._det_log = None
+        self._det_log_failed = False
+
     # ── Lifecycle ──────────────────────────────────────────────
 
     def start(self) -> bool:
@@ -346,7 +358,26 @@ class CameraWorker:
             warmup_frames=v.warmup_frames,
             role_hints=geo.camera_role_id_hint,
             expected_sensor_model=geo.expected_sensor_model,
-            lens_mm=geo.lens_mm)
+            lens_mm=geo.lens_mm,
+            crop_mode=v.crop_mode,
+            crop_sensor_size=v.crop_sensor_size,
+            crop_published_source=v.crop_published_source)
+
+        if v.crop_mode:
+            streams = getattr(self._manager, "crop_streams", {})
+            if streams:
+                for cam, s in sorted(streams.items()):
+                    log.info("smart crop ON for %s: sensor mode %s, native "
+                             "%s -> published %s via %s, up to %d crop(s) "
+                             "per detector run",
+                             self._manager.role_for(cam), s["sensor"],
+                             s["native"], s["published"], s["source"],
+                             v.crop_max_per_frame)
+            else:
+                log.warning("smart crop was requested but no camera "
+                            "accepted it — running the original single-"
+                            "stream pipeline (see the CameraManager lines "
+                            "above for the reason)")
 
         # ── Adopt the focal lengths derived from the REAL sensor mode ──
         # Still theoretical, but no longer dependent on an assumption
@@ -443,7 +474,15 @@ class CameraWorker:
         while not self._stop.is_set():
             frame_start = time.monotonic()
 
-            frame_raw, sensor_ns = self._manager.get_frame_and_sensor_ns()
+            # SMART CROP: `native_raw` is the same exposure at the sensor
+            # mode's resolution, or None — always None with crop mode off,
+            # where the original call below is the only capture.
+            if v.crop_mode:
+                frame_raw, native_raw, sensor_ns = \
+                    self._manager.get_frames_and_sensor_ns()
+            else:
+                frame_raw, sensor_ns = self._manager.get_frame_and_sensor_ns()
+                native_raw = None
             capture_done = time.monotonic()
             if frame_raw is None:
                 consecutive_failures += 1
@@ -525,6 +564,10 @@ class CameraWorker:
             frame_bgr = cv2.cvtColor(frame_raw, cv2.COLOR_RGB2BGR)
             detector_input = frame_bgr if v.swap_detector_channels else frame_raw
 
+            if native_raw is not None:
+                self._maybe_check_alignment(frame_camera, native_raw,
+                                            frame_raw)
+
             # ── Detection (duty-cycled exactly as before) ──
             detections: List[np.ndarray] = []
             scores: List[float] = []
@@ -535,6 +578,9 @@ class CameraWorker:
                                  or not has_confirmed))
 
             infer_ms: Optional[float] = None
+            # Diagnostics (VisualConfig.detection_log): filled by the
+            # detection step, written after tracking. None = not logging.
+            diag: Optional[dict] = None
             if run_detector:
                 t0 = time.monotonic()
                 # ── B. HAILO INVOCATION RATE, counted where it happens ──
@@ -553,15 +599,27 @@ class CameraWorker:
                         self._det_fps_ema = self._ema(self._det_fps_ema,
                                                       1.0 / gap)
                 self._last_detect_t = t0
+                diag = {} if v.detection_log else None
                 try:
-                    detections, scores = self._detector.predict_with_scores(
-                        detector_input)
+                    if native_raw is not None:
+                        # The full published frame exactly as below, PLUS
+                        # native windows, merged into published pixels.
+                        detections, scores = self._detect_with_crops(
+                            detector_input, native_raw, frame_raw, diag)
+                    else:
+                        detections, scores = \
+                            self._detector.predict_with_scores(detector_input)
+                        if diag is not None:
+                            diag["full"] = (list(detections), list(scores))
                 except Exception as exc:
                     self.events.rate("infer-error", logging.ERROR,
                                      "inference failed: %s", exc)
                     self._set_health(SubsystemState.DEGRADED,
                                      "inference errors", str(exc))
                     detections, scores = [], []
+                # With smart crop this is the WHOLE detection step — the
+                # full frame plus every window — because that, not a single
+                # forward pass, is what the loop waits for.
                 infer_ms = (time.monotonic() - t0) * 1000.0
                 self._infer_ema = (0.9 * self._infer_ema + 0.1 * infer_ms
                                    if self._infer_ema else infer_ms)
@@ -575,7 +633,10 @@ class CameraWorker:
                 # post-processing on the CPU" — two problems with opposite
                 # fixes, which a single aggregate timing cannot tell apart.
                 stages = getattr(self._detector, "stage_ms", None)
-                if stages:
+                # Smart crop records every forward pass itself (see
+                # _detect_with_crops); recording here as well would count
+                # the last window twice.
+                if stages and native_raw is None:
                     for stage, value in stages.items():
                         # None = the stage was skipped on this frame (NMS is,
                         # whenever nothing was detected). Skipped is not zero.
@@ -590,6 +651,10 @@ class CameraWorker:
             except Exception as exc:
                 self.events.rate("tracker-error", logging.ERROR,
                                  "tracker failed: %s", exc)
+
+            if diag is not None:
+                self._log_detection_run(frame_camera, infer_ms, diag,
+                                        detections, scores)
 
             # Everything that DESCRIBES this frame uses frame_camera: the
             # optics that produced the pixels are the optics the distances,
@@ -652,11 +717,11 @@ class CameraWorker:
                 "camera-heartbeat", logging.DEBUG,
                 "camera: sensor %.1f fps | loop %.1f fps | detector %.1f fps | "
                 "infer %.0f ms | frame age %.0f ms | capture wait %.1f ms | "
-                "%d track(s) | cam %d",
+                "%d track(s) | cam %d | crops %d",
                 self._sensor_fps_ema, self._fps_ema, self._det_fps_ema,
                 self._infer_ema, self._frame_age_ms_ema,
                 self._capture_wait_ms_ema, len(tracks), frame_camera,
-                interval=5.0)
+                len(self._last_crop_origins), interval=5.0)
 
     # ── Camera switch: discard the other camera's state ────────
 
@@ -726,6 +791,227 @@ class CameraWorker:
                  "ego-motion reference (optical flow must never cross two "
                  "different lenses)",
                  self._camera_name(new_camera), dropped)
+
+    # ── Smart crop ─────────────────────────────────────────────
+
+    def _detect_with_crops(self, full_input: np.ndarray,
+                           native_raw: np.ndarray, published_raw: np.ndarray,
+                           diag: Optional[dict] = None
+                           ) -> Tuple[List[np.ndarray], List[float]]:
+        """
+        One detector run in crop mode. Returns (boxes, scores) in PUBLISHED
+        pixels — the only pixel space the tracker, fusion and HUD know.
+
+          1. The full published frame, with exactly the call and the input
+             the original pipeline uses. Near targets are found as before.
+          2. Up to `crop_max_per_frame` native windows (smart_crop.CropPlanner)
+             — on small confirmed tracks first, then on small tracks that are
+             not confirmed (new, or just lost), then sweeping the frame —
+             each inferred 1:1 and mapped into published pixels.
+          3. All of it merged, so one drone seen at two resolutions is ONE
+             detection (smart_crop.merge_detections).
+
+        Every forward pass is recorded in the latency budget as it happens.
+        `diag`, when given, receives what each inference returned, for the
+        detection log.
+        """
+        import cv2
+        import TWO_CAMERAS_FIXED as tc
+
+        v = self.config.visual
+        detector = self._detector
+
+        def infer(image):
+            boxes, scores = detector.predict_with_scores(image)
+            for stage, value in (getattr(detector, "stage_ms", None)
+                                 or {}).items():
+                # None = the stage was skipped on this call. Skipped is not
+                # zero (see the note in _loop).
+                if value is not None:
+                    BUDGET.record("hailo_" + stage, float(value))
+            return boxes, scores
+
+        groups = [infer(full_input)]
+        if diag is not None:
+            diag["full"] = (list(groups[0][0]), list(groups[0][1]))
+            diag["crops"] = []
+
+        ph, pw = published_raw.shape[:2]
+        nh, nw = native_raw.shape[:2]
+        crop = int(min(getattr(detector, "input_shape", None) or (640, 640)))
+        scale = (nw / float(pw), nh / float(ph))
+
+        # Tracks as (cx, cy, w, h) in published px — the same state
+        # _collect_tracks() reads. Confirmed tracks keep a window first;
+        # tracks that are not confirmed — new (Tentative) or just lost
+        # (Lost) — come next, so the window that found a far target can
+        # look again at once and let the tracker confirm or re-acquire it
+        # (see smart_crop.CropPlanner for why the sweep alone cannot).
+        confirmed, candidates = [], []
+        for track in self._tracker.tracks:
+            if track.state == tc.TrackState.Confirmed:
+                bucket = confirmed
+            elif track.state in (tc.TrackState.Tentative,
+                                 tc.TrackState.Lost):
+                bucket = candidates
+            else:
+                continue
+            state = track.merged_x
+            if state is None or len(state) < 4 \
+                    or not np.all(np.isfinite(state[:4])):
+                continue
+            bucket.append(tuple(float(x) for x in state[:4]))
+
+        origins = self._crop_planner.plan(
+            (nw, nh), scale, crop, int(v.crop_max_per_frame), confirmed,
+            float(v.crop_track_below_px), candidate_boxes=candidates)
+        self._last_crop_origins = origins
+
+        for x0, y0 in origins:
+            window = native_raw[y0:y0 + crop, x0:x0 + crop]
+            # The same channel convention as the full-frame input above.
+            if v.swap_detector_channels:
+                window = cv2.cvtColor(window, cv2.COLOR_RGB2BGR)
+            boxes, scores = infer(window)
+            mapped = smart_crop.boxes_from_crop(
+                boxes, scores, (x0, y0), crop, (nw, nh), scale)
+            groups.append(mapped)
+            if diag is not None:
+                diag["crops"].append({"origin": (int(x0), int(y0)),
+                                      "boxes": list(mapped[0]),
+                                      "scores": list(mapped[1])})
+
+        return smart_crop.merge_detections(groups, v.detector_iou_threshold)
+
+    # ── Diagnostics: detection log ─────────────────────────────
+
+    def _open_detection_log(self) -> None:
+        """Open <logging.log_dir>/detections_<start>.jsonl, line-buffered."""
+        from pathlib import Path
+        try:
+            log_dir = (Path(__file__).resolve().parent
+                       / self.config.logging.log_dir)
+            log_dir.mkdir(parents=True, exist_ok=True)
+            path = log_dir / time.strftime("detections_%Y%m%d_%H%M%S.jsonl")
+            self._det_log = open(path, "a", encoding="utf-8", buffering=1)
+            log.info("detection log -> %s", path)
+        except OSError as exc:
+            self._det_log = None
+            self._det_log_failed = True
+            log.error("detection log could not be opened (%s) — "
+                      "diagnostics are OFF for this run", exc)
+
+    def _log_detection_run(self, camera_id: int, infer_ms: Optional[float],
+                           diag: dict, detections, scores) -> None:
+        """
+        One JSON line per detector run (VisualConfig.detection_log).
+
+        Boxes are [x, y, w, h, score] in PUBLISHED pixels. "full" is what the
+        full frame alone found, "crops" what each native window found (after
+        mapping and the inner-edge rule), "merged" what reached the tracker,
+        "tracks" every track after this run's association. Never raises: a
+        diagnostic must not stop the camera.
+        """
+        if self._det_log_failed:
+            return
+        try:
+            if self._det_log is None:
+                self._open_detection_log()
+                if self._det_log is None:
+                    return
+            import json
+
+            def boxes(bs, ss):
+                return [[round(float(x), 1) for x in b[:4]]
+                        + [round(float(s), 3)] for b, s in zip(bs, ss)]
+
+            tracks = []
+            for t in self._tracker.tracks:
+                state = t.merged_x
+                if state is None or len(state) < 4 \
+                        or not np.all(np.isfinite(state[:4])):
+                    continue
+                last = getattr(t, "last_detection_score", None)
+                tracks.append({
+                    "id": int(t.id), "state": str(t.state),
+                    "box": [round(float(x), 1) for x in state[:4]],
+                    "hits": int(getattr(t, "hits", 0)),
+                    "miss": int(getattr(t, "consecutive_misses", 0)),
+                    "score": None if last is None else round(float(last), 3)})
+
+            full = diag.get("full", ([], []))
+            record = {
+                "wall": round(time.time(), 3),
+                "t": round(time.monotonic(), 3),
+                "frame": int(self._frame_count),
+                "cam": self._camera_name(camera_id),
+                "mode": "crop" if "crops" in diag else "full",
+                "infer_ms": None if infer_ms is None else round(infer_ms, 1),
+                "full": boxes(*full),
+                "crops": [{"origin": list(c["origin"]),
+                           "dets": boxes(c["boxes"], c["scores"])}
+                          for c in diag.get("crops", [])],
+                "merged": boxes(detections, scores),
+                "tracks": tracks,
+            }
+            self._det_log.write(json.dumps(record, separators=(",", ":"))
+                                + "\n")
+        except Exception as exc:
+            self.events.rate("detection-log-error", logging.ERROR,
+                             "detection log write failed: %s", exc)
+
+    def _maybe_check_alignment(self, camera_id: int, native_raw: np.ndarray,
+                               published_raw: np.ndarray) -> None:
+        """
+        MEASURE, once per camera, that the published stream is a pure
+        downscale of the native one — the assumption every crop box rests
+        on (smart_crop.measure_stream_alignment).
+
+        Only the "lores" source needs it: "resize" is aligned by
+        construction. The first attempt waits for exposure to settle. An
+        INCONCLUSIVE scene (blank sky) is retried a few times and then
+        reported as NOT VERIFIED, never assumed fine.
+
+        ⚠️ A measured misalignment switches that camera to "resize". Knowingly
+        running on a stream whose boxes land off-target would be worse than
+        paying the CPU for a downscale that is correct by construction.
+        """
+        streams = getattr(self._manager, "crop_streams", {}).get(camera_id)
+        if not streams or streams.get("source") != "lores":
+            return
+        now_t = time.monotonic()
+        state = self._align_state.setdefault(
+            camera_id, {"done": False, "next": now_t + 3.0, "tries": 0})
+        if state["done"] or now_t < state["next"]:
+            return
+
+        result = smart_crop.measure_stream_alignment(native_raw,
+                                                     published_raw)
+        state["tries"] += 1
+        name = self._camera_name(camera_id)
+        if result.verdict == "ALIGNED":
+            state["done"] = True
+            log.info("smart crop %s: streams MEASURED aligned (%s)",
+                     name, result.detail)
+        elif result.verdict == "MISALIGNED":
+            state["done"] = True
+            streams["source"] = "resize"
+            log.warning("smart crop %s: streams MISALIGNED (%s) — crop boxes "
+                        "would land off-target, so this camera now builds "
+                        "its published frame by downscaling the native one "
+                        "(\"resize\", aligned by construction, costs CPU)",
+                        name, result.detail)
+        elif state["tries"] >= 6:
+            state["done"] = True
+            log.warning("smart crop %s: stream alignment NOT VERIFIED after "
+                        "%d attempts (%s). Point the camera at a textured "
+                        "scene and restart to measure it, or set "
+                        "visual.crop_published_source = \"resize\".",
+                        name, state["tries"], result.detail)
+        else:
+            state["next"] = now_t + 10.0
+            log.info("smart crop %s: alignment inconclusive (%s), retrying "
+                     "in 10 s", name, result.detail)
 
     # ── Track extraction ───────────────────────────────────────
 
@@ -827,6 +1113,12 @@ class CameraWorker:
     # ── Teardown ───────────────────────────────────────────────
 
     def _teardown(self) -> None:
+        if self._det_log is not None:
+            try:
+                self._det_log.close()
+            except OSError:
+                pass
+            self._det_log = None
         for name, obj in (("detector", self._detector),
                           ("cameras", self._manager)):
             if obj is None:

@@ -38,7 +38,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field, fields, asdict
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 CONFIG_PATH = Path(__file__).with_name("fusion_config.json")
 
@@ -316,6 +316,72 @@ class VisualConfig:
     # this integration cannot change detection quality. Set True only after
     # A/B testing both settings against a known drone. See report section 5.
     swap_detector_channels: bool = False
+
+    # ═══════════════════════════════════════════════════════════
+    #  SMART CROP — native-resolution windows for small (far) targets
+    # ═══════════════════════════════════════════════════════════
+    #
+    # [POLICY] OFF by default, and OFF reproduces the original pipeline
+    # EXACTLY: one frame_width x frame_height stream, one full-frame
+    # inference per detector run. Nothing below is read while this is False.
+    #
+    # When True, every camera delivers TWO views of the SAME exposure:
+    #
+    #   published  frame_width x frame_height, as today. The operator, the
+    #              HUD, the tracker, the fusion layer and the full-frame
+    #              ("near") inference keep using it — same pixel space, same
+    #              focal length, so nothing downstream changes meaning.
+    #   native     the sensor mode's own resolution. 640x640 windows are cut
+    #              from it 1:1 and given to the detector ("far" targets).
+    #
+    # Crop detections are mapped back into the published space, merged with
+    # the full-frame ones (NMS) and handed to the tracker in ONE call. See
+    # smart_crop.py.
+    crop_mode: bool = False
+
+    # [CALIBRATE] Sensor mode to pin, [width, height], e.g. [1332, 990].
+    # None = keep whichever mode libcamera picks for the published stream
+    # today, read back at start-up — so switching crop_mode on can never
+    # silently change the field of view. Set it only if the start-up log says
+    # the mode could not be read back on this picamera2 version; use the
+    # mode whose crop matches the ScalerCrop printed at start-up (see
+    # `rpicam-hello --list-cameras`).
+    crop_sensor_size: Optional[List[int]] = None
+
+    # [POLICY] Crop inferences per detector run, ON TOP of the full-frame one.
+    # Each crop is one more Hailo call. 0 = the new capture path with no
+    # crops at all: run it first to A/B the capture path on its own.
+    #
+    # ⚠️ With 1 and a small target being tracked, that crop follows the
+    # target and the sweep of the rest of the frame pauses until the target
+    # grows or is lost. 2 keeps one crop sweeping.
+    crop_max_per_frame: int = 1
+
+    # [POLICY — initial value, tune on the station] A confirmed track
+    # narrower than this, in PUBLISHED pixels, gets a crop centred on it.
+    # 24 px is 3 cells of the model's finest (stride-8) head on the
+    # full-frame input: below that the full frame carries little shape
+    # detail. It is a starting point, NOT a measured detection limit.
+    crop_track_below_px: float = 24.0
+
+    # [POLICY] Where the published frame comes from in crop mode:
+    #   "lores"   the ISP's second output — no CPU cost. Whether it lines up
+    #             pixel-for-pixel with the native stream cannot be known off
+    #             the hardware, so it is MEASURED at run time and logged.
+    #   "resize"  cv2.INTER_AREA from the native frame — aligned by
+    #             construction, but costs CPU on every frame.
+    # "lores" falls back to "resize" by itself if the camera refuses a
+    # second stream.
+    crop_published_source: str = "lores"
+
+    # [POLICY] DIAGNOSTICS for test flights. One JSON line per detector run
+    # — every box from the full frame and from each native window (published
+    # px + detector score), what reached the tracker, and every track's state
+    # afterwards — written to <logging.log_dir>/detections_<start>.jsonl.
+    # Off by default: a deployed station does not need it. Works with
+    # crop_mode on AND off, so the two can be compared on the same terms.
+    # About half a kilobyte per detector run.
+    detection_log: bool = False
 
 
 # ═══════════════════════════════════════════════════════════════
