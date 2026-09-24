@@ -2540,6 +2540,23 @@ def test_13_coordinate_chain():
     check("an unambiguous reading is not flagged",
           not select_azimuth([280., 281., 279., 280.])[2])
 
+    # ── ROOT CAUSE: a stale pair winning without a majority ──
+    #
+    # Обидва входи ВИМІРЯНІ на станції, не вигадані. Два промені, що
+    # тримають протухле значення, били два поодинокі промені на
+    # реальному джерелі — і проходили як надійний вимір, бо рівних
+    # груп не було і `ambiguous` не вмикався.
+    stale = [39.4, 72.1, 4.7, 4.7]
+    check("a 2-of-4 plurality is flagged, not passed off as firm",
+          select_azimuth(stale)[2])
+    check("the phantom pair's confidence is halved like a tie",
+          abs(select_azimuth(stale)[1] - 0.25) < 1e-9,
+          f"confidence {select_azimuth(stale)[1]:.2f}")
+    # Дублікат серед ЖИВИХ променів — норма (квантування DSP ~0.3°),
+    # тому більшість 3-з-4 мусить лишитись без прапорця.
+    check("a real 3-of-4 agreement is still unflagged",
+          not select_azimuth([59.0, 269.1, 269.7, 269.7])[2])
+
     # ── ROOT CAUSE: the tracker flipping a stable target ──
     tr = DOATracker()
     for i in range(5):
