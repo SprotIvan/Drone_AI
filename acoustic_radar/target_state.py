@@ -361,6 +361,16 @@ class VisualObservation:
     timestamp: float = field(default_factory=now)
     seq: int = 0
 
+    # ── What the OPERATOR sees (VisualConfig.operator_view = "wide") ──
+    #
+    # `frame`, `tracks` and `active_camera` above stay the DETECTION camera's
+    # (TELE) — the fusion layer, the cue and the range gate need its optics.
+    # When these are set, the HUD shows `display_frame` instead and draws every
+    # box through `display_map` = (ox, oy, k): display_x = ox + k * x.
+    display_frame: Optional[np.ndarray] = None    # BGR, WIDE camera
+    display_map: Optional[Tuple[float, float, float]] = None
+    display_name: Optional[str] = None
+
     @property
     def confirmed_tracks(self) -> List[VisualTrack]:
         return [t for t in self.tracks if t.confirmed]

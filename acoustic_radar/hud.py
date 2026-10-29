@@ -115,6 +115,20 @@ def _dot(img, centre, colour, r=4) -> None:
     cv2.circle(img, centre, r, colour, -1, cv2.LINE_AA)
 
 
+#: Outline of the TELE field of view on the operator's WIDE picture.
+C_TELE_FOV = (220, 200, 40)
+
+
+def _shown_frame(visual):
+    """The picture the operator sees: the WIDE view when the camera worker
+    supplies one (VisualConfig.operator_view = "wide"), else the frame."""
+    if visual is None:
+        return None
+    if visual.display_frame is not None:
+        return visual.display_frame
+    return visual.frame
+
+
 def _dashed_v(img, x: int, y0: int, y1: int, colour, dash: int = 9) -> None:
     """
     A dashed vertical edge.
@@ -257,8 +271,9 @@ class HUD:
         """Output size of the camera area, in display pixels."""
         scale = self.config.ui.display_scale or 1.0
         visual = target.visual
-        if visual is not None and visual.frame is not None:
-            fh, fw = visual.frame.shape[:2]
+        frame = _shown_frame(visual)
+        if frame is not None:
+            fh, fw = frame.shape[:2]
         else:
             fw = self.config.visual.frame_width
             fh = self.config.visual.frame_height
@@ -294,7 +309,7 @@ class HUD:
         visual = target.visual
 
         if visual is not None and visual.frame is not None:
-            frame = visual.frame
+            frame = _shown_frame(visual)
             if frame.shape[0] == h and frame.shape[1] == w:
                 # No scaling: copy the worker's frame straight in. The UI
                 # draws chrome on top, so it must never draw into the
@@ -393,8 +408,26 @@ class HUD:
                                        for t in draw_list):
             draw_list.append(primary)
 
+        # Operator's WIDE view: boxes are in TELE px, drawn through
+        # display_map; the TELE field of view is outlined so the operator
+        # sees which part of the picture the detector is looking at.
+        m = visual.display_map
+        if m is not None:
+            ox, oy, k = m
+            cv2.rectangle(canvas,
+                          (int(round(ox * scale)), int(round(oy * scale)) + y_offset),
+                          (int(round((ox + k * visual.frame_width) * scale)),
+                           int(round((oy + k * visual.frame_height) * scale))
+                           + y_offset), C_TELE_FOV, 1, cv2.LINE_AA)
+
         for track in draw_list:
             x, y, w, h = track.bbox
+            if m is not None:
+                # A box only a few px wide in WIDE is grown to stay visible;
+                # its centre is kept.
+                cx, cy = m[0] + m[2] * (x + w / 2.0), m[1] + m[2] * (y + h / 2.0)
+                w, h = max(10.0, m[2] * w), max(10.0, m[2] * h)
+                x, y = cx - w / 2.0, cy - h / 2.0
             x1 = int(round(x * scale))
             y1 = int(round(y * scale)) + y_offset
             x2 = int(round((x + w) * scale))
@@ -494,8 +527,12 @@ class HUD:
                   (x - 40 if side < 0 else x - 96, y + 26), 0.36, C_CUE)
             return
 
-        cx = int(round((cue.x_px or 0.0) * scale))
-        half = int(round((cue.half_width_px or 0.0) * scale))
+        x_px, half_px = (cue.x_px or 0.0), (cue.half_width_px or 0.0)
+        m = target.visual.display_map if target.visual is not None else None
+        if m is not None:               # cue is in TELE px; picture is WIDE
+            x_px, half_px = m[0] + m[2] * x_px, m[2] * half_px
+        cx = int(round(x_px * scale))
+        half = int(round(half_px * scale))
         top, bot = y_offset, y_offset + height
 
         # ── The search REGION ──
@@ -859,7 +896,7 @@ class HUD:
             x += _text(canvas, f"RNG {dist}", (x, row2), FS, C_TEXT) + 14
 
         if visual is not None:
-            cam_txt = f"CAM: {visual.camera_name}"
+            cam_txt = f"CAM: {visual.display_name or visual.camera_name}"
             (tw, _), _ = cv2.getTextSize(ascii_safe(cam_txt), FONT, FS, 1)
             _text(canvas, cam_txt, (width - tw - 8, row2), FS, C_WARN)
 

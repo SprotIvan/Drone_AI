@@ -42,10 +42,10 @@ from audio_io import open_stream, resolve_input  # noqa: E402
 from radar import (  # noqa: E402
     BLOCK_SAMPLES, CONFIRM_THRESHOLD, RadarEngine, RadarStatus, UartSender,
 )
-from telegram_alert import TelegramAlerter  # noqa: E402
+from telegram_alert import TelegramAlerter, load_token  # noqa: E402
 from audio_logger import AudioLogger  # noqa: E402
 
-TELEGRAM_TOKEN = "8875007303:AAGb8p-3-_h8qJaUFVAICO4I2sXSCpbTwOE"
+TELEGRAM_TOKEN = load_token()   # $TELEGRAM_TOKEN or telegram_config.json "token" (not in git)
 
 # Максимальна дальність шкали (метри)
 MAX_RANGE_M = 250.0

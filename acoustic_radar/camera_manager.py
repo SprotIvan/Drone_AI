@@ -1,3 +1,4 @@
+import threading
 import time
 
 import camera_identity
@@ -81,11 +82,25 @@ class CameraManager:
         expected_sensor_model=camera_identity.EXPECTED_SENSOR_MODEL,
         info_provider=None,
         lens_mm=None,
+        crop_mode=False,
+        crop_sensor_size=None,
+        crop_published_source="lores",
     ):
         #: role -> nominal lens focal length in mm, from GeometryConfig.
         #: Empty disables the runtime focal derivation below (the
         #: configured THEORETICAL default then stands unchanged).
         self.lens_mm = dict(lens_mm or {})
+
+        # SMART CROP (VisualConfig.crop_mode). Off = every camera is
+        # configured and read exactly as before. On = each camera ALSO
+        # delivers its sensor mode's native resolution; see
+        # _configure_crop_streams. `crop_streams` holds, per device index,
+        # the geometry that was actually accepted — a camera that refused
+        # crop mode is simply absent and keeps the original single stream.
+        self.crop_mode = bool(crop_mode)
+        self.crop_sensor_size = crop_sensor_size
+        self.crop_published_source = crop_published_source
+        self.crop_streams = {}
         self._role_hints = dict(role_hints or {})
         self._expected_sensor_model = expected_sensor_model
 
@@ -128,6 +143,10 @@ class CameraManager:
         self.active_camera = None
         self.last_switch_time = 0.0
         self.picams = {}
+        # Held while the ACTIVE camera changes and while get_published_frame()
+        # reads a non-active one, so that a second thread (the operator's WIDE
+        # view) can never be reading the camera the frame loop just switched to.
+        self._side_lock = threading.Lock()
 
         #: role -> horizontal focal length in pixels of the delivered frame,
         #: recomputed from each sensor's ACTUAL crop once it is running.
@@ -248,6 +267,14 @@ class CameraManager:
 
         picam.configure(config)
 
+        # SMART CROP: re-configure the SAME sensor mode with a native main
+        # stream plus a published-size second stream. Skipped entirely with
+        # crop mode off, so the camera then runs exactly the configuration
+        # above.
+        if self.crop_mode:
+            self._configure_crop_streams(camera_id, picam, config,
+                                         (fastest_us, slowest_us))
+
         picam.start()
 
         # AUDIT BUG #6 fix (unchanged from session 2): log warmup failures
@@ -274,12 +301,233 @@ class CameraManager:
         # _derive_focal_px() for each open camera immediately afterwards.
         self.picams[camera_id] = picam
 
+    # ── Smart crop: configuration ──────────────────────────────
+
+    @staticmethod
+    def _sensor_mode_of(picam):
+        """(output_size, bit_depth) of the sensor mode libcamera chose, or
+        (None, None) when this picamera2 does not report it."""
+        try:
+            sensor = picam.camera_configuration()["sensor"]
+            size = sensor["output_size"]
+            size = (int(size[0]), int(size[1]))
+        except Exception:
+            return None, None
+        try:
+            depth = int(sensor["bit_depth"])
+        except Exception:
+            depth = None
+        return size, depth
+
+    @staticmethod
+    def _stream_size(picam, stream):
+        """Size of `stream` as libcamera actually configured it, or None."""
+        try:
+            size = picam.camera_configuration()[stream]["size"]
+            return (int(size[0]), int(size[1]))
+        except Exception:
+            return None
+
+    def _configure_crop_streams(self, camera_id, picam, base_config,
+                                frame_limits):
+        """
+        SMART CROP: two streams from ONE exposure, in the SAME sensor mode.
+
+          main   the sensor mode's native resolution (aspect-matched to the
+                 published stream, see smart_crop.native_stream_size). The
+                 detector's 640x640 windows are cut from it 1:1.
+          lores  width x height — exactly the frame published today. The
+                 operator, the HUD, the tracker and the full-frame inference
+                 keep using it.
+
+        ⚠️ THE SENSOR MODE IS PINNED to the one libcamera chose for the
+        original single-stream configuration, which has just been applied.
+        Asking for a larger main stream would otherwise let libcamera pick a
+        different mode — possibly one with a different crop, i.e. a
+        different field of view — and every focal length, boresight and
+        range gate on this station would silently stop describing the
+        picture. `crop_sensor_size` replaces the read-back only when this
+        picamera2 cannot report the mode.
+
+        Never raises for a crop problem: any refusal restores `base_config`
+        (the original configuration) and leaves crop mode off for this
+        camera, and says so.
+        """
+        import smart_crop
+
+        read_size, read_depth = self._sensor_mode_of(picam)
+        sensor_size, bit_depth = read_size, read_depth
+        if self.crop_sensor_size:
+            pinned = (int(self.crop_sensor_size[0]),
+                      int(self.crop_sensor_size[1]))
+            if read_size is not None and pinned != read_size:
+                print(f"[CameraManager] crop mode, camera {camera_id}: "
+                      f"crop_sensor_size {pinned} differs from the mode in "
+                      f"use without crop mode {read_size} — the FIELD OF "
+                      f"VIEW may differ from the non-crop configuration.")
+                bit_depth = None
+            sensor_size = pinned
+        if sensor_size is None:
+            print(f"[CameraManager] crop mode DISABLED on camera {camera_id}: "
+                  f"this picamera2 does not report the sensor mode, so the "
+                  f"native stream cannot be pinned to the current field of "
+                  f"view. Set visual.crop_sensor_size to the mode whose crop "
+                  f"matches the ScalerCrop printed at start-up "
+                  f"(`rpicam-hello --list-cameras`).")
+            return
+
+        published = (int(self.width), int(self.height))
+        native = smart_crop.native_stream_size(sensor_size, published)
+        sensor = {"output_size": tuple(sensor_size)}
+        if bit_depth:
+            sensor["bit_depth"] = int(bit_depth)
+
+        sources = (["lores"] if self.crop_published_source == "lores"
+                   else []) + ["resize"]
+        for source in sources:
+            kwargs = dict(
+                main={"size": native, "format": "RGB888"},
+                buffer_count=self.buffer_count,
+                controls={"FrameDurationLimits": tuple(frame_limits)},
+                sensor=sensor)
+            if source == "lores":
+                kwargs["lores"] = {"size": published, "format": "RGB888"}
+            try:
+                picam.configure(picam.create_video_configuration(**kwargs))
+            except Exception as exc:
+                print(f"[CameraManager] crop mode, camera {camera_id}: the "
+                      f"'{source}' configuration was refused ({exc})")
+                continue
+
+            main_size = self._stream_size(picam, "main") or native
+            if source == "lores":
+                lores_size = self._stream_size(picam, "lores") or published
+                if lores_size != published:
+                    # A published frame of another size would change the
+                    # pixel space everything downstream works in.
+                    print(f"[CameraManager] crop mode, camera {camera_id}: "
+                          f"libcamera adjusted the second stream to "
+                          f"{lores_size}, not {published} — not used.")
+                    continue
+            self.crop_streams[camera_id] = {
+                "native": main_size,
+                "published": published,
+                "source": source,
+                "sensor": tuple(sensor_size),
+            }
+            print(f"[CameraManager] crop mode ON, camera {camera_id}: sensor "
+                  f"mode {tuple(sensor_size)}, native {main_size} -> "
+                  f"published {published} via {source}")
+            return
+
+        # Nothing was accepted: back to exactly the original configuration.
+        picam.configure(base_config)
+        print(f"[CameraManager] crop mode DISABLED on camera {camera_id}: no "
+              f"crop configuration was accepted; the original single-stream "
+              f"configuration is in use.")
+
+    # ── Smart crop: capture ────────────────────────────────────
+
+    @staticmethod
+    def _downscale(native, size):
+        import cv2
+        return cv2.resize(native, (int(size[0]), int(size[1])),
+                          interpolation=cv2.INTER_AREA)
+
+    def _read_streams(self, picam, streams):
+        """(published, native, metadata), both frames from ONE request."""
+        request = picam.capture_request()
+        try:
+            native = request.make_array("main")
+            published = (request.make_array("lores")
+                         if streams["source"] == "lores" else None)
+            metadata = request.get_metadata() or {}
+        finally:
+            # Not optional — see get_frame_and_sensor_ns().
+            request.release()
+        if published is None:
+            published = self._downscale(native, streams["published"])
+        return published, native, metadata
+
+    def get_frames_and_sensor_ns(self):
+        """
+        (published, native, sensor_timestamp_ns).
+
+        `published` is the frame everything downstream uses, exactly as
+        get_frame_and_sensor_ns() returns it. `native` is the SAME exposure at
+        the sensor mode's resolution — or None when crop mode is not active
+        on the active camera, in which case this is the original capture.
+        """
+        streams = getattr(self, "crop_streams", {}).get(self.active_camera)
+        if streams is None:
+            frame, sensor_ns = self.get_frame_and_sensor_ns()
+            return frame, None, sensor_ns
+        return self._get_crop_frames(streams)
+
+    def _get_crop_frames(self, streams):
+        """Crop-mode capture, with get_frame_and_sensor_ns()'s failure
+        handling: None frames and a counted failure, never a raise."""
+        picam = self.picams.get(self.active_camera)
+        if picam is None:
+            self._handle_capture_failure(
+                f"active camera {self.active_camera} is not open")
+            return None, None, None
+
+        published = native = None
+        metadata = {}
+        try:
+            if getattr(self, "_request_capture_ok", True):
+                try:
+                    published, native, metadata = self._read_streams(
+                        picam, streams)
+                except Exception as exc:
+                    self._request_capture_ok = False
+                    published = native = None
+                    print(f"[CameraManager] capture_request() unavailable "
+                          f"({exc}) — crop mode falls back to "
+                          f"capture_arrays().")
+            if native is None:
+                names = (["main", "lores"] if streams["source"] == "lores"
+                         else ["main"])
+                arrays, metadata = picam.capture_arrays(names)
+                native = arrays[0]
+                published = (arrays[1] if streams["source"] == "lores"
+                             else self._downscale(native,
+                                                  streams["published"]))
+        except Exception as exc:
+            self._handle_capture_failure(
+                f"capture failed on camera {self.active_camera}: {exc}")
+            return None, None, None
+
+        if published is None or native is None:
+            self._handle_capture_failure(
+                f"camera {self.active_camera} returned no frame")
+            return None, None, None
+
+        ts = metadata.get("SensorTimestamp") if isinstance(metadata, dict) \
+            else None
+        sensor_ns = int(ts) if ts is not None else None
+        if getattr(self, "_sensor_ts_supported", False) is None:
+            self._sensor_ts_supported = sensor_ns is not None
+            if not self._sensor_ts_supported:
+                print("[CameraManager] the driver does not report "
+                      "SensorTimestamp — real capture rate and frame "
+                      "age cannot be measured on this system.")
+        self.consecutive_capture_failures = 0
+        self.total_frames += 1
+        return published, native, sensor_ns
+
     def _probe_frame(self, camera_id):
         """One frame for the optical role check, or None."""
         picam = self.picams.get(camera_id)
         if picam is None:
             return None
         try:
+            streams = getattr(self, "crop_streams", {}).get(camera_id)
+            if streams is not None:
+                # The published view: exactly the frame the role check
+                # compares without crop mode.
+                return self._read_streams(picam, streams)[0]
             return picam.capture_array()
         except Exception as exc:
             print(f"[CameraManager] could not grab a probe frame from "
@@ -438,7 +686,13 @@ class CameraManager:
             # ScalerCrop is (x, y, w, h) in full-pixel-array coordinates:
             # exactly the sensor region the ISP sampled for this stream.
             crop_w = int(metadata["ScalerCrop"][2])
-            out_w = int(picam.camera_configuration()["main"]["size"][0])
+            # In crop mode "main" is the NATIVE stream; boxes, the tracker
+            # and the fusion layer all live in the PUBLISHED frame, so that
+            # is the width the focal length must describe — which keeps it
+            # identical to the value without crop mode.
+            streams = getattr(self, "crop_streams", {}).get(camera_id)
+            out_w = (int(streams["published"][0]) if streams is not None
+                     else int(picam.camera_configuration()["main"]["size"][0]))
         except Exception as exc:
             print(f"[CameraManager] could not read the sensor crop for "
                   f"{role} ({exc}) — keeping the configured THEORETICAL "
@@ -517,6 +771,15 @@ class CameraManager:
         compare it against time.clock_gettime(CLOCK_BOOTTIME) and not against
         time.monotonic(). See camera_worker._sensor_now_ns().
         """
+        # SMART CROP: in crop mode "main" is the NATIVE stream, so the body
+        # below would hand every caller of this single-frame API a frame of
+        # another size — another pixel space, silently. They get the
+        # published view instead, exactly as without crop mode.
+        streams = getattr(self, "crop_streams", {}).get(self.active_camera)
+        if streams is not None:
+            frame, _native, sensor_ns = self._get_crop_frames(streams)
+            return frame, sensor_ns
+
         picam = self.picams.get(self.active_camera)
         if picam is None:
             self._handle_capture_failure(
@@ -602,7 +865,7 @@ class CameraManager:
         print(f"[CameraManager] failing over from camera "
               f"{self.active_camera} to {target} after "
               f"{self.consecutive_capture_failures} consecutive failures.")
-        self.active_camera = target
+        self._set_active(target)
         self.last_switch_time = time.monotonic()
         self.consecutive_capture_failures = 0
 
@@ -653,9 +916,45 @@ class CameraManager:
         if time.monotonic() - self.last_switch_time < self.debounce_interval:
             return False
 
-        self.active_camera = target_id
+        self._set_active(target_id)
         self.last_switch_time = time.monotonic()
         return True
+
+    def _set_active(self, camera_id):
+        lock = getattr(self, "_side_lock", None)
+        if lock is None:
+            self.active_camera = camera_id
+            return
+        with lock:
+            self.active_camera = camera_id
+
+    def get_published_frame(self, camera_id):
+        """
+        The published-size frame of a camera that is NOT the active one,
+        without switching to it — the operator's WIDE picture while the
+        detector runs on TELE (VisualConfig.operator_view = "wide").
+
+        None while `camera_id` is the active camera (the frame loop owns it
+        then), when it is not open, or on any capture failure. Never raises
+        and never counts a failure: this view is a convenience, the active
+        camera's frames are the product.
+        """
+        lock = getattr(self, "_side_lock", None)
+        if lock is None:
+            return None
+        with lock:
+            if camera_id == self.active_camera:
+                return None
+            picam = self.picams.get(camera_id)
+            if picam is None:
+                return None
+            try:
+                streams = getattr(self, "crop_streams", {}).get(camera_id)
+                if streams is not None:
+                    return self._read_streams(picam, streams)[0]
+                return picam.capture_array()
+            except Exception:
+                return None
 
     def release(self):
         # Defensive: __del__ runs even on a PARTIALLY-constructed object,

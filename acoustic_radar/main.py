@@ -76,6 +76,7 @@ from latency import BUDGET  # noqa: E402
 from acoustic_worker import AcousticWorker  # noqa: E402
 from camera_cue import BearingProjector  # noqa: E402
 from camera_worker import CameraWorker  # noqa: E402
+from esp32_alarm import Esp32Alarm, alarm_for_target  # noqa: E402
 from hud import HUD  # noqa: E402
 from respeaker_led import RespeakerLed, frame_for_target  # noqa: E402
 from sensor_fusion import SensorFusion, SystemState  # noqa: E402
@@ -83,7 +84,7 @@ from station_logging import EventLogger  # noqa: E402
 from web_server import WebServer  # noqa: E402
 from target_state import SubsystemHealth, SubsystemState, now  # noqa: E402
 
-DEFAULT_HEF = str(BASE_DIR / "bestty_yolo260508.hef")
+DEFAULT_HEF = str(BASE_DIR / "bestty_yolo26_0928_1129_logits.hef")  # ft_v2 (back from ft_v3 on 30.09.2026: ft_v3 boxed cars and structures live); original: --hef bestty_yolo260508.hef
 
 log = logging.getLogger("station.main")
 
@@ -204,6 +205,12 @@ def print_banner(config: fusion_config.StationConfig, hef_path: str) -> None:
         log.info("  LED ring: %d LEDs, %d-LED target sector, zero at %.0f deg",
                  led.led_count, led.sector_leds, led.led_zero_offset_deg)
 
+    alarm = config.alarm
+    log.info("  ESP32 speaker: %s", "disabled" if not alarm.enabled else
+             f"port {alarm.port or 'auto (USB serial)'} @ {alarm.baud}, beeps "
+             f"on confirmed {'or unconfirmed ' if alarm.beep_on_unconfirmed_acoustic else ''}"
+             f"acoustic contact and on camera tracking")
+
     log.info("  HEF: %s", hef_path)
     log.info("-" * 62)
 
@@ -225,7 +232,8 @@ class Station:
                  events: EventLogger, headless: bool = False,
                  no_audio: bool = False, no_camera: bool = False,
                  no_led: bool = False,
-                 web: Optional["WebServer"] = None):
+                 web: Optional["WebServer"] = None,
+                 no_alarm: bool = False):
         self.config = config
         self.events = events
         self.headless = headless
@@ -251,6 +259,13 @@ class Station:
         if no_led:
             led_cfg = fusion_config.LedConfig(enabled=False)
         self.led = RespeakerLed(led_cfg)
+
+        # Speaker on an ESP32 (USB). Same contract as the ring: an indicator
+        # that can never block or crash the sensors it indicates.
+        alarm_cfg = config.alarm
+        if no_alarm:
+            alarm_cfg = fusion_config.AlarmConfig(enabled=False)
+        self.alarm = Esp32Alarm(alarm_cfg)
 
         self._disabled = SubsystemHealth(SubsystemState.DISABLED,
                                          "disabled on the command line")
@@ -289,6 +304,7 @@ class Station:
         # Started last and never waited on: the ring is an indicator, and
         # an indicator must not be able to delay the sensors it indicates.
         self.led.start()
+        self.alarm.start()
         if self.web is not None:
             self.web.set_status_provider(self._web_status)
 
@@ -303,6 +319,9 @@ class Station:
         # the process is still healthy. A ring left showing a red target
         # after the station exited would be actively misleading.
         self.led.stop(timeout=2.0)
+        # Same reason: a speaker still beeping after the station exited
+        # would be a false alarm. stop() sends "off" before closing.
+        self.alarm.stop(timeout=2.0)
         for worker in (self.camera, self.acoustic):
             if worker is not None:
                 worker.stop()
@@ -344,6 +363,9 @@ class Station:
                     self.camera.frame_age_ms)
         log.info("LED ring: %s, %d hardware writes",
                  self.led.status.value, self.led.writes)
+        log.info("%s, %d commands, switched on %d time(s)",
+                 self.alarm.status_text(), self.alarm.commands_sent,
+                 self.alarm.on_count)
         for line in BUDGET.report():
             log.info("%s", line)
         log.info("stopped.")
@@ -591,6 +613,7 @@ class Station:
                 # and submit() is a single publish into a one-slot mailbox
                 # (all device I/O happens on the LED worker thread).
                 self.led.submit(frame_for_target(target))
+                self.alarm.submit(alarm_for_target(target, self.alarm.cfg))
                 self.fusion_snapshot = target
 
                 if target.state is not last_state:
@@ -763,6 +786,8 @@ def main(argv: Optional[list] = None) -> int:
                         help="run without the camera subsystem")
     parser.add_argument("--no-led", action="store_true",
                         help="run without the ReSpeaker LED ring indicator")
+    parser.add_argument("--no-alarm", action="store_true",
+                        help="run without the ESP32 speaker")
     parser.add_argument("--web", action="store_true",
                         help="serve the station's display over HTTP as an "
                              "MJPEG stream (FastAPI + uvicorn). The web view "
@@ -818,7 +843,7 @@ def main(argv: Optional[list] = None) -> int:
     station = Station(config, args.hef, events, headless=args.headless,
                       no_audio=args.no_audio or args.inject_bearing is not None,
                       no_camera=args.no_camera, no_led=args.no_led,
-                      web=web)
+                      web=web, no_alarm=args.no_alarm)
     station.inject_bearing = args.inject_bearing
     if args.inject_bearing is not None:
         log.warning("TEST MODE: injecting a fixed canonical bearing of "

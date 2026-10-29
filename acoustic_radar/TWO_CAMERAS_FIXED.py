@@ -202,6 +202,22 @@ _MAX_ACCEL:        float = 300.0  # px/s²
 _MAX_OMEGA:        float = 4.0    # rad/s
 _EYE23 = np.eye(2, 3, dtype=np.float64)
 
+# Multiplier on the tracker's measurement noise Rb (AdvancedADASTracker._associate),
+# used for BOTH the gate and the update. 1.0 = the original Rb.
+#
+# ⚠️ 3.0 IS MEASURED, NOT GUESSED. The original Rb was only ever "consistent"
+# because the CTRV heading flip (see StableUKF.predict) blew the covariance up,
+# which made every gate huge. With the flip fixed and Rb x1, 39 % of real
+# drone continuations fell outside the 16.27 gate and tracks split MORE
+# (whole-tracker replay of the ft_v5 live log detections_20260920_025044,
+# 26 549 frames, 451 by-eye-labelled drone detections: confirmed on the drone
+# 45.5 % vs 57.2 % before the fix). Sweep x1/2/3/4/6/8: x3 puts the gate
+# statistic's median at 3.0 (chi-square 4 dof median = 3.36), confirmed on the
+# drone 57.9 %, mean track ids per drone chain 6.0 (was 6.2), predictions off
+# screen 3 (was 232), one-step error median 7.5 px / p90 29 px (was 18.2 / 345).
+# Tuned on ONE session — recheck on the next recorded flight.
+R_MEAS_SCALE:      float = 3.0
+
 
 
 def make_psd(P: np.ndarray, eps: float = 1e-11, max_eig: float = 1e8) -> np.ndarray:
@@ -573,10 +589,23 @@ class StableUKF:
         spf = self._predict_dynamics(sp, dt)
 
         if self.model_type == ModelType.CTRV:
-            s_phi = np.sum(self.w_m * np.sin(spf[:, 5]))
-            c_phi = np.sum(self.w_m * np.cos(spf[:, 5]))
+            # ⚠️ HEADING MEAN AS A WEIGHTED SUM OF SMALL DIFFERENCES, not as
+            # atan2(sum w*sin, sum w*cos). With alpha=1e-2 the centre weight
+            # is about -9999 against +714 for the others, so the weighted sum
+            # of unit vectors has length 1 - 2*w_i*(1 - cos(delta)), which goes
+            # NEGATIVE once the heading spread delta exceeds ~0.037 rad
+            # (P_phi > ~2 rad^2). atan2 of a negative-length vector is the
+            # heading turned 180 deg. That is exactly the state of every new
+            # track (P_phi starts at pi^2): measured on the ft_v5 live log
+            # (detections_20260920_025044), phi went -2.96 -> +0.18 in one
+            # predict, the CTRV position variance went 3.8 -> 5.3e7 px^2 within
+            # 3 sub-steps and the merged prediction landed 3200 px away.
+            # Differences from the central sigma point are small and the
+            # weights sum to 1, so their weighted sum is the unscented mean.
+            ref = spf[0, 5]
+            dphi = (spf[:, 5] - ref + np.pi) % (2.0 * np.pi) - np.pi
             x_pred = np.einsum('ij,i->j', spf, self.w_m)
-            x_pred[5] = wrap_angle(np.arctan2(s_phi, c_phi))
+            x_pred[5] = wrap_angle(ref + float(np.dot(self.w_m, dphi)))
         else:
             x_pred = np.einsum('ij,i->j', spf, self.w_m)
 
@@ -1087,7 +1116,7 @@ class AdvancedADASTracker:
             pbox     = np.array([pz[0]-pz[2]/2, pz[1]-pz[3]/2, pz[2], pz[3]])
             area     = max(100.0, pz[2]*pz[3])
             sa       = float(np.clip(np.sqrt(area)/20.0, 0.5, 2.0))
-            Rb       = np.diag([2.0*sa, 2.0*sa, 4.0*sa, 4.0*sa])
+            Rb       = np.diag([2.0*sa, 2.0*sa, 4.0*sa, 4.0*sa]) * R_MEAS_SCALE
             r_base_list[ti] = Rb
             S        = pc + Rb*t.r_scale
 

@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+
+# Android build output (phone_app)
+phone_app/.gradle/
+phone_app/build/
+phone_app/app/build/
+phone_app/local.properties
+*.apk
+
+# Hailo compile intermediates (large; the .hef is the result)
+*.har
+
+# secrets: Telegram bot token lives here (see acoustic_radar/telegram_config.example.json)
+acoustic_radar/telegram_config.json
+
+# station runtime output
+acoustic_radar/logs/
+acoustic_radar/detections/

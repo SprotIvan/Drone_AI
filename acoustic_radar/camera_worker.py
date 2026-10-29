@@ -40,6 +40,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
+import smart_crop
 from fusion_config import StationConfig
 from latency import BUDGET
 from station_logging import EventLogger
@@ -167,6 +168,87 @@ class CameraSwitchPolicy:
 #  Worker
 # ═══════════════════════════════════════════════════════════════
 
+class TeleInWide:
+    """
+    Where the TELE view sits inside the WIDE published frame — what lets the
+    operator watch WIDE while the detector works on TELE
+    (VisualConfig.operator_view = "wide").
+
+    Measured, not assumed: the TELE frame is shrunk by a range of ratios and
+    correlated (TM_CCOEFF_NORMED) against the whole WIDE frame, the same idea
+    as camera_identity._match_peaks. A result is adopted only when the peak is
+    strong AND unique — a flat sky or a repetitive wall is refused and the
+    previous rectangle stays. Until the first good match the rectangle comes
+    from the THEORETICAL focal lengths, centred (pointing offset unknown).
+    """
+
+    MIN_NCC = 0.5           # correlation of the winning alignment
+    MIN_PEAK_MARGIN = 0.15  # ... over the best alignment elsewhere
+
+    def __init__(self, fixed_rect: Optional[List[float]] = None):
+        self.rect: Optional[List[float]] = (
+            [float(c) for c in fixed_rect] if fixed_rect else None)
+        self.fixed = self.rect is not None
+        self.source = "configured" if self.fixed else "none"
+        self.ratio: Optional[float] = None
+
+    def set_theoretical(self, wide_size: Tuple[int, int],
+                        tele_size: Tuple[int, int],
+                        f_wide: Optional[float], f_tele: Optional[float]) -> None:
+        if self.rect is not None or not f_wide or not f_tele:
+            return
+        k = float(f_wide) / float(f_tele)
+        w, h = tele_size[0] * k, tele_size[1] * k
+        self.rect = [(wide_size[0] - w) / 2.0, (wide_size[1] - h) / 2.0, w, h]
+        self.source = "THEORETICAL (focal ratio, centred)"
+
+    def mapping(self, tele_width: int) -> Optional[Tuple[float, float, float]]:
+        """(ox, oy, k) with wide_xy = o + k * tele_xy, or None."""
+        if self.rect is None or tele_width <= 0:
+            return None
+        return (self.rect[0], self.rect[1], self.rect[2] / float(tele_width))
+
+    def measure(self, wide_bgr: np.ndarray, tele_bgr: np.ndarray) -> str:
+        """Try to (re)measure the rectangle; returns a line for the log."""
+        import cv2
+
+        gw = cv2.cvtColor(wide_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        gt = cv2.cvtColor(tele_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        th, tw = gt.shape[:2]
+        if self.ratio is None:
+            ratios = np.arange(2.5, 7.001, 0.05)
+        else:                                   # stay near the last good one
+            ratios = np.arange(self.ratio - 0.3, self.ratio + 0.3001, 0.05)
+        best = None
+        for r in ratios:
+            sw, sh = int(round(tw / r)), int(round(th / r))
+            if sw < 16 or sh < 16 or sw >= gw.shape[1] or sh >= gw.shape[0]:
+                continue
+            small = cv2.resize(gt, (sw, sh), interpolation=cv2.INTER_AREA)
+            if float(np.std(small)) < 1e-6:
+                return "TELE frame is flat - kept the previous rectangle"
+            res = cv2.matchTemplate(gw, small, cv2.TM_CCOEFF_NORMED)
+            res = np.nan_to_num(res, nan=0.0, posinf=0.0, neginf=0.0)
+            _, score, _, loc = cv2.minMaxLoc(res)
+            if best is None or score > best[0]:
+                best = (float(score), float(r), loc, sw, sh, res)
+        if best is None:
+            return "no ratio fits - kept the previous rectangle"
+        score, r, (bx, by), sw, sh, res = best
+        masked = res.copy()
+        masked[max(0, by - sh // 2):by + sh // 2 + 1,
+               max(0, bx - sw // 2):bx + sw // 2 + 1] = -1.0
+        runner = float(masked.max())
+        detail = (f"ratio {r:.2f}, rect [{bx}, {by}, {sw}, {sh}], "
+                  f"NCC {score:.2f} (elsewhere {runner:.2f})")
+        if score < self.MIN_NCC or score - runner < self.MIN_PEAK_MARGIN:
+            return f"match REFUSED ({detail}) - kept {self.source} rectangle"
+        self.rect = [float(bx), float(by), float(sw), float(sh)]
+        self.ratio = r
+        self.source = "measured"
+        return f"measured: {detail}"
+
+
 class CameraWorker:
     """
     Owns the cameras, the Hailo device and the tracker.
@@ -219,6 +301,29 @@ class CameraWorker:
             time, "CLOCK_BOOTTIME")
         # Requested from the UI thread, serviced on the camera thread.
         self._calibrate_request = threading.Event()
+
+        # ── Smart crop (VisualConfig.crop_mode) ──
+        # Where the native windows go, and what the last detector run used.
+        self._crop_planner = smart_crop.CropPlanner()
+        self._last_crop_origins: List[Tuple[int, int]] = []
+        # Per camera: the one-off stream-alignment measurement.
+        self._align_state: dict = {}
+        # VisualConfig.detection_log: the open .jsonl file, opened on the
+        # first detector run and closed at teardown.
+        self._det_log = None
+        self._det_log_failed = False
+        # VisualConfig.frame_record: created on the first detector run.
+        self._recorder = None
+        self._recorder_failed = False
+
+        # ── Operator's WIDE view (VisualConfig.operator_view = "wide") ──
+        # A second thread reads the WIDE camera (a capture waits ~one frame,
+        # 33 ms — too long for the detection loop); the loop pairs the newest
+        # WIDE frame with its own TELE tracks at publish time.
+        self._tele_in_wide = TeleInWide(config.visual.tele_in_wide_rect)
+        self._wide_latest: Optional[Tuple[float, np.ndarray]] = None
+        self._tele_latest: Optional[np.ndarray] = None
+        self._wide_thread: Optional[threading.Thread] = None
 
     # ── Lifecycle ──────────────────────────────────────────────
 
@@ -346,7 +451,26 @@ class CameraWorker:
             warmup_frames=v.warmup_frames,
             role_hints=geo.camera_role_id_hint,
             expected_sensor_model=geo.expected_sensor_model,
-            lens_mm=geo.lens_mm)
+            lens_mm=geo.lens_mm,
+            crop_mode=v.crop_mode,
+            crop_sensor_size=v.crop_sensor_size,
+            crop_published_source=v.crop_published_source)
+
+        if v.crop_mode:
+            streams = getattr(self._manager, "crop_streams", {})
+            if streams:
+                for cam, s in sorted(streams.items()):
+                    log.info("smart crop ON for %s: sensor mode %s, native "
+                             "%s -> published %s via %s, up to %d crop(s) "
+                             "per detector run",
+                             self._manager.role_for(cam), s["sensor"],
+                             s["native"], s["published"], s["source"],
+                             v.crop_max_per_frame)
+            else:
+                log.warning("smart crop was requested but no camera "
+                            "accepted it — running the original single-"
+                            "stream pipeline (see the CameraManager lines "
+                            "above for the reason)")
 
         # ── Adopt the focal lengths derived from the REAL sensor mode ──
         # Still theoretical, but no longer dependent on an assumption
@@ -389,6 +513,23 @@ class CameraWorker:
 
         self._tracker = tc.AdvancedADASTracker()
 
+        if str(v.operator_view).lower() == "wide":
+            wide_id = getattr(self._manager, "wide_id", None)
+            if wide_id is None or wide_id not in opened or len(opened) < 2:
+                log.warning("operator_view 'wide' needs both cameras open - "
+                            "showing the active camera instead")
+            else:
+                size = (v.frame_width, v.frame_height)
+                self._tele_in_wide.set_theoretical(
+                    size, size, geo.camera_focal_px_by_role.get("WIDE"),
+                    geo.camera_focal_px_by_role.get("TELE"))
+                log.info("operator view: WIDE picture, detection on the active "
+                         "camera; TELE-in-WIDE rectangle %s (%s)",
+                         self._tele_in_wide.rect, self._tele_in_wide.source)
+                self._wide_thread = threading.Thread(
+                    target=self._wide_view_loop, name="wide-view", daemon=True)
+                self._wide_thread.start()
+
         detail = (f"{len(opened)} camera(s)"
                   + ("" if self._detector_available else ", NO DETECTOR"))
         self._set_health(
@@ -425,6 +566,63 @@ class CameraWorker:
             return None
         return int(time.clock_gettime(time.CLOCK_BOOTTIME) * 1e9)
 
+    # ── Operator's WIDE view ───────────────────────────────────
+
+    def _wide_view_loop(self) -> None:
+        """
+        Thread body: keep the newest WIDE frame for the operator and re-measure
+        where TELE sits inside it. Idle while WIDE is itself the active camera
+        (the frame loop owns it then and the operator sees it directly).
+        """
+        import cv2
+
+        v = self.config.visual
+        last_measure: Optional[float] = None
+        while not self._stop.is_set():
+            mgr = self._manager
+            wide_id = getattr(mgr, "wide_id", None)
+            if mgr is None or wide_id is None \
+                    or mgr.get_active_camera() == wide_id:
+                time.sleep(0.05)
+                continue
+            raw = mgr.get_published_frame(wide_id)
+            if raw is None:
+                time.sleep(0.05)
+                continue
+            # Same colour handling as the active camera's display copy.
+            wide_bgr = cv2.cvtColor(raw, cv2.COLOR_RGB2BGR)
+            self._wide_latest = (time.monotonic(), wide_bgr)
+
+            tele = self._tele_latest
+            if (not self._tele_in_wide.fixed and tele is not None
+                    and (last_measure is None or time.monotonic() - last_measure
+                         >= float(v.tele_in_wide_remeasure_s))):
+                last_measure = time.monotonic()
+                try:
+                    line = self._tele_in_wide.measure(wide_bgr, tele)
+                except Exception as exc:
+                    line = f"measurement failed: {exc}"
+                log.info("TELE-in-WIDE %s", line)
+
+    def _display_fields(self, frame_camera: int, frame_bgr: np.ndarray):
+        """(display_frame, display_map, display_name) for the observation."""
+        if str(self.config.visual.operator_view).lower() != "wide" \
+                or self._wide_thread is None:
+            return None, None, None
+        if frame_camera == getattr(self._manager, "wide_id", None):
+            return None, None, None             # detecting on WIDE already
+        latest = self._wide_latest
+        if latest is None or time.monotonic() - latest[0] > 0.5:
+            return None, None, None             # no fresh WIDE frame
+        mapping = self._tele_in_wide.mapping(frame_bgr.shape[1])
+        if mapping is None:
+            return None, None, None
+        name = (f"{self._manager.role_for(getattr(self._manager, 'wide_id', 0))}"
+                f" view / detect {self._camera_name(frame_camera)}")
+        if self._tele_in_wide.source != "measured" and not self._tele_in_wide.fixed:
+            name += " (TELE box NOT measured)"
+        return latest[1], mapping, name
+
     # ── Main loop ──────────────────────────────────────────────
 
     def _loop(self) -> None:
@@ -443,7 +641,15 @@ class CameraWorker:
         while not self._stop.is_set():
             frame_start = time.monotonic()
 
-            frame_raw, sensor_ns = self._manager.get_frame_and_sensor_ns()
+            # SMART CROP: `native_raw` is the same exposure at the sensor
+            # mode's resolution, or None — always None with crop mode off,
+            # where the original call below is the only capture.
+            if v.crop_mode:
+                frame_raw, native_raw, sensor_ns = \
+                    self._manager.get_frames_and_sensor_ns()
+            else:
+                frame_raw, sensor_ns = self._manager.get_frame_and_sensor_ns()
+                native_raw = None
             capture_done = time.monotonic()
             if frame_raw is None:
                 consecutive_failures += 1
@@ -524,6 +730,13 @@ class CameraWorker:
             # not "fixed" here without a measurement to justify it.
             frame_bgr = cv2.cvtColor(frame_raw, cv2.COLOR_RGB2BGR)
             detector_input = frame_bgr if v.swap_detector_channels else frame_raw
+            if self._wide_thread is not None and \
+                    frame_camera == getattr(self._manager, "tele_id", None):
+                self._tele_latest = frame_bgr   # for the TELE-in-WIDE match
+
+            if native_raw is not None:
+                self._maybe_check_alignment(frame_camera, native_raw,
+                                            frame_raw)
 
             # ── Detection (duty-cycled exactly as before) ──
             detections: List[np.ndarray] = []
@@ -535,6 +748,9 @@ class CameraWorker:
                                  or not has_confirmed))
 
             infer_ms: Optional[float] = None
+            # Diagnostics (VisualConfig.detection_log): filled by the
+            # detection step, written after tracking. None = not logging.
+            diag: Optional[dict] = None
             if run_detector:
                 t0 = time.monotonic()
                 # ── B. HAILO INVOCATION RATE, counted where it happens ──
@@ -553,15 +769,27 @@ class CameraWorker:
                         self._det_fps_ema = self._ema(self._det_fps_ema,
                                                       1.0 / gap)
                 self._last_detect_t = t0
+                diag = {} if v.detection_log else None
                 try:
-                    detections, scores = self._detector.predict_with_scores(
-                        detector_input)
+                    if native_raw is not None:
+                        # The full published frame exactly as below, PLUS
+                        # native windows, merged into published pixels.
+                        detections, scores = self._detect_with_crops(
+                            detector_input, native_raw, frame_raw, diag)
+                    else:
+                        detections, scores = \
+                            self._detector.predict_with_scores(detector_input)
+                        if diag is not None:
+                            diag["full"] = (list(detections), list(scores))
                 except Exception as exc:
                     self.events.rate("infer-error", logging.ERROR,
                                      "inference failed: %s", exc)
                     self._set_health(SubsystemState.DEGRADED,
                                      "inference errors", str(exc))
                     detections, scores = [], []
+                # With smart crop this is the WHOLE detection step — the
+                # full frame plus every window — because that, not a single
+                # forward pass, is what the loop waits for.
                 infer_ms = (time.monotonic() - t0) * 1000.0
                 self._infer_ema = (0.9 * self._infer_ema + 0.1 * infer_ms
                                    if self._infer_ema else infer_ms)
@@ -575,7 +803,10 @@ class CameraWorker:
                 # post-processing on the CPU" — two problems with opposite
                 # fixes, which a single aggregate timing cannot tell apart.
                 stages = getattr(self._detector, "stage_ms", None)
-                if stages:
+                # Smart crop records every forward pass itself (see
+                # _detect_with_crops); recording here as well would count
+                # the last window twice.
+                if stages and native_raw is None:
                     for stage, value in stages.items():
                         # None = the stage was skipped on this frame (NMS is,
                         # whenever nothing was detected). Skipped is not zero.
@@ -590,6 +821,15 @@ class CameraWorker:
             except Exception as exc:
                 self.events.rate("tracker-error", logging.ERROR,
                                  "tracker failed: %s", exc)
+
+            if diag is not None:
+                self._log_detection_run(frame_camera, infer_ms, diag,
+                                        detections, scores)
+            # Frames are offered only when the detector ran, so an empty box
+            # list in frames.jsonl always means "the detector saw nothing".
+            if v.frame_record and run_detector:
+                self._record_frame(frame_camera, frame_raw, native_raw,
+                                   detections, scores)
 
             # Everything that DESCRIBES this frame uses frame_camera: the
             # optics that produced the pixels are the optics the distances,
@@ -626,6 +866,8 @@ class CameraWorker:
             last_time = frame_start
 
             self._seq += 1
+            display_frame, display_map, display_name = self._display_fields(
+                frame_camera, frame_bgr)
             self.latest.publish(VisualObservation(
                 frame=frame_bgr,
                 frame_width=frame_bgr.shape[1],
@@ -646,17 +888,20 @@ class CameraWorker:
                               if self._last_sensor_ns is not None else None),
                 capture_wait_ms=self._capture_wait_ms_ema,
                 timestamp=now(),
-                seq=self._seq))
+                seq=self._seq,
+                display_frame=display_frame,
+                display_map=display_map,
+                display_name=display_name))
 
             self.events.rate(
                 "camera-heartbeat", logging.DEBUG,
                 "camera: sensor %.1f fps | loop %.1f fps | detector %.1f fps | "
                 "infer %.0f ms | frame age %.0f ms | capture wait %.1f ms | "
-                "%d track(s) | cam %d",
+                "%d track(s) | cam %d | crops %d",
                 self._sensor_fps_ema, self._fps_ema, self._det_fps_ema,
                 self._infer_ema, self._frame_age_ms_ema,
                 self._capture_wait_ms_ema, len(tracks), frame_camera,
-                interval=5.0)
+                len(self._last_crop_origins), interval=5.0)
 
     # ── Camera switch: discard the other camera's state ────────
 
@@ -726,6 +971,257 @@ class CameraWorker:
                  "ego-motion reference (optical flow must never cross two "
                  "different lenses)",
                  self._camera_name(new_camera), dropped)
+
+    # ── Smart crop ─────────────────────────────────────────────
+
+    def _detect_with_crops(self, full_input: np.ndarray,
+                           native_raw: np.ndarray, published_raw: np.ndarray,
+                           diag: Optional[dict] = None
+                           ) -> Tuple[List[np.ndarray], List[float]]:
+        """
+        One detector run in crop mode. Returns (boxes, scores) in PUBLISHED
+        pixels — the only pixel space the tracker, fusion and HUD know.
+
+          1. The full published frame, with exactly the call and the input
+             the original pipeline uses. Near targets are found as before.
+          2. Up to `crop_max_per_frame` native windows (smart_crop.CropPlanner)
+             — on small confirmed tracks first, then on small tracks that are
+             not confirmed (new, or just lost), then sweeping the frame —
+             each inferred 1:1 and mapped into published pixels.
+          3. All of it merged, so one drone seen at two resolutions is ONE
+             detection (smart_crop.merge_detections).
+
+        Every forward pass is recorded in the latency budget as it happens.
+        `diag`, when given, receives what each inference returned, for the
+        detection log.
+        """
+        import cv2
+        import TWO_CAMERAS_FIXED as tc
+
+        v = self.config.visual
+        detector = self._detector
+
+        def infer(image):
+            boxes, scores = detector.predict_with_scores(image)
+            for stage, value in (getattr(detector, "stage_ms", None)
+                                 or {}).items():
+                # None = the stage was skipped on this call. Skipped is not
+                # zero (see the note in _loop).
+                if value is not None:
+                    BUDGET.record("hailo_" + stage, float(value))
+            return boxes, scores
+
+        groups = [infer(full_input)]
+        if diag is not None:
+            diag["full"] = (list(groups[0][0]), list(groups[0][1]))
+            diag["crops"] = []
+
+        ph, pw = published_raw.shape[:2]
+        nh, nw = native_raw.shape[:2]
+        crop = int(min(getattr(detector, "input_shape", None) or (640, 640)))
+        scale = (nw / float(pw), nh / float(ph))
+
+        # Tracks as (cx, cy, w, h) in published px — the same state
+        # _collect_tracks() reads. Confirmed tracks keep a window first;
+        # tracks that are not confirmed — new (Tentative) or just lost
+        # (Lost) — come next, so the window that found a far target can
+        # look again at once and let the tracker confirm or re-acquire it
+        # (see smart_crop.CropPlanner for why the sweep alone cannot).
+        confirmed, candidates = [], []
+        for track in self._tracker.tracks:
+            if track.state == tc.TrackState.Confirmed:
+                bucket = confirmed
+            elif track.state in (tc.TrackState.Tentative,
+                                 tc.TrackState.Lost):
+                bucket = candidates
+            else:
+                continue
+            state = track.merged_x
+            if state is None or len(state) < 4 \
+                    or not np.all(np.isfinite(state[:4])):
+                continue
+            bucket.append(tuple(float(x) for x in state[:4]))
+
+        origins = self._crop_planner.plan(
+            (nw, nh), scale, crop, int(v.crop_max_per_frame), confirmed,
+            float(v.crop_track_below_px), candidate_boxes=candidates)
+        self._last_crop_origins = origins
+
+        for x0, y0 in origins:
+            window = native_raw[y0:y0 + crop, x0:x0 + crop]
+            # The same channel convention as the full-frame input above.
+            if v.swap_detector_channels:
+                window = cv2.cvtColor(window, cv2.COLOR_RGB2BGR)
+            boxes, scores = infer(window)
+            mapped = smart_crop.boxes_from_crop(
+                boxes, scores, (x0, y0), crop, (nw, nh), scale)
+            groups.append(mapped)
+            if diag is not None:
+                diag["crops"].append({"origin": (int(x0), int(y0)),
+                                      "boxes": list(mapped[0]),
+                                      "scores": list(mapped[1])})
+
+        return smart_crop.merge_detections(groups, v.detector_iou_threshold)
+
+    # ── Data collection: frame recorder ────────────────────────
+
+    def _record_frame(self, camera_id: int, frame_raw: np.ndarray,
+                      native_raw: Optional[np.ndarray], detections,
+                      scores) -> None:
+        """VisualConfig.frame_record — see frame_recorder.py. Never raises."""
+        if self._recorder_failed:
+            return
+        try:
+            if self._recorder is None:
+                from pathlib import Path
+
+                from frame_recorder import FrameRecorder
+                v = self.config.visual
+                out = (Path(__file__).resolve().parent
+                       / self.config.logging.log_dir
+                       / time.strftime("frames_%Y%m%d_%H%M%S"))
+                self._recorder = FrameRecorder(
+                    out, every_s=v.frame_record_every_s,
+                    min_gap_s=v.frame_record_min_gap_s)
+                log.info("frame recorder -> %s (every %.1f s + on detections)",
+                         out, v.frame_record_every_s)
+            boxes = [list(map(float, b[:4])) + [float(s)]
+                     for b, s in zip(detections, scores)]
+            self._recorder.offer(time.time(), self._camera_name(camera_id),
+                                 frame_raw, native_raw, boxes)
+        except Exception as exc:
+            self._recorder_failed = True
+            log.error("frame recorder disabled for this run: %s", exc)
+
+    # ── Diagnostics: detection log ─────────────────────────────
+
+    def _open_detection_log(self) -> None:
+        """Open <logging.log_dir>/detections_<start>.jsonl, line-buffered."""
+        from pathlib import Path
+        try:
+            log_dir = (Path(__file__).resolve().parent
+                       / self.config.logging.log_dir)
+            log_dir.mkdir(parents=True, exist_ok=True)
+            path = log_dir / time.strftime("detections_%Y%m%d_%H%M%S.jsonl")
+            self._det_log = open(path, "a", encoding="utf-8", buffering=1)
+            log.info("detection log -> %s", path)
+        except OSError as exc:
+            self._det_log = None
+            self._det_log_failed = True
+            log.error("detection log could not be opened (%s) — "
+                      "diagnostics are OFF for this run", exc)
+
+    def _log_detection_run(self, camera_id: int, infer_ms: Optional[float],
+                           diag: dict, detections, scores) -> None:
+        """
+        One JSON line per detector run (VisualConfig.detection_log).
+
+        Boxes are [x, y, w, h, score] in PUBLISHED pixels. "full" is what the
+        full frame alone found, "crops" what each native window found (after
+        mapping and the inner-edge rule), "merged" what reached the tracker,
+        "tracks" every track after this run's association. Never raises: a
+        diagnostic must not stop the camera.
+        """
+        if self._det_log_failed:
+            return
+        try:
+            if self._det_log is None:
+                self._open_detection_log()
+                if self._det_log is None:
+                    return
+            import json
+
+            def boxes(bs, ss):
+                return [[round(float(x), 1) for x in b[:4]]
+                        + [round(float(s), 3)] for b, s in zip(bs, ss)]
+
+            tracks = []
+            for t in self._tracker.tracks:
+                state = t.merged_x
+                if state is None or len(state) < 4 \
+                        or not np.all(np.isfinite(state[:4])):
+                    continue
+                last = getattr(t, "last_detection_score", None)
+                tracks.append({
+                    "id": int(t.id), "state": str(t.state),
+                    "box": [round(float(x), 1) for x in state[:4]],
+                    "hits": int(getattr(t, "hits", 0)),
+                    "miss": int(getattr(t, "consecutive_misses", 0)),
+                    "score": None if last is None else round(float(last), 3)})
+
+            full = diag.get("full", ([], []))
+            record = {
+                "wall": round(time.time(), 3),
+                "t": round(time.monotonic(), 3),
+                "frame": int(self._frame_count),
+                "cam": self._camera_name(camera_id),
+                "mode": "crop" if "crops" in diag else "full",
+                "infer_ms": None if infer_ms is None else round(infer_ms, 1),
+                "full": boxes(*full),
+                "crops": [{"origin": list(c["origin"]),
+                           "dets": boxes(c["boxes"], c["scores"])}
+                          for c in diag.get("crops", [])],
+                "merged": boxes(detections, scores),
+                "tracks": tracks,
+            }
+            self._det_log.write(json.dumps(record, separators=(",", ":"))
+                                + "\n")
+        except Exception as exc:
+            self.events.rate("detection-log-error", logging.ERROR,
+                             "detection log write failed: %s", exc)
+
+    def _maybe_check_alignment(self, camera_id: int, native_raw: np.ndarray,
+                               published_raw: np.ndarray) -> None:
+        """
+        MEASURE, once per camera, that the published stream is a pure
+        downscale of the native one — the assumption every crop box rests
+        on (smart_crop.measure_stream_alignment).
+
+        Only the "lores" source needs it: "resize" is aligned by
+        construction. The first attempt waits for exposure to settle. An
+        INCONCLUSIVE scene (blank sky) is retried a few times and then
+        reported as NOT VERIFIED, never assumed fine.
+
+        ⚠️ A measured misalignment switches that camera to "resize". Knowingly
+        running on a stream whose boxes land off-target would be worse than
+        paying the CPU for a downscale that is correct by construction.
+        """
+        streams = getattr(self._manager, "crop_streams", {}).get(camera_id)
+        if not streams or streams.get("source") != "lores":
+            return
+        now_t = time.monotonic()
+        state = self._align_state.setdefault(
+            camera_id, {"done": False, "next": now_t + 3.0, "tries": 0})
+        if state["done"] or now_t < state["next"]:
+            return
+
+        result = smart_crop.measure_stream_alignment(native_raw,
+                                                     published_raw)
+        state["tries"] += 1
+        name = self._camera_name(camera_id)
+        if result.verdict == "ALIGNED":
+            state["done"] = True
+            log.info("smart crop %s: streams MEASURED aligned (%s)",
+                     name, result.detail)
+        elif result.verdict == "MISALIGNED":
+            state["done"] = True
+            streams["source"] = "resize"
+            log.warning("smart crop %s: streams MISALIGNED (%s) — crop boxes "
+                        "would land off-target, so this camera now builds "
+                        "its published frame by downscaling the native one "
+                        "(\"resize\", aligned by construction, costs CPU)",
+                        name, result.detail)
+        elif state["tries"] >= 6:
+            state["done"] = True
+            log.warning("smart crop %s: stream alignment NOT VERIFIED after "
+                        "%d attempts (%s). Point the camera at a textured "
+                        "scene and restart to measure it, or set "
+                        "visual.crop_published_source = \"resize\".",
+                        name, state["tries"], result.detail)
+        else:
+            state["next"] = now_t + 10.0
+            log.info("smart crop %s: alignment inconclusive (%s), retrying "
+                     "in 10 s", name, result.detail)
 
     # ── Track extraction ───────────────────────────────────────
 
@@ -827,6 +1323,22 @@ class CameraWorker:
     # ── Teardown ───────────────────────────────────────────────
 
     def _teardown(self) -> None:
+        if self._wide_thread is not None:
+            # It reads a camera: it must be out before the cameras close.
+            self._stop.set()
+            self._wide_thread.join(timeout=1.0)
+        if self._recorder is not None:
+            try:
+                self._recorder.close()
+            except Exception as exc:
+                log.debug("error closing the frame recorder: %s", exc)
+            self._recorder = None
+        if self._det_log is not None:
+            try:
+                self._det_log.close()
+            except OSError:
+                pass
+            self._det_log = None
         for name, obj in (("detector", self._detector),
                           ("cameras", self._manager)):
             if obj is None:
