@@ -23,6 +23,19 @@ if hasattr(sys.stdout, 'reconfigure'):
 
 CONFIG_PATH = Path(__file__).with_name("telegram_config.json")
 
+
+def load_token(config_path: Path = CONFIG_PATH) -> str:
+    """Bot token from $TELEGRAM_TOKEN or "token" in telegram_config.json — never in the code:
+    telegram_config.json is kept out of git (see telegram_config.example.json)."""
+    import os
+    tok = os.environ.get("TELEGRAM_TOKEN", "")
+    if not tok and config_path.exists():
+        try:
+            tok = json.loads(config_path.read_text(encoding="utf-8")).get("token", "")
+        except Exception:
+            tok = ""
+    return tok
+
 # Мінімальний інтервал між сповіщеннями (секунди).
 # Щоб не спамити під час тривалого ALARM.
 COOLDOWN_SEC = 30.0
@@ -52,7 +65,13 @@ class TelegramAlerter:
                 pass
 
     def _save_config(self) -> None:
-        data = {"chat_ids": self.chat_ids}
+        data = {}
+        if self.config_path.exists():
+            try:                              # keep the token and any other key
+                data = json.loads(self.config_path.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+        data["chat_ids"] = self.chat_ids
         self.config_path.write_text(
             json.dumps(data, indent=2), encoding="utf-8"
         )
@@ -165,7 +184,10 @@ class TelegramAlerter:
 # ── Автономний запуск для реєстрації ──────────────────────
 
 if __name__ == "__main__":
-    TOKEN = "8875007303:AAGb8p-3-_h8qJaUFVAICO4I2sXSCpbTwOE"
+    TOKEN = load_token()
+    if not TOKEN:
+        sys.exit("No bot token: set TELEGRAM_TOKEN or put \"token\" into telegram_config.json "
+                 "(see telegram_config.example.json)")
     alerter = TelegramAlerter(TOKEN)
 
     print("=" * 50)

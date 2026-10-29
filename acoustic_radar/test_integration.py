@@ -2644,6 +2644,44 @@ def test_14_srp_geometry():
           abs(float(to_mono(block).mean()) - 22.0 / 6.0) < 1e-6,
           f"{float(to_mono(block).mean()):.3f} = (4x1 + 2x9)/6")
 
+    # ── classifier_channels: the classifier's input is chosen apart from
+    #    the SRP-PHAT microphones (6-channel XVF3800: 0-1 processed, 2-5 raw)
+    import audio_io
+    real_find = audio_io.find_device
+    try:
+        for n_ch in (2, 6):
+            audio_io.find_device = (lambda _name, n=n_ch:
+                                    (0, {"name": "fake", "max_input_channels": n}))
+            inp = audio_io.resolve_input({}, 16000)
+            check(f"classifier_channels unset -> the mic channels, as before "
+                  f"({n_ch}-ch device)",
+                  inp.classifier_channels == inp.mic_channels,
+                  f"mic {inp.mic_channels}, classifier {inp.classifier_channels}")
+        audio_io.find_device = (lambda _name:
+                                (0, {"name": "fake", "max_input_channels": 6}))
+        inp = audio_io.resolve_input({"mic_channels": [2, 3, 4, 5],
+                                      "classifier_channels": [0]}, 16000)
+        check("6-ch split: SRP gets the raw mics, the classifier channel 0",
+              inp.mic_channels == (2, 3, 4, 5)
+              and inp.classifier_channels == (0,),
+              f"mic {inp.mic_channels}, classifier {inp.classifier_channels}")
+        six = np.zeros((100, 6), dtype=np.float32)
+        six[:, 0] = 5.0                   # processed channel
+        six[:, 2:] = 1.0                  # raw microphones
+        check("the classifier's mono is channel 0 alone, not a mic mix",
+              abs(float(to_mono(six, inp.classifier_channels).mean()) - 5.0)
+              < 1e-6)
+        inp = audio_io.resolve_input({"classifier_channels": [0, 9]}, 16000)
+        check("a classifier channel the device lacks is dropped",
+              inp.classifier_channels == (0,), f"{inp.classifier_channels}")
+    finally:
+        audio_io.find_device = real_find
+    import inspect
+    import radar
+    src = inspect.getsource(radar.RadarEngine.process_block)
+    check("RadarEngine feeds the classifier from classifier_channels",
+          "classifier_channels" in src)
+
 
 def test_15_camera_search_region():
     header("TEST 15 — the acoustic search region and the YOLO handover")
@@ -4316,6 +4354,40 @@ def test_26_smart_crop():
     check("SC: the detection log writes one JSON line per detector run",
           len(files) == 1 and len(lines) == 3, f"{len(files)} file(s), "
           f"{len(lines)} line(s)")
+    # ── 11. Frame recorder (training data collection) ──
+    from frame_recorder import FrameRecorder
+    rec_dir = _tempfile.mkdtemp()
+    recorder = FrameRecorder(rec_dir, every_s=1.0, min_gap_s=0.25)
+    frame = np.zeros((480, 640, 3), np.uint8)
+    reasons = [
+        recorder.offer(100.0, "TELE/IMX477P", frame, None, []),
+        recorder.offer(100.5, "TELE/IMX477P", frame, None, []),
+        recorder.offer(101.0, "TELE/IMX477P", frame,
+                       np.zeros((990, 1320, 3), np.uint8), []),
+        recorder.offer(101.1, "TELE/IMX477P", frame, None,
+                       [[10, 20, 30, 40, 0.5]]),
+        recorder.offer(101.2, "TELE/IMX477P", frame, None,
+                       [[10, 20, 30, 40, 0.5]]),
+        recorder.offer(101.4, "TELE/IMX477P", frame, None,
+                       [[10, 20, 30, 40, 0.6]]),
+    ]
+    frame[:] = 255              # "the UI draws on the published frame"
+    recorder.close()
+    check("SC: the recorder saves periodically and on detections, with a "
+          "minimum gap", reasons == ["periodic", None, "periodic",
+                                     "detection", None, "detection"],
+          str(reasons))
+    idx = [_json.loads(x) for x in
+           open(rec_dir + "/frames.jsonl", encoding="utf-8")]
+    first = _cv2.imread(rec_dir + "/" + idx[0]["files"]["pub"])
+    check("SC: ...writes each frame and its boxes, native only when given",
+          len(idx) == 4 and sum("nat" in r["files"] for r in idx) == 1
+          and idx[2]["boxes"] == [[10.0, 20.0, 30.0, 40.0, 0.5]],
+          f"{len(idx)} entries")
+    check("SC: ...and saves the frame as captured, not what was drawn on it "
+          "afterwards", first is not None and float(first.mean()) < 5.0,
+          f"mean {None if first is None else round(float(first.mean()), 1)}")
+
     check("SC: ...with what the full frame, each window and the tracker saw",
           rec.get("mode") == "crop" and len(rec.get("full", [])) == 1
           and len(rec.get("crops", [])) == 1
@@ -4328,6 +4400,227 @@ def test_26_smart_crop():
     check("SC: the tracker is still called ONCE per frame (one association "
           "over the merged detections)",
           loop_code.count("process_frame(") == 1)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  TEST 27 — ESP32 speaker
+# ═══════════════════════════════════════════════════════════════
+
+def test_27_esp32_alarm():
+    header("TEST 27 — ESP32 speaker: when it beeps, and the serial protocol")
+    import inspect as _insp
+    import os
+    import select
+    import threading as _th
+
+    import fusion_config as _fc
+    import main as station_main
+    import respeaker_led as rl
+    from esp32_alarm import AlarmStatus, Esp32Alarm, alarm_for_target
+    from sensor_fusion import FusedTarget
+
+    def held(s, engine_state):
+        """Fused state `s` with the microphone's detector in `engine_state`
+        (None = no acoustic reading at all)."""
+        if engine_state is None:
+            return FusedTarget(state=s)
+        return FusedTarget(state=s, acoustic=acoustic(engine_state),
+                           acoustic_freshness=Freshness.FRESH,
+                           acoustic_health=HEALTHY)
+
+    # ── When ──
+    acfg = _fc.AlarmConfig()
+    unconfirmed = _fc.AlarmConfig(beep_on_unconfirmed_acoustic=True)
+    mic_states = (SystemState.ACOUSTIC_TRACKING,
+                  SystemState.VISUAL_ACQUISITION,
+                  SystemState.VISUAL_LOST_ACOUSTIC_TRACKING)
+    on = {s: alarm_for_target(held(s, "ALARM"), acfg) for s in SystemState}
+    check("speaker ON in the four states where a sensor holds the drone",
+          all(on[s] for s in mic_states + (SystemState.VISUAL_TRACKING,)),
+          str({s.value: v for s, v in on.items()}))
+    check("speaker OFF in SEARCHING and TARGET_LOST",
+          not on[SystemState.SEARCHING] and not on[SystemState.TARGET_LOST])
+    check("an unconfirmed acoustic contact does not beep by default",
+          not alarm_for_target(held(SystemState.ACOUSTIC_DETECTED, "TRACK"),
+                               acfg))
+    check("... and does with alarm.beep_on_unconfirmed_acoustic",
+          alarm_for_target(held(SystemState.ACOUSTIC_DETECTED, "TRACK"),
+                           unconfirmed))
+    check("the microphone's coasting still beeps (the ring is still red)",
+          all(alarm_for_target(held(s, "ALARM_COASTING"), acfg)
+              for s in mic_states))
+    # The fused state outlives the microphone by target_lost_after_s; the
+    # speaker must not (it kept beeping ~5 s after the ring went blue).
+    check("microphone let go, fused state still held -> speaker OFF",
+          not any(alarm_for_target(held(s, e), acfg)
+                  for s in mic_states for e in ("LISTEN", None)))
+    check("... and an unconfirmed contact stops with the detector too",
+          not alarm_for_target(held(SystemState.ACOUSTIC_DETECTED, "LISTEN"),
+                               unconfirmed))
+
+    # Through the real state machine. Camera alone, no microphone:
+    cfg, f = new_fusion()
+    t = 1000.0
+    snap = None
+    for _ in range(cfg.visual.confirm_frames + 1):
+        t += 0.05
+        snap = f.update(None, visual(score=0.9, t=t), HEALTHY, HEALTHY, t=t)
+    check("camera sees the drone (no sound) -> speaker ON",
+          alarm_for_target(snap, cfg.alarm), snap.state.value)
+    t += cfg.visual.lost_after_s + 0.5
+    snap = f.update(None, None, HEALTHY, HEALTHY, t=t)
+    check("the drone disappears from the camera (no sound) -> speaker OFF",
+          not alarm_for_target(snap, cfg.alarm), snap.state.value)
+    # Microphone alone:
+    cfg2, f2 = new_fusion()
+    snap = drive(f2, acoustic("ALARM", p=0.95), None, n=3)
+    check("confirmed acoustic alarm (no camera) -> speaker ON",
+          alarm_for_target(snap, cfg2.alarm), snap.state.value)
+    snap = drive(f2, acoustic("ALARM_COASTING", p=0.3), None)
+    check("the drone falls silent, detector coasting -> speaker still ON",
+          alarm_for_target(snap, cfg2.alarm), snap.state.value)
+    snap = drive(f2, acoustic("LISTEN", p=0.02, bearing=None, seq=1), None)
+    check("detector released the alarm -> speaker OFF while the fused state "
+          "is still held",
+          snap.state.has_target and not alarm_for_target(snap, cfg2.alarm),
+          snap.state.value)
+    check("... at the same moment the LED ring goes blue",
+          not rl.frame_for_target(snap).mode.is_alarm)
+
+    src = _insp.getsource(station_main.Station.run)
+    check("main.py feeds the speaker from the same fused target as the ring",
+          "self.alarm.submit(alarm_for_target(target" in src)
+
+    # ── Never fatal ──
+    off = Esp32Alarm(_fc.AlarmConfig(enabled=False))
+    off.submit(True)
+    check("disabled: start() returns False, status DISABLED, no thread",
+          off.start() is False and off.status is AlarmStatus.DISABLED)
+    off.stop()
+    gone = Esp32Alarm(_fc.AlarmConfig(port="/dev/does-not-exist",
+                                      retry_interval_s=5.0))
+    gone.start()
+    gone.submit(True)
+    time.sleep(0.4)
+    check("no ESP32 plugged in: UNAVAILABLE, nothing raised",
+          gone.status is AlarmStatus.UNAVAILABLE, gone.status_text())
+    gone.stop()
+
+    # ── Protocol, against a fake firmware on a pseudo-terminal ──
+    try:
+        import serial  # noqa: F401
+    except ImportError:
+        check("serial protocol test skipped: pyserial not installed", True)
+        return
+    if not hasattr(os, "openpty"):
+        check("serial protocol test skipped: no pty on this OS", True)
+        return
+
+    def fake_firmware(master, got, stop, answer=True):
+        buf = b""
+        while not stop.is_set():
+            try:
+                r, _, _ = select.select([master], [], [], 0.05)
+                if not r:
+                    continue
+                buf += os.read(master, 256)
+            except OSError:
+                return
+            *lines, buf = buf.split(b"\n")
+            for ln in lines:
+                s = ln.strip().decode("ascii", "replace")
+                got.append(s)
+                if not answer:
+                    continue
+                if s == "PING":
+                    os.write(master, b"PONG ALARM v1 pin=14 hz=2700\n")
+                elif s in ("A1", "A0") or s.startswith("F"):
+                    os.write(master, f"OK {s}\n".encode())
+
+    master, slave = os.openpty()
+    got: List[str] = []
+    stop = _th.Event()
+    fw = _th.Thread(target=fake_firmware, args=(master, got, stop), daemon=True)
+    fw.start()
+    a = Esp32Alarm(_fc.AlarmConfig(port=os.ttyname(slave), heartbeat_s=0.1,
+                                   watchdog_s=0.5, retry_interval_s=0.2,
+                                   handshake_timeout_s=2.0, tone_hz=2200))
+    a.start()
+    t_end = time.monotonic() + 3.0
+    while a.status is not AlarmStatus.ACTIVE and time.monotonic() < t_end:
+        a.submit(False)
+        time.sleep(0.05)
+    check("handshake: ACTIVE only after the firmware answered PING",
+          a.status is AlarmStatus.ACTIVE and "PING" in got, a.status_text())
+
+    def hold(want, seconds):
+        t1 = time.monotonic()
+        while time.monotonic() - t1 < seconds:
+            a.submit(want)
+            time.sleep(0.05)
+
+    n0 = len(got)
+    hold(True, 0.6)
+    check("drone -> 'A1' reaches the ESP32 and is repeated as a heartbeat",
+          got[n0:].count("A1") >= 3, str(got[n0:]))
+    check("alarm.tone_hz is sent to the passive buzzer after connecting",
+          "F2200" in got and got.index("F2200") < got.index("A1"), str(got[:6]))
+    a.set_frequency(1800)
+    hold(True, 0.3)
+    check("set_frequency(1800) reaches the board as 'F1800'", "F1800" in got,
+          str(got[-6:]))
+    try:
+        a.set_frequency(20)
+        refused = False
+    except ValueError:
+        refused = True
+    check("a tone outside 50-10000 Hz is refused on the Pi side", refused)
+    n1 = len(got)
+    hold(False, 0.4)
+    check("drone gone -> 'A0'", "A0" in got[n1:] and got[-1] == "A0",
+          str(got[n1:]))
+    a.submit(True)
+    time.sleep(0.25)
+    n2 = len(got)
+    time.sleep(1.0)                      # the UI loop stops submitting
+    check("UI loop stalled -> watchdog turns the speaker OFF",
+          "A0" in got[n2:] and got[-1] == "A0", str(got[n2:]))
+    hold(True, 0.3)
+    a.stop()
+    time.sleep(0.2)
+    check("stop() leaves the speaker OFF", got[-1] == "A0", str(got[-3:]))
+    check("every command was acknowledged (link stayed ACTIVE)",
+          a.status is AlarmStatus.ACTIVE, a.status_text())
+    stop.set()
+    fw.join(1.0)
+    os.close(master)
+    os.close(slave)
+
+    # A serial device that does not answer must never get an alarm command.
+    m2, s2 = os.openpty()
+    got2: List[str] = []
+    stop2 = _th.Event()
+    fw2 = _th.Thread(target=fake_firmware, args=(m2, got2, stop2, False),
+                     daemon=True)
+    fw2.start()
+    silent = Esp32Alarm(_fc.AlarmConfig(port=os.ttyname(s2),
+                                        handshake_timeout_s=0.6,
+                                        retry_interval_s=5.0))
+    silent.start()
+    hold_t = time.monotonic()
+    while time.monotonic() - hold_t < 1.2:
+        silent.submit(True)
+        time.sleep(0.05)
+    check("a device that does not answer is not used: UNAVAILABLE, only PING "
+          "written, never A1",
+          silent.status is AlarmStatus.UNAVAILABLE
+          and set(got2) <= {"PING"} and "A1" not in got2,
+          f"{silent.status_text()} wrote {sorted(set(got2))}")
+    silent.stop()
+    stop2.set()
+    fw2.join(1.0)
+    os.close(m2)
+    os.close(s2)
 
 
 def main() -> int:
@@ -4350,7 +4643,7 @@ def main() -> int:
                test_23_acoustic_timestamp_semantics,
                test_24_camera_manager_role_resolution,
                test_25_forensic_review_fixes, test_26_smart_crop,
-               test_regressions, test_final_audit_regressions,
+               test_27_esp32_alarm, test_regressions, test_final_audit_regressions,
                test_honesty, test_thread_safety):
         try:
             fn()

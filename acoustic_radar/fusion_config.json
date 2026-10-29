@@ -14,5 +14,8 @@
       "TELE": null
     },
     "drone_real_width_m": 0.25
+  },
+  "visual": {
+    "swap_detector_channels": true
   }
 }

@@ -168,6 +168,87 @@ class CameraSwitchPolicy:
 #  Worker
 # ═══════════════════════════════════════════════════════════════
 
+class TeleInWide:
+    """
+    Where the TELE view sits inside the WIDE published frame — what lets the
+    operator watch WIDE while the detector works on TELE
+    (VisualConfig.operator_view = "wide").
+
+    Measured, not assumed: the TELE frame is shrunk by a range of ratios and
+    correlated (TM_CCOEFF_NORMED) against the whole WIDE frame, the same idea
+    as camera_identity._match_peaks. A result is adopted only when the peak is
+    strong AND unique — a flat sky or a repetitive wall is refused and the
+    previous rectangle stays. Until the first good match the rectangle comes
+    from the THEORETICAL focal lengths, centred (pointing offset unknown).
+    """
+
+    MIN_NCC = 0.5           # correlation of the winning alignment
+    MIN_PEAK_MARGIN = 0.15  # ... over the best alignment elsewhere
+
+    def __init__(self, fixed_rect: Optional[List[float]] = None):
+        self.rect: Optional[List[float]] = (
+            [float(c) for c in fixed_rect] if fixed_rect else None)
+        self.fixed = self.rect is not None
+        self.source = "configured" if self.fixed else "none"
+        self.ratio: Optional[float] = None
+
+    def set_theoretical(self, wide_size: Tuple[int, int],
+                        tele_size: Tuple[int, int],
+                        f_wide: Optional[float], f_tele: Optional[float]) -> None:
+        if self.rect is not None or not f_wide or not f_tele:
+            return
+        k = float(f_wide) / float(f_tele)
+        w, h = tele_size[0] * k, tele_size[1] * k
+        self.rect = [(wide_size[0] - w) / 2.0, (wide_size[1] - h) / 2.0, w, h]
+        self.source = "THEORETICAL (focal ratio, centred)"
+
+    def mapping(self, tele_width: int) -> Optional[Tuple[float, float, float]]:
+        """(ox, oy, k) with wide_xy = o + k * tele_xy, or None."""
+        if self.rect is None or tele_width <= 0:
+            return None
+        return (self.rect[0], self.rect[1], self.rect[2] / float(tele_width))
+
+    def measure(self, wide_bgr: np.ndarray, tele_bgr: np.ndarray) -> str:
+        """Try to (re)measure the rectangle; returns a line for the log."""
+        import cv2
+
+        gw = cv2.cvtColor(wide_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        gt = cv2.cvtColor(tele_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        th, tw = gt.shape[:2]
+        if self.ratio is None:
+            ratios = np.arange(2.5, 7.001, 0.05)
+        else:                                   # stay near the last good one
+            ratios = np.arange(self.ratio - 0.3, self.ratio + 0.3001, 0.05)
+        best = None
+        for r in ratios:
+            sw, sh = int(round(tw / r)), int(round(th / r))
+            if sw < 16 or sh < 16 or sw >= gw.shape[1] or sh >= gw.shape[0]:
+                continue
+            small = cv2.resize(gt, (sw, sh), interpolation=cv2.INTER_AREA)
+            if float(np.std(small)) < 1e-6:
+                return "TELE frame is flat - kept the previous rectangle"
+            res = cv2.matchTemplate(gw, small, cv2.TM_CCOEFF_NORMED)
+            res = np.nan_to_num(res, nan=0.0, posinf=0.0, neginf=0.0)
+            _, score, _, loc = cv2.minMaxLoc(res)
+            if best is None or score > best[0]:
+                best = (float(score), float(r), loc, sw, sh, res)
+        if best is None:
+            return "no ratio fits - kept the previous rectangle"
+        score, r, (bx, by), sw, sh, res = best
+        masked = res.copy()
+        masked[max(0, by - sh // 2):by + sh // 2 + 1,
+               max(0, bx - sw // 2):bx + sw // 2 + 1] = -1.0
+        runner = float(masked.max())
+        detail = (f"ratio {r:.2f}, rect [{bx}, {by}, {sw}, {sh}], "
+                  f"NCC {score:.2f} (elsewhere {runner:.2f})")
+        if score < self.MIN_NCC or score - runner < self.MIN_PEAK_MARGIN:
+            return f"match REFUSED ({detail}) - kept {self.source} rectangle"
+        self.rect = [float(bx), float(by), float(sw), float(sh)]
+        self.ratio = r
+        self.source = "measured"
+        return f"measured: {detail}"
+
+
 class CameraWorker:
     """
     Owns the cameras, the Hailo device and the tracker.
@@ -231,6 +312,18 @@ class CameraWorker:
         # first detector run and closed at teardown.
         self._det_log = None
         self._det_log_failed = False
+        # VisualConfig.frame_record: created on the first detector run.
+        self._recorder = None
+        self._recorder_failed = False
+
+        # ── Operator's WIDE view (VisualConfig.operator_view = "wide") ──
+        # A second thread reads the WIDE camera (a capture waits ~one frame,
+        # 33 ms — too long for the detection loop); the loop pairs the newest
+        # WIDE frame with its own TELE tracks at publish time.
+        self._tele_in_wide = TeleInWide(config.visual.tele_in_wide_rect)
+        self._wide_latest: Optional[Tuple[float, np.ndarray]] = None
+        self._tele_latest: Optional[np.ndarray] = None
+        self._wide_thread: Optional[threading.Thread] = None
 
     # ── Lifecycle ──────────────────────────────────────────────
 
@@ -420,6 +513,23 @@ class CameraWorker:
 
         self._tracker = tc.AdvancedADASTracker()
 
+        if str(v.operator_view).lower() == "wide":
+            wide_id = getattr(self._manager, "wide_id", None)
+            if wide_id is None or wide_id not in opened or len(opened) < 2:
+                log.warning("operator_view 'wide' needs both cameras open - "
+                            "showing the active camera instead")
+            else:
+                size = (v.frame_width, v.frame_height)
+                self._tele_in_wide.set_theoretical(
+                    size, size, geo.camera_focal_px_by_role.get("WIDE"),
+                    geo.camera_focal_px_by_role.get("TELE"))
+                log.info("operator view: WIDE picture, detection on the active "
+                         "camera; TELE-in-WIDE rectangle %s (%s)",
+                         self._tele_in_wide.rect, self._tele_in_wide.source)
+                self._wide_thread = threading.Thread(
+                    target=self._wide_view_loop, name="wide-view", daemon=True)
+                self._wide_thread.start()
+
         detail = (f"{len(opened)} camera(s)"
                   + ("" if self._detector_available else ", NO DETECTOR"))
         self._set_health(
@@ -455,6 +565,63 @@ class CameraWorker:
         if not self._boottime_ok:
             return None
         return int(time.clock_gettime(time.CLOCK_BOOTTIME) * 1e9)
+
+    # ── Operator's WIDE view ───────────────────────────────────
+
+    def _wide_view_loop(self) -> None:
+        """
+        Thread body: keep the newest WIDE frame for the operator and re-measure
+        where TELE sits inside it. Idle while WIDE is itself the active camera
+        (the frame loop owns it then and the operator sees it directly).
+        """
+        import cv2
+
+        v = self.config.visual
+        last_measure: Optional[float] = None
+        while not self._stop.is_set():
+            mgr = self._manager
+            wide_id = getattr(mgr, "wide_id", None)
+            if mgr is None or wide_id is None \
+                    or mgr.get_active_camera() == wide_id:
+                time.sleep(0.05)
+                continue
+            raw = mgr.get_published_frame(wide_id)
+            if raw is None:
+                time.sleep(0.05)
+                continue
+            # Same colour handling as the active camera's display copy.
+            wide_bgr = cv2.cvtColor(raw, cv2.COLOR_RGB2BGR)
+            self._wide_latest = (time.monotonic(), wide_bgr)
+
+            tele = self._tele_latest
+            if (not self._tele_in_wide.fixed and tele is not None
+                    and (last_measure is None or time.monotonic() - last_measure
+                         >= float(v.tele_in_wide_remeasure_s))):
+                last_measure = time.monotonic()
+                try:
+                    line = self._tele_in_wide.measure(wide_bgr, tele)
+                except Exception as exc:
+                    line = f"measurement failed: {exc}"
+                log.info("TELE-in-WIDE %s", line)
+
+    def _display_fields(self, frame_camera: int, frame_bgr: np.ndarray):
+        """(display_frame, display_map, display_name) for the observation."""
+        if str(self.config.visual.operator_view).lower() != "wide" \
+                or self._wide_thread is None:
+            return None, None, None
+        if frame_camera == getattr(self._manager, "wide_id", None):
+            return None, None, None             # detecting on WIDE already
+        latest = self._wide_latest
+        if latest is None or time.monotonic() - latest[0] > 0.5:
+            return None, None, None             # no fresh WIDE frame
+        mapping = self._tele_in_wide.mapping(frame_bgr.shape[1])
+        if mapping is None:
+            return None, None, None
+        name = (f"{self._manager.role_for(getattr(self._manager, 'wide_id', 0))}"
+                f" view / detect {self._camera_name(frame_camera)}")
+        if self._tele_in_wide.source != "measured" and not self._tele_in_wide.fixed:
+            name += " (TELE box NOT measured)"
+        return latest[1], mapping, name
 
     # ── Main loop ──────────────────────────────────────────────
 
@@ -563,6 +730,9 @@ class CameraWorker:
             # not "fixed" here without a measurement to justify it.
             frame_bgr = cv2.cvtColor(frame_raw, cv2.COLOR_RGB2BGR)
             detector_input = frame_bgr if v.swap_detector_channels else frame_raw
+            if self._wide_thread is not None and \
+                    frame_camera == getattr(self._manager, "tele_id", None):
+                self._tele_latest = frame_bgr   # for the TELE-in-WIDE match
 
             if native_raw is not None:
                 self._maybe_check_alignment(frame_camera, native_raw,
@@ -655,6 +825,11 @@ class CameraWorker:
             if diag is not None:
                 self._log_detection_run(frame_camera, infer_ms, diag,
                                         detections, scores)
+            # Frames are offered only when the detector ran, so an empty box
+            # list in frames.jsonl always means "the detector saw nothing".
+            if v.frame_record and run_detector:
+                self._record_frame(frame_camera, frame_raw, native_raw,
+                                   detections, scores)
 
             # Everything that DESCRIBES this frame uses frame_camera: the
             # optics that produced the pixels are the optics the distances,
@@ -691,6 +866,8 @@ class CameraWorker:
             last_time = frame_start
 
             self._seq += 1
+            display_frame, display_map, display_name = self._display_fields(
+                frame_camera, frame_bgr)
             self.latest.publish(VisualObservation(
                 frame=frame_bgr,
                 frame_width=frame_bgr.shape[1],
@@ -711,7 +888,10 @@ class CameraWorker:
                               if self._last_sensor_ns is not None else None),
                 capture_wait_ms=self._capture_wait_ms_ema,
                 timestamp=now(),
-                seq=self._seq))
+                seq=self._seq,
+                display_frame=display_frame,
+                display_map=display_map,
+                display_name=display_name))
 
             self.events.rate(
                 "camera-heartbeat", logging.DEBUG,
@@ -882,6 +1062,36 @@ class CameraWorker:
                                       "scores": list(mapped[1])})
 
         return smart_crop.merge_detections(groups, v.detector_iou_threshold)
+
+    # ── Data collection: frame recorder ────────────────────────
+
+    def _record_frame(self, camera_id: int, frame_raw: np.ndarray,
+                      native_raw: Optional[np.ndarray], detections,
+                      scores) -> None:
+        """VisualConfig.frame_record — see frame_recorder.py. Never raises."""
+        if self._recorder_failed:
+            return
+        try:
+            if self._recorder is None:
+                from pathlib import Path
+
+                from frame_recorder import FrameRecorder
+                v = self.config.visual
+                out = (Path(__file__).resolve().parent
+                       / self.config.logging.log_dir
+                       / time.strftime("frames_%Y%m%d_%H%M%S"))
+                self._recorder = FrameRecorder(
+                    out, every_s=v.frame_record_every_s,
+                    min_gap_s=v.frame_record_min_gap_s)
+                log.info("frame recorder -> %s (every %.1f s + on detections)",
+                         out, v.frame_record_every_s)
+            boxes = [list(map(float, b[:4])) + [float(s)]
+                     for b, s in zip(detections, scores)]
+            self._recorder.offer(time.time(), self._camera_name(camera_id),
+                                 frame_raw, native_raw, boxes)
+        except Exception as exc:
+            self._recorder_failed = True
+            log.error("frame recorder disabled for this run: %s", exc)
 
     # ── Diagnostics: detection log ─────────────────────────────
 
@@ -1113,6 +1323,16 @@ class CameraWorker:
     # ── Teardown ───────────────────────────────────────────────
 
     def _teardown(self) -> None:
+        if self._wide_thread is not None:
+            # It reads a camera: it must be out before the cameras close.
+            self._stop.set()
+            self._wide_thread.join(timeout=1.0)
+        if self._recorder is not None:
+            try:
+                self._recorder.close()
+            except Exception as exc:
+                log.debug("error closing the frame recorder: %s", exc)
+            self._recorder = None
         if self._det_log is not None:
             try:
                 self._det_log.close()

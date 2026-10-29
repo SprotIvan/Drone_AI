@@ -1,3 +1,4 @@
+import threading
 import time
 
 import camera_identity
@@ -142,6 +143,10 @@ class CameraManager:
         self.active_camera = None
         self.last_switch_time = 0.0
         self.picams = {}
+        # Held while the ACTIVE camera changes and while get_published_frame()
+        # reads a non-active one, so that a second thread (the operator's WIDE
+        # view) can never be reading the camera the frame loop just switched to.
+        self._side_lock = threading.Lock()
 
         #: role -> horizontal focal length in pixels of the delivered frame,
         #: recomputed from each sensor's ACTUAL crop once it is running.
@@ -860,7 +865,7 @@ class CameraManager:
         print(f"[CameraManager] failing over from camera "
               f"{self.active_camera} to {target} after "
               f"{self.consecutive_capture_failures} consecutive failures.")
-        self.active_camera = target
+        self._set_active(target)
         self.last_switch_time = time.monotonic()
         self.consecutive_capture_failures = 0
 
@@ -911,9 +916,45 @@ class CameraManager:
         if time.monotonic() - self.last_switch_time < self.debounce_interval:
             return False
 
-        self.active_camera = target_id
+        self._set_active(target_id)
         self.last_switch_time = time.monotonic()
         return True
+
+    def _set_active(self, camera_id):
+        lock = getattr(self, "_side_lock", None)
+        if lock is None:
+            self.active_camera = camera_id
+            return
+        with lock:
+            self.active_camera = camera_id
+
+    def get_published_frame(self, camera_id):
+        """
+        The published-size frame of a camera that is NOT the active one,
+        without switching to it — the operator's WIDE picture while the
+        detector runs on TELE (VisualConfig.operator_view = "wide").
+
+        None while `camera_id` is the active camera (the frame loop owns it
+        then), when it is not open, or on any capture failure. Never raises
+        and never counts a failure: this view is a convenience, the active
+        camera's frames are the product.
+        """
+        lock = getattr(self, "_side_lock", None)
+        if lock is None:
+            return None
+        with lock:
+            if camera_id == self.active_camera:
+                return None
+            picam = self.picams.get(camera_id)
+            if picam is None:
+                return None
+            try:
+                streams = getattr(self, "crop_streams", {}).get(camera_id)
+                if streams is not None:
+                    return self._read_streams(picam, streams)[0]
+                return picam.capture_array()
+            except Exception:
+                return None
 
     def release(self):
         # Defensive: __del__ runs even on a PARTIALLY-constructed object,

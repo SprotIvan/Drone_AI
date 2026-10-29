@@ -530,8 +530,12 @@ class RadarEngine:
         жоден елемент інтерфейсу не міг повідомити про втрачене аудіо —
         хоча аудіопотік цю подію справно виявляв.
         """
-        # Тільки мікрофонні канали — див. audio_io.to_mono.
-        mono = to_mono(block, getattr(self.input, "mic_channels", None))
+        # Канали класифікатора — див. audio_io.InputConfig.classifier_channels.
+        # Порожньо (у т.ч. InputConfig, зібраний без нового поля) = мікрофонні
+        # канали, як до розділення.
+        mono = to_mono(block,
+                       getattr(self.input, "classifier_channels", None)
+                       or getattr(self.input, "mic_channels", None))
 
         # ── Ковзне вікно: зсуваємо буфер і дописуємо новий блок ──
         n = len(mono)

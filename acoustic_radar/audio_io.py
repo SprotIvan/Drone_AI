@@ -54,6 +54,14 @@ class InputConfig:
     #: Результат вписується у radar_calibration.json як "mic_channels".
     mic_channels: tuple[int, ...] = ()
 
+    #: Канали, що усереднюються у вхід КЛАСИФІКАТОРА (і рівень для гейту та
+    #: відстані) — "classifier_channels" у radar_calibration.json.
+    #: Порожньо = mic_channels, тобто рівно поведінка до розділення.
+    #: Окремо від mic_channels, бо на 6-канальній прошивці XVF3800 напрямку
+    #: потрібні сирі мікрофони, а класифікатору — оброблений канал, на якому
+    #: його навчено (див. calibration.DEFAULTS).
+    classifier_channels: tuple[int, ...] = ()
+
     def describe(self) -> str:
         kind = ("сирі канали масиву" if self.raw_array
                 else "оброблене стерео" if self.channels == 2
@@ -132,12 +140,19 @@ def resolve_input(cfg: dict, sample_rate: int,
     else:
         mic_channels = tuple(range(min(n_mics, channels)))
 
+    # Не задано — ті самі, що мікрофонні (поведінка до розділення).
+    cls_cfg = cfg.get("classifier_channels")
+    classifier_channels = (
+        tuple(int(c) for c in cls_cfg if 0 <= int(c) < channels)
+        if cls_cfg else mic_channels)
+
     return InputConfig(device_index=idx,
                        device_name=str(info.get("name", "?")),
                        channels=channels,
                        sample_rate=sample_rate,
                        raw_array=channels >= 4,
-                       mic_channels=mic_channels)
+                       mic_channels=mic_channels,
+                       classifier_channels=classifier_channels)
 
 
 def open_stream(inp: InputConfig, blocksize: int) -> sd.InputStream:

@@ -148,6 +148,11 @@ class AcousticConfig:
     # the signal disappears (ALARM_COASTING). Must stay <= lost_after_s or
     # the fusion layer declares the sensor lost while the engine is still
     # holding the target; the acoustic worker warns if that is violated.
+    #
+    # This is also how long the LED ring stays red and the ESP32 speaker
+    # keeps beeping once the drone falls silent (plus the 2 s analysis
+    # window) — the knob to turn if that tail is too long. Shorter = a fading
+    # drone drops out sooner and must re-confirm (confirm_seconds).
     coast_seconds: float = 3.0
 
     # [POLICY] How long a target must remain inside the camera-range gate
@@ -382,6 +387,34 @@ class VisualConfig:
     # crop_mode on AND off, so the two can be compared on the same terms.
     # About half a kilobyte per detector run.
     detection_log: bool = False
+
+    # [POLICY] DATA COLLECTION for training (frame_recorder.py). Saves the
+    # frames the detector sees to <logging.log_dir>/frames_<start>/ as JPEG
+    # — every `frame_record_every_s` seconds, and on every detector box at
+    # most once per `frame_record_min_gap_s` (false positives become hard
+    # negatives) — with the detector's boxes in frames.jsonl. In crop mode
+    # the native frame is saved as well. Off by default.
+    frame_record: bool = False
+    frame_record_every_s: float = 1.0
+    frame_record_min_gap_s: float = 0.25
+
+    # [POLICY] What the OPERATOR sees.
+    #   "active"  the camera the detector runs on (the original behaviour).
+    #   "wide"    the WIDE camera's picture, while detection, tracking, the
+    #             acoustic cue and frame recording stay on the active camera
+    #             (normally TELE). Every TELE box is drawn at the matching
+    #             place in the WIDE picture, together with the outline of the
+    #             TELE field of view. Detection-side numbers do not change.
+    operator_view: str = "active"
+
+    # [MEASURED at run time, or set here] Where the TELE view sits inside the
+    # WIDE published frame: [x, y, w, h] in WIDE published px. None = found by
+    # image matching (TELE frame shrunk and correlated against WIDE, see
+    # camera_worker.TeleInWide) at start-up and every
+    # `tele_in_wide_remeasure_s` seconds; a match is only adopted when it is
+    # strong and unique. Set it by hand if the scene has no structure.
+    tele_in_wide_rect: Optional[List[float]] = None
+    tele_in_wide_remeasure_s: float = 30.0
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1076,6 +1109,68 @@ class LedConfig:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  ESP32 sound alarm (esp32_alarm.py + esp32_alarm/esp32_alarm.ino)
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class AlarmConfig:
+    """
+    A speaker/buzzer on an ESP32 that is plugged into the Pi by USB.
+
+    The Pi decides, the ESP32 only beeps. The decision is taken from the SAME
+    fused target the HUD and the LED ring are drawn from (esp32_alarm.
+    alarm_for_target); on the microphone side it stops when the ring goes
+    blue, i.e. acoustic.coast_seconds after the signal disappears.
+
+    ⚠️ The Pi's /dev/serial0 is NOT where the ESP32 goes: on a Pi 5 it is the
+    3-pin debug UART (ttyAMA10), it carries the Linux console, and radar.
+    UartSender already writes ANGLE: lines to it. The ESP32 is a USB serial
+    device (/dev/ttyUSB* or /dev/ttyACM*).
+    """
+
+    # [POLICY] Master switch. True is safe: with no ESP32 plugged in the
+    # controller reports UNAVAILABLE, logs it once, and retries quietly.
+    enabled: bool = True
+
+    # [HARDWARE] Serial device of the ESP32. None = auto: the controller
+    # looks at /dev/serial/by-id, /dev/ttyUSB*, /dev/ttyACM* and uses a port
+    # only if the firmware ANSWERS the handshake — it never writes alarm
+    # commands into a device that did not identify itself as the alarm.
+    port: Optional[str] = None
+    baud: int = 115200
+
+    # [HARDWARE] Tone of the PASSIVE buzzer in Hz (50-10000). None = the
+    # firmware's own default (toneHz in the sketch, 2700). Sent after every
+    # (re)connect, so it is changed here without re-flashing. Find the
+    # loudest value by typing frequencies into `python esp32_alarm.py`.
+    tone_hz: Optional[int] = None
+
+    # [POLICY] Beep already on an UNCONFIRMED acoustic contact
+    # (ACOUSTIC_DETECTED). False = beep from the acoustic side only once the
+    # engine's own alarm is confirmed, which is also when the LED ring turns
+    # red. The camera side beeps on VISUAL_TRACKING (confirm_frames of
+    # boxes >= confirm_conf_threshold), including visual-only targets.
+    beep_on_unconfirmed_acoustic: bool = False
+
+    # [POLICY] The Pi repeats the current command this often. The firmware
+    # goes silent on its own when it hears nothing for its timeout (2 s in
+    # the sketch), so a crashed station cannot leave the speaker beeping.
+    heartbeat_s: float = 0.5
+
+    # [POLICY] If the UI loop stops submitting decisions for this long the
+    # controller sends "off" — same safety net as LedConfig.watchdog_s.
+    watchdog_s: float = 3.0
+
+    # [POLICY] Seconds between attempts to find / reopen the ESP32.
+    retry_interval_s: float = 10.0
+
+    # [POLICY] Seconds to wait for the firmware's reply to the handshake.
+    # A USB-serial ESP32 board usually RESETS when its port is opened
+    # (DTR/RTS auto-reset), so this covers its boot.
+    handshake_timeout_s: float = 3.0
+
+
+# ═══════════════════════════════════════════════════════════════
 #  Logging
 # ═══════════════════════════════════════════════════════════════
 
@@ -1133,6 +1228,7 @@ class StationConfig:
     fusion: FusionConfig = field(default_factory=FusionConfig)
     ui: UIConfig = field(default_factory=UIConfig)
     led: LedConfig = field(default_factory=LedConfig)
+    alarm: AlarmConfig = field(default_factory=AlarmConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     integrations: IntegrationConfig = field(default_factory=IntegrationConfig)
 
@@ -1290,6 +1386,7 @@ _SECTIONS = {
     "fusion": FusionConfig,
     "ui": UIConfig,
     "led": LedConfig,
+    "alarm": AlarmConfig,
     "logging": LoggingConfig,
     "integrations": IntegrationConfig,
 }
